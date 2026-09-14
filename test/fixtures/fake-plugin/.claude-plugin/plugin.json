@@ -1,0 +1,5 @@
+{
+  "name": "fake-channel",
+  "description": "Test-only channel plugin.",
+  "version": "1.0.0"
+}

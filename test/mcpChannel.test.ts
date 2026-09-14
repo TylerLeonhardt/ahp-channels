@@ -1,0 +1,64 @@
+import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+import { McpChannelProcess, convertToolResult } from '../src/mcpChannel.js';
+
+describe('McpChannelProcess', () => {
+	it('receives channel notifications and calls tools', async () => {
+		const server = fileURLToPath(new URL('./fixtures/fake-plugin/server.mjs', import.meta.url));
+		const channel = new McpChannelProcess({
+			command: process.execPath,
+			args: [server],
+		}, () => undefined);
+		try {
+			const info = await channel.start();
+			const event = new Promise<{ content: string; meta?: Readonly<Record<string, string>> }>(resolve => {
+				void channel.setChannelHandler(resolve);
+			});
+			const reply = await channel.callTool('reply', { text: 'pong' });
+
+			assert.deepEqual({
+				info,
+				event: await event,
+				reply,
+			}, {
+				info: {
+					name: 'fake-channel',
+					instructions: 'Anything the sender should see must be sent with the reply tool.',
+					tools: [{
+						name: 'reply',
+						description: 'Send a reply to the channel sender',
+						inputSchema: {
+							type: 'object',
+							properties: { text: { type: 'string' } },
+							required: ['text'],
+						},
+					}],
+				},
+				event: {
+					content: 'hello',
+					meta: { chat_id: '42' },
+				},
+				reply: {
+					success: true,
+					pastTenseMessage: 'Called reply',
+					content: [{ type: 'text', text: 'sent pong' }],
+				},
+			});
+		} finally {
+			await channel.close();
+		}
+	});
+
+	it('converts MCP failures', () => {
+		assert.deepEqual(convertToolResult('reply', {
+			isError: true,
+			content: [{ type: 'text', text: 'nope' }],
+		}), {
+			success: false,
+			pastTenseMessage: 'Failed to call reply',
+			content: [{ type: 'text', text: 'nope' }],
+			error: { message: 'nope' },
+		});
+	});
+});
