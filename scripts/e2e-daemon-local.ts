@@ -14,18 +14,21 @@ import {
 } from '@microsoft/agent-host-protocol';
 import type { Subscription, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectAgentHost, resolveChat } from '../src/ahp.js';
+import { ConfigStore } from '../src/config.js';
 import { ensureDaemonStarted, requestDaemon, stopDaemon } from '../src/daemonClient.js';
 import { discoverLocalAgentHosts, selectAgentHost } from '../src/endpoints.js';
+import { PluginManager } from '../src/plugins.js';
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const testRoot = await mkdtemp(join(tmpdir(), 'ahp-d-'));
-const pluginRoot = join(testRoot, 'plugin');
-const setupPluginRoot = join(testRoot, 'setup-plugin');
+const marketplaceRoot = join(testRoot, 'marketplace');
+const pluginRoot = join(marketplaceRoot, 'plugins', 'fake-channel');
+const setupPluginRoot = join(marketplaceRoot, 'plugins', 'setup-channel');
 const outputFile = join(testRoot, 'replies.txt');
 const fixtureServer = join(repositoryRoot, 'test', 'fixtures', 'fake-plugin', 'server.mjs');
 const marker = `DAEMON_SWITCH_${randomUUID()}`;
@@ -42,6 +45,16 @@ let daemonStarted = false;
 
 try {
 	await Promise.all([createTestPlugin(), createSetupPlugin()]);
+	await writeFile(join(marketplaceRoot, 'marketplace.json'), JSON.stringify({
+		plugins: [
+			{ name: 'fake-channel', source: './plugins/fake-channel' },
+			{ name: 'setup-channel', source: './plugins/setup-channel' },
+		],
+	}));
+	const pluginManager = new PluginManager(new ConfigStore(testRoot));
+	await pluginManager.addMarketplace('test', marketplaceRoot);
+	const installed = await pluginManager.install('fake-channel@test');
+	const setupInstalled = await pluginManager.install('setup-channel@test');
 	const rootSnapshot = connection.initializeResult.snapshots.find(snapshot => snapshot.resource === 'ahp-root://');
 	const provider = (rootSnapshot?.state as RootState | undefined)?.agents[0]?.provider;
 	if (!provider) {
@@ -81,7 +94,8 @@ try {
 		command: 'channel.create',
 		name: 'switch-test',
 		definition: {
-			plugin: pluginRoot,
+			plugin: 'fake-channel',
+			installation: installed.installation,
 			session: sessions[0],
 			enabled: false,
 			host: endpoint.id,
@@ -128,7 +142,8 @@ try {
 		command: 'channel.create',
 		name: 'setup-test',
 		definition: {
-			plugin: setupPluginRoot,
+			plugin: 'setup-channel',
+			installation: setupInstalled.installation,
 			session: sessions[0],
 			enabled: false,
 			host: endpoint.id,
@@ -144,12 +159,17 @@ try {
 	await waitForPluginSkill(sessionSubscriptions[0], 'setup-channel', 'configure');
 	console.log('Daemon E2E passed: kept setup-channel skills available after MCP startup failed');
 	await requestDaemon(testRoot, { command: 'channel.delete', name: 'setup-test' });
+	if (await readFile(join(pluginRoot, 'node_modules', 'source-marker.txt'), 'utf8') !== 'marketplace') {
+		throw new Error('Marketplace runtime marker changed');
+	}
+	await assertMissing(join(installed.plugin.path, 'node_modules'));
 } finally {
 	if (daemonStarted) {
 		await stopDaemon(testRoot).catch(error => {
 			console.error(`[e2e] Failed to stop daemon: ${error instanceof Error ? error.message : String(error)}`);
 		});
 	}
+
 	for (const subscription of chatSubscriptions) {
 		await subscription.close();
 	}
@@ -163,6 +183,18 @@ try {
 	}
 	await client.shutdown();
 	await rm(testRoot, { recursive: true, force: true });
+}
+
+async function assertMissing(path: string): Promise<void> {
+	try {
+		await access(path);
+	} catch (error) {
+		if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+			return;
+		}
+		throw error;
+	}
+	throw new Error(`Expected ${path} to remain absent`);
 }
 
 async function createSetupPlugin(): Promise<void> {
@@ -193,6 +225,7 @@ async function createSetupPlugin(): Promise<void> {
 
 async function createTestPlugin(): Promise<void> {
 	await mkdir(join(pluginRoot, '.claude-plugin'), { recursive: true });
+	await mkdir(join(pluginRoot, 'node_modules'), { recursive: true });
 	await writeFile(join(pluginRoot, '.claude-plugin', 'plugin.json'), JSON.stringify({
 		name: 'fake-channel',
 		version: '1.0.0',
@@ -209,6 +242,7 @@ async function createTestPlugin(): Promise<void> {
 			},
 		},
 	}));
+	await writeFile(join(pluginRoot, 'node_modules', 'source-marker.txt'), 'marketplace');
 }
 
 async function waitForPluginSkill(

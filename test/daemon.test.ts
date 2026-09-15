@@ -148,6 +148,37 @@ describe('DaemonServer', () => {
 			assert.equal(status.channels[0]?.runtime?.session, 'ahp-session:/two');
 			assert.equal(factory.runtimes[0].closed, true);
 
+			const installation = 'a'.repeat(64);
+			await store.update(config => ({
+				...config,
+				marketplaces: {
+					...config.marketplaces,
+					test: { source: './marketplace' },
+				},
+				plugins: {
+					...config.plugins,
+					fake: {
+						marketplace: 'test',
+						activeInstallation: installation,
+						installations: {
+							[installation]: {
+								path: join(home, 'plugins', 'test', 'fake', installation),
+								source: './plugins/fake',
+							},
+						},
+					},
+				},
+			}));
+			const beforeRepin = factory.runtimes.length;
+			status = await requestDaemon(home, {
+				command: 'channel.repin',
+				name: 'personal',
+				installation,
+			});
+			assert.equal(status.channels[0]?.definition.installation, installation);
+			assert.equal(factory.runtimes.length, beforeRepin + 1);
+			assert.equal(factory.runtimes[beforeRepin - 1]?.closed, true);
+
 			const beforeRestartCommand = factory.runtimes.length;
 			status = await requestDaemon(home, { command: 'channel.restart', name: 'personal' });
 			assert.equal(status.channels[0]?.state, 'running');

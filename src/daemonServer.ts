@@ -280,6 +280,8 @@ export class DaemonServer {
 				});
 			case 'channel.switch':
 				return this.enqueue(async () => this.switchOne(request.name, request.session, request.chat));
+			case 'channel.repin':
+				return this.enqueue(async () => this.repinOne(request.name, request.installation));
 			case 'channel.delete':
 				return this.enqueue(async () => {
 					await this.getDefinition(request.name);
@@ -408,8 +410,24 @@ export class DaemonServer {
 
 	private async switchOne(name: string, session: string, chat?: string): Promise<void> {
 		const previous = await this.getDefinition(name);
-		const runtime = this.runtimes.get(name);
 		const next = retargetChannelInstance(previous, session, chat);
+		await this.replaceOne(name, previous, next);
+	}
+
+	private async repinOne(name: string, installation: string): Promise<void> {
+		const previous = await this.getDefinition(name);
+		if (previous.installation === installation) {
+			return;
+		}
+		await this.replaceOne(name, previous, { ...previous, installation });
+	}
+
+	private async replaceOne(
+		name: string,
+		previous: ChannelInstanceConfig,
+		next: ChannelInstanceConfig,
+	): Promise<void> {
+		const runtime = this.runtimes.get(name);
 		await this.runtimeFactory.validate(next);
 		if (runtime && !await runtime.quiesce()) {
 			throw new DaemonProtocolError('CHANNEL_BUSY', `Channel '${name}' is processing a turn`);

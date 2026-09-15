@@ -9,7 +9,7 @@ import { getDaemonPaths } from './daemonPaths.js';
 import { type ChannelDaemonStatus, type DaemonStatus } from './daemonProtocol.js';
 import { describeEndpoint, discoverLocalAgentHosts, selectAgentHost } from './endpoints.js';
 import { removeInstanceState } from './instancePaths.js';
-import { PluginManager, listInstalledPlugins } from './plugins.js';
+import { activeInstallation, PluginManager, listInstalledPlugins } from './plugins.js';
 import { VERSION } from './version.js';
 
 const program = new Command();
@@ -38,6 +38,14 @@ marketplace
 			console.log(`${name}\t${value.source}`);
 		}
 	});
+marketplace
+	.command('update')
+	.argument('<name>')
+	.action(async (name: string) => {
+		const path = await plugins.updateMarketplace(name);
+		console.log(`Updated marketplace ${name}`);
+		console.log(path);
+	});
 
 const plugin = program.command('plugin').description('Install and inspect Claude channel plugins');
 plugin
@@ -45,21 +53,73 @@ plugin
 	.argument('<plugin>')
 	.action(async (spec: string) => {
 		const installed = await plugins.install(spec);
-		console.log(`Installed ${installed.name}${installed.version ? ` ${installed.version}` : ''}`);
-		console.log(installed.path);
+		console.log(formatInstalledPlugin(installed.plugin.name, installed.plugin.version, installed.installation, installed.created));
+		console.log(installed.plugin.path);
+	});
+plugin
+	.command('upgrade')
+	.argument('<plugin>')
+	.action(async (name: string) => {
+		const installed = await plugins.upgrade(name);
+		console.log(formatInstalledPlugin(installed.plugin.name, installed.plugin.version, installed.installation, installed.created));
+		console.log('Existing channels remain pinned; run channel upgrade <name> to adopt it');
+	});
+plugin
+	.command('versions')
+	.argument('<plugin>')
+	.action(async (name: string) => {
+		const versions = await plugins.versions(name);
+		console.table(versions.map(version => ({
+			installation: version.id,
+			active: version.active,
+			version: version.config.version ?? '',
+			marketplaceRevision: version.config.marketplaceRevision ?? '',
+			channels: version.channels.join(', '),
+			path: version.config.path,
+		})));
+	});
+plugin
+	.command('rollback')
+	.argument('<plugin>')
+	.argument('<installation>')
+	.action(async (name: string, installation: string) => {
+		const selected = await plugins.activate(name, installation);
+		console.log(`Activated ${name} ${selected.version ?? installation} (${installation})`);
+		console.log('Existing channels remain pinned; run channel upgrade <name> to adopt it');
+	});
+plugin
+	.command('prune')
+	.argument('[plugin]')
+	.action(async (name?: string) => {
+		const removed = await plugins.prune(name);
+		if (removed.length === 0) {
+			console.log('No unreferenced plugin installations');
+			return;
+		}
+		for (const installation of removed) {
+			console.log(`Removed ${installation.plugin} ${installation.installation}`);
+		}
 	});
 plugin
 	.command('list')
 	.action(async () => {
 		for (const [name, installed] of listInstalledPlugins(await store.read())) {
-			console.log(`${name}\t${installed.marketplace}\t${installed.path}`);
+			const active = activeInstallation(installed);
+			console.log([
+				name,
+				installed.marketplace,
+				active.version ?? '',
+				installed.activeInstallation,
+				active.path,
+			].join('\t'));
 		}
 	});
 plugin
 	.command('inspect')
 	.argument('<plugin>')
-	.action(async (nameOrPath: string) => {
-		const inspected = await plugins.resolvePlugin(nameOrPath);
+	.option('--installation <id>')
+	.action(async (nameOrPath: string, options: { installation?: string }) => {
+		const inspected = await plugins.resolvePlugin(nameOrPath, options.installation);
 		console.log(JSON.stringify({
 			name: inspected.name,
 			version: inspected.version,
@@ -151,6 +211,7 @@ channel
 	.option('--server <name>', 'MCP server name when the plugin declares more than one')
 	.option('--host <selector>', 'Discovered host index or ID prefix')
 	.option('--client-id <id>', 'Override the stable AHP client ID')
+	.option('--installation <id>', 'Pin a specific installed plugin version')
 	.option('--start', 'Start the channel immediately')
 	.action(async (name: string, options: {
 		plugin: string;
@@ -159,10 +220,11 @@ channel
 		server?: string;
 		host?: string;
 		clientId?: string;
+		installation?: string;
 		start?: boolean;
 	}) => {
 		assertChannelName(name);
-		const definition = channelDefinition(options);
+		const definition = await channelDefinition(options);
 		if (!options.start) {
 			await validateChannelDefinition(plugins, definition);
 			await store.update(config => {
@@ -222,6 +284,30 @@ channel
 		}
 		const restarted = await requestDaemon(store.home, { command: 'channel.restart', name });
 		printChannelStatus(requireChannelStatus(restarted, name));
+	});
+channel
+	.command('upgrade')
+	.argument('<name>')
+	.action(async (name: string) => {
+		const current = await getOfflineChannel(name);
+		const reference = await plugins.pinPlugin(current.plugin);
+		if (!reference.installation) {
+			throw new Error(`Channel '${name}' uses a plugin path and cannot be upgraded through the plugin registry`);
+		}
+		const updated = { ...current, installation: reference.installation };
+		const daemonStatus = await probeDaemon(store.home);
+		if (daemonStatus) {
+			const status = await requestDaemon(store.home, {
+				command: 'channel.repin',
+				name,
+				installation: reference.installation,
+			});
+			printChannelStatus(requireChannelStatus(status, name));
+			return;
+		}
+		await validateChannelDefinition(plugins, updated);
+		await store.update(config => withChannel(config, name, updated));
+		printChannelStatus(stoppedChannelStatus(name, updated));
 	});
 channel
 	.command('stop')
@@ -326,9 +412,18 @@ channel
 	.option('--server <name>', 'MCP server name when the plugin declares more than one')
 	.option('--host <selector>', 'Discovered host index or ID prefix')
 	.option('--client-id <id>', 'Override the stable AHP client ID')
-	.action(async (pluginName: string, options: { session: string; chat?: string; server?: string; host?: string; clientId?: string }) => {
+	.option('--installation <id>', 'Use a specific installed plugin version')
+	.action(async (pluginName: string, options: {
+		session: string;
+		chat?: string;
+		server?: string;
+		host?: string;
+		clientId?: string;
+		installation?: string;
+	}) => {
+		const reference = await plugins.pinPlugin(pluginName, options.installation);
 		const runtime = await ChannelRuntime.start(pluginName, {
-			plugin: pluginName,
+			...reference,
 			session: options.session,
 			enabled: true,
 			...(options.chat ? { chat: options.chat } : {}),
@@ -365,16 +460,18 @@ function waitForShutdownSignal(): Promise<void> {
 	});
 }
 
-function channelDefinition(options: {
+async function channelDefinition(options: {
 	plugin: string;
 	session: string;
 	chat?: string;
 	server?: string;
 	host?: string;
 	clientId?: string;
-}): ChannelInstanceConfig {
+	installation?: string;
+}): Promise<ChannelInstanceConfig> {
+	const reference = await plugins.pinPlugin(options.plugin, options.installation);
 	return {
-		plugin: options.plugin,
+		...reference,
 		session: options.session,
 		enabled: false,
 		...(options.chat ? { chat: options.chat } : {}),
@@ -411,6 +508,7 @@ function printChannelTable(channels: readonly ChannelDaemonStatus[]): void {
 		state: channel.state,
 		desired: channel.desired,
 		plugin: channel.definition.plugin,
+		installation: channel.definition.installation?.slice(0, 12) ?? '',
 		session: channel.definition.session,
 		chat: channel.runtime?.chat ?? channel.definition.chat ?? 'default',
 		error: channel.error ?? '',
@@ -418,10 +516,22 @@ function printChannelTable(channels: readonly ChannelDaemonStatus[]): void {
 }
 
 function printChannelStatus(channel: ChannelDaemonStatus): void {
-	console.log(`${channel.name}: ${channel.state} → ${channel.definition.session}${channel.runtime ? ` (${channel.runtime.chat})` : ''}`);
+	const installation = channel.definition.installation
+		? ` @ ${channel.definition.installation.slice(0, 12)}`
+		: '';
+	console.log(`${channel.name}: ${channel.state}${installation} → ${channel.definition.session}${channel.runtime ? ` (${channel.runtime.chat})` : ''}`);
 	if (channel.error) {
 		console.log(`Error: ${channel.error}`);
 	}
+}
+
+function formatInstalledPlugin(
+	name: string,
+	version: string | undefined,
+	installation: string,
+	created: boolean,
+): string {
+	return `${created ? 'Installed' : 'Reused'} ${name}${version ? ` ${version}` : ''} (${installation})`;
 }
 
 async function getOfflineChannel(name: string): Promise<ChannelInstanceConfig> {
