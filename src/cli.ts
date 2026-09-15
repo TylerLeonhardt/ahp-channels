@@ -2,7 +2,7 @@
 
 import type { ChatState } from '@microsoft/agent-host-protocol';
 import { Command } from 'commander';
-import { connectAgentHost, listSessions, resolveChat, subscribeSession } from './ahp.js';
+import { connectAgentHost, createChannelClientId, listSessions, resolveChat, subscribeSession } from './ahp.js';
 import { ChannelBridge } from './bridge.js';
 import { ConfigStore } from './config.js';
 import { describeEndpoint, discoverLocalAgentHosts, selectAgentHost } from './endpoints.js';
@@ -112,11 +112,12 @@ channel
 	.option('--chat <uri>', 'AHP chat URI; defaults to the session default chat')
 	.option('--server <name>', 'MCP server name when the plugin declares more than one')
 	.option('--host <selector>', 'Discovered host index or ID prefix')
-	.action(async (pluginName: string, options: { session: string; chat?: string; server?: string; host?: string }) => {
+	.option('--client-id <id>', 'Override the stable AHP client ID')
+	.action(async (pluginName: string, options: { session: string; chat?: string; server?: string; host?: string; clientId?: string }) => {
 		const installed = await plugins.resolvePlugin(pluginName);
 		const server = resolveServerConfig(installed, options.server);
 		const endpoint = selectAgentHost(await discoverLocalAgentHosts(), options.host);
-		const connection = await connectAgentHost(endpoint);
+		const connection = await connectAgentHost(endpoint, options.clientId ?? createChannelClientId(pluginName, options.session));
 		let subscribedSession: Awaited<ReturnType<typeof subscribeSession>> | undefined;
 		let chatSubscription: Awaited<ReturnType<typeof connection.client.subscribe>> | undefined;
 		let mcp: McpChannelProcess | undefined;

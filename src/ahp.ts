@@ -6,7 +6,7 @@ import {
 } from '@microsoft/agent-host-protocol';
 import { AhpClient, type Subscription } from '@microsoft/agent-host-protocol/client';
 import { WebSocketTransport } from '@microsoft/agent-host-protocol/ws';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AgentHostEndpoint } from './endpoints.js';
 
 export interface ConnectedAgentHost {
@@ -20,7 +20,17 @@ export interface SubscribedSession {
 	readonly subscription: Subscription;
 }
 
-export async function connectAgentHost(endpoint: AgentHostEndpoint, clientId = randomUUID()): Promise<ConnectedAgentHost> {
+export function createChannelClientId(plugin: string, session: string): string {
+	const digest = createHash('sha256')
+		.update('ahp-channels\0')
+		.update(plugin)
+		.update('\0')
+		.update(session)
+		.digest('hex');
+	return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+}
+
+export async function connectAgentHost(endpoint: AgentHostEndpoint, clientId: string = randomUUID()): Promise<ConnectedAgentHost> {
 	if (endpoint.endpoint.type !== 'tcp') {
 		throw new Error('Socket-based local Agent Host connections are planned but not implemented in Phase 1');
 	}
