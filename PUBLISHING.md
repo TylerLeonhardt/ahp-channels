@@ -44,6 +44,10 @@ Then open npmjs.com → `ahp-channels` → Settings → Trusted Publisher and se
 After confirming one OIDC release, set Publishing access to **Require 2FA and
 disallow tokens**.
 
+Provenance requires the GitHub source repository to be public. A private source
+repository authenticates through OIDC but npm rejects the provenance bundle
+with HTTP 422.
+
 ## Cut subsequent releases
 
 ```powershell

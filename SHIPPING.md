@@ -15,7 +15,9 @@
 - [x] Add the tag-driven OIDC publish workflow and release documentation.
 - [x] Bootstrap `0.1.0-alpha.1` under the npm `next` tag.
 - [x] Verify npm's required first-version `latest` behavior.
-- [ ] Configure npm trusted publishing for `TylerLeonhardt/ahp-channels`.
+- [x] Configure npm trusted publishing for `TylerLeonhardt/ahp-channels`.
+- [x] Publish `0.1.0-alpha.2` through OIDC with SLSA provenance.
+- [x] Verify the public registry install, daemon, signatures, and attestations.
 - [ ] Run a fresh-machine Telegram setup on macOS or Linux.
 
 ## `0.1.0`
