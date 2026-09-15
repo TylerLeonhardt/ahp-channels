@@ -5,7 +5,7 @@ import {
 	type ToolResultContent,
 } from '@microsoft/agent-host-protocol';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
 import type { ChannelEvent } from './channelPrompt.js';
 import type { StdioMcpServerConfig } from './plugins.js';
@@ -69,14 +69,11 @@ export class McpChannelProcess implements McpChannelClient {
 	}
 
 	async start(): Promise<StartedMcpChannel> {
-		const env = this.config.env
-			? { ...getDefaultEnvironment(), ...this.config.env }
-			: undefined;
 		this.transport = new StdioClientTransport({
 			command: this.config.command,
 			args: [...this.config.args],
 			...(this.config.cwd ? { cwd: this.config.cwd } : {}),
-			...(env ? { env } : {}),
+			env: createChannelEnvironment(this.config.env),
 			stderr: 'pipe',
 		});
 		this.transport.stderr?.on('data', chunk => this.onStderr(String(chunk)));
@@ -147,6 +144,18 @@ export class McpChannelProcess implements McpChannelClient {
 			}
 		}
 	}
+}
+
+export function createChannelEnvironment(
+	overrides: Readonly<Record<string, string>> = {},
+): Record<string, string> {
+	const environment: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) {
+			environment[key] = value;
+		}
+	}
+	return { ...environment, ...overrides };
 }
 
 export function convertToolResult(toolName: string, value: unknown): ToolCallResult {
