@@ -15,6 +15,7 @@ import {
 } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { isValidChannelInstanceName, type PluginInstallationConfig } from './config.js';
+import { withFileLock } from './lockedFile.js';
 
 const INSTALLATION_METADATA = '.ahp-channels-installation.json';
 const EXCLUDED_DIRECTORIES = new Set(['.git', 'node_modules']);
@@ -66,43 +67,30 @@ export async function installPluginSnapshot(
 	const entries = await collectEntries(canonicalSource, includedPaths);
 	const id = digestEntries(entries);
 	const installationPath = getPluginInstallationPath(home, provenance.marketplace, provenance.plugin, id);
-	if (await isDirectory(installationPath)) {
-		return readInstalledSnapshot(installationPath, id, provenance.marketplace, provenance.plugin);
-	}
+	return withFileLock(installationPath, async () => {
+		if (await isDirectory(installationPath)) {
+			return readInstalledSnapshot(installationPath, id, provenance.marketplace, provenance.plugin);
+		}
 
-	const parent = dirname(installationPath);
-	await mkdir(parent, { recursive: true });
-	const temporary = join(parent, `.${id}.${process.pid}.${randomUUID()}.tmp`);
-	let created = true;
-	try {
-		await writeSnapshot(temporary, entries);
-		await writeFile(join(temporary, INSTALLATION_METADATA), `${JSON.stringify({
-			schemaVersion: 1,
-			id,
-			...provenance,
-		}, undefined, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+		const parent = dirname(installationPath);
+		const temporary = join(parent, `.${id}.${process.pid}.${randomUUID()}.tmp`);
 		try {
+			await writeSnapshot(temporary, entries);
+			await writeFile(join(temporary, INSTALLATION_METADATA), `${JSON.stringify({
+				schemaVersion: 1,
+				id,
+				...provenance,
+			}, undefined, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
 			await rename(temporary, installationPath);
-		} catch (error) {
-			if (!isNodeError(error) || (error.code !== 'EEXIST' && error.code !== 'ENOTEMPTY')) {
-				throw error;
-			}
-			if (!await isDirectory(installationPath)) {
-				throw error;
-			}
-			created = false;
+			return {
+				id,
+				config: installationConfig(installationPath, provenance),
+				created: true,
+			};
+		} finally {
+			await rm(temporary, { recursive: true, force: true });
 		}
-	} finally {
-		await rm(temporary, { recursive: true, force: true });
-	}
-
-	return created
-		? {
-			id,
-			config: installationConfig(installationPath, provenance),
-			created: true,
-		}
-		: readInstalledSnapshot(installationPath, id, provenance.marketplace, provenance.plugin);
+	});
 }
 
 export function getPluginInstallationPath(
