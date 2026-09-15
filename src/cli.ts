@@ -2,6 +2,7 @@
 
 import { Command } from 'commander';
 import { connectAgentHost, listSessions } from './ahp.js';
+import { ChannelAccessStore, isAccessPluginName, type DirectMessagePolicy } from './channelAccess.js';
 import { ChannelRuntime, createChannelRuntimeServices, validateChannelDefinition } from './channelRuntime.js';
 import { ConfigStore, isValidChannelInstanceName, retargetChannelInstance, type AppConfig, type ChannelInstanceConfig } from './config.js';
 import { ensureDaemonStarted, probeDaemon, requestDaemon, stopDaemon } from './daemonClient.js';
@@ -12,7 +13,6 @@ import { removeInstanceState } from './instancePaths.js';
 import { PluginManager, listInstalledPlugins } from './plugins.js';
 import { readSecret } from './secretInput.js';
 import { KeyringSecretStore, validateSecretKey } from './secrets.js';
-import { TelegramAccessStore, type TelegramDirectMessagePolicy } from './telegramAccess.js';
 import { VERSION } from './version.js';
 
 const program = new Command();
@@ -435,7 +435,7 @@ channelAccess
 	.argument('<name>')
 	.option('--json', 'Print machine-readable output')
 	.action(async (name: string, options: { json?: boolean }) => {
-		const status = await telegramAccess(name).then(access => access.status());
+		const status = await channelAccessStore(name).then(access => access.status());
 		if (options.json) {
 			console.log(JSON.stringify(status, undefined, 2));
 		} else {
@@ -453,7 +453,7 @@ channelAccess
 	.argument('<name>')
 	.argument('<code>')
 	.action(async (name: string, code: string) => {
-		const access = await telegramAccess(name);
+		const access = await channelAccessStore(name);
 		const senderId = await withSuspendedChannel(name, () => access.pair(code));
 		console.log(`Paired sender ${senderId}`);
 	});
@@ -462,7 +462,7 @@ channelAccess
 	.argument('<name>')
 	.argument('<code>')
 	.action(async (name: string, code: string) => {
-		const access = await telegramAccess(name);
+		const access = await channelAccessStore(name);
 		await withSuspendedChannel(name, () => access.deny(code));
 		console.log(`Denied pairing ${code}`);
 	});
@@ -471,10 +471,10 @@ channelAccess
 	.argument('<name>')
 	.argument('<policy>')
 	.action(async (name: string, policy: string) => {
-		if (!isTelegramPolicy(policy)) {
-			throw new Error(`Invalid Telegram policy '${policy}'`);
+		if (!isDirectMessagePolicy(policy)) {
+			throw new Error(`Invalid access policy '${policy}'`);
 		}
-		const access = await telegramAccess(name);
+		const access = await channelAccessStore(name);
 		await withSuspendedChannel(name, () => access.setPolicy(policy));
 		console.log(`Set policy to ${policy}`);
 	});
@@ -483,7 +483,7 @@ channelAccess
 	.argument('<name>')
 	.argument('<sender-id>')
 	.action(async (name: string, senderId: string) => {
-		const access = await telegramAccess(name);
+		const access = await channelAccessStore(name);
 		await withSuspendedChannel(name, () => access.allow(requireValue(senderId, 'sender ID')));
 		console.log(`Allowed sender ${senderId}`);
 	});
@@ -492,7 +492,7 @@ channelAccess
 	.argument('<name>')
 	.argument('<sender-id>')
 	.action(async (name: string, senderId: string) => {
-		const access = await telegramAccess(name);
+		const access = await channelAccessStore(name);
 		await withSuspendedChannel(name, () => access.remove(requireValue(senderId, 'sender ID')));
 		console.log(`Removed sender ${senderId}`);
 	});
@@ -686,16 +686,16 @@ async function restartAfterSecretChange(name: string, definition: ChannelInstanc
 	}
 }
 
-async function telegramAccess(name: string): Promise<TelegramAccessStore> {
+async function channelAccessStore(name: string): Promise<ChannelAccessStore> {
 	const definition = await getOfflineChannel(name);
 	const plugin = await plugins.resolvePlugin(definition.plugin);
-	if (plugin.name !== 'telegram') {
+	if (!isAccessPluginName(plugin.name)) {
 		throw new Error(`Access management is not available for plugin '${plugin.name}'`);
 	}
-	return new TelegramAccessStore(store.home, name);
+	return new ChannelAccessStore(store.home, name, plugin.name);
 }
 
-function isTelegramPolicy(value: string): value is TelegramDirectMessagePolicy {
+function isDirectMessagePolicy(value: string): value is DirectMessagePolicy {
 	return value === 'pairing' || value === 'allowlist' || value === 'disabled';
 }
 

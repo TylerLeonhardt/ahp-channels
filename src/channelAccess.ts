@@ -1,9 +1,10 @@
 import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { getTelegramStateDirectory } from './instancePaths.js';
+import { getPluginStateDirectory } from './instancePaths.js';
 import { withFileLock, writeFileAtomic } from './lockedFile.js';
 
-export type TelegramDirectMessagePolicy = 'pairing' | 'allowlist' | 'disabled';
+export type AccessPluginName = 'discord' | 'telegram';
+export type DirectMessagePolicy = 'pairing' | 'allowlist' | 'disabled';
 
 interface PendingPairing {
 	readonly senderId: string;
@@ -13,16 +14,16 @@ interface PendingPairing {
 	readonly replies?: number;
 }
 
-interface TelegramAccess {
-	readonly dmPolicy: TelegramDirectMessagePolicy;
+interface ChannelAccess {
+	readonly dmPolicy: DirectMessagePolicy;
 	readonly allowFrom: readonly string[];
 	readonly groups: Readonly<Record<string, unknown>>;
 	readonly pending: Readonly<Record<string, PendingPairing>>;
 	readonly [key: string]: unknown;
 }
 
-export interface TelegramAccessStatus {
-	readonly policy: TelegramDirectMessagePolicy;
+export interface ChannelAccessStatus {
+	readonly policy: DirectMessagePolicy;
 	readonly allowedSenders: readonly string[];
 	readonly pendingPairings: readonly {
 		readonly code: string;
@@ -32,16 +33,16 @@ export interface TelegramAccessStatus {
 	readonly groupCount: number;
 }
 
-export class TelegramAccessStore {
+export class ChannelAccessStore {
 	private readonly stateDirectory: string;
 	private readonly accessFile: string;
 
-	constructor(home: string, channel: string) {
-		this.stateDirectory = getTelegramStateDirectory(home, channel);
+	constructor(home: string, channel: string, plugin: AccessPluginName) {
+		this.stateDirectory = getPluginStateDirectory(home, channel, plugin);
 		this.accessFile = join(this.stateDirectory, 'access.json');
 	}
 
-	async status(): Promise<TelegramAccessStatus> {
+	async status(): Promise<ChannelAccessStatus> {
 		const access = await this.read();
 		return {
 			policy: access.dmPolicy,
@@ -97,7 +98,7 @@ export class TelegramAccessStore {
 		});
 	}
 
-	async setPolicy(policy: TelegramDirectMessagePolicy): Promise<void> {
+	async setPolicy(policy: DirectMessagePolicy): Promise<void> {
 		await this.update(async access => ({
 			value: undefined,
 			access: { ...access, dmPolicy: policy },
@@ -127,7 +128,7 @@ export class TelegramAccessStore {
 	}
 
 	private async update<T>(
-		change: (access: TelegramAccess) => Promise<{ readonly access: TelegramAccess; readonly value: T }>,
+		change: (access: ChannelAccess) => Promise<{ readonly access: ChannelAccess; readonly value: T }>,
 	): Promise<T> {
 		return withFileLock(this.accessFile, async () => {
 			const changed = await change(await this.read());
@@ -136,7 +137,7 @@ export class TelegramAccessStore {
 		});
 	}
 
-	private async read(): Promise<TelegramAccess> {
+	private async read(): Promise<ChannelAccess> {
 		let value: unknown;
 		try {
 			value = JSON.parse(await readFile(this.accessFile, 'utf8'));
@@ -144,19 +145,19 @@ export class TelegramAccessStore {
 			if (isNodeError(error) && error.code === 'ENOENT') {
 				return defaultAccess();
 			}
-			throw new Error(`Failed to read Telegram access state ${this.accessFile}`, { cause: error });
+			throw new Error(`Failed to read channel access state ${this.accessFile}`, { cause: error });
 		}
 		return parseAccess(value, this.accessFile);
 	}
 }
 
-function parseAccess(value: unknown, path: string): TelegramAccess {
+function parseAccess(value: unknown, path: string): ChannelAccess {
 	if (!isRecord(value)
 		|| !isPolicy(value['dmPolicy'])
 		|| !isStringArray(value['allowFrom'])
 		|| !isRecord(value['groups'])
 		|| !isRecord(value['pending'])) {
-		throw new Error(`Invalid Telegram access state ${path}`);
+		throw new Error(`Invalid channel access state ${path}`);
 	}
 	const pending: Record<string, PendingPairing> = {};
 	for (const [code, entry] of Object.entries(value['pending'])) {
@@ -167,7 +168,7 @@ function parseAccess(value: unknown, path: string): TelegramAccess {
 			|| typeof entry['createdAt'] !== 'number'
 			|| typeof entry['expiresAt'] !== 'number'
 			|| (entry['replies'] !== undefined && typeof entry['replies'] !== 'number')) {
-			throw new Error(`Invalid pending Telegram pairing in ${path}`);
+			throw new Error(`Invalid pending pairing in ${path}`);
 		}
 		pending[code] = {
 			senderId: entry['senderId'],
@@ -186,7 +187,7 @@ function parseAccess(value: unknown, path: string): TelegramAccess {
 	};
 }
 
-function defaultAccess(): TelegramAccess {
+function defaultAccess(): ChannelAccess {
 	return {
 		dmPolicy: 'pairing',
 		allowFrom: [],
@@ -195,7 +196,7 @@ function defaultAccess(): TelegramAccess {
 	};
 }
 
-function isPolicy(value: unknown): value is TelegramDirectMessagePolicy {
+function isPolicy(value: unknown): value is DirectMessagePolicy {
 	return value === 'pairing' || value === 'allowlist' || value === 'disabled';
 }
 
@@ -213,12 +214,16 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 
 function validateSenderId(senderId: string): void {
 	if (!/^\d+$/.test(senderId)) {
-		throw new Error(`Invalid Telegram sender ID '${senderId}'`);
+		throw new Error(`Invalid sender ID '${senderId}'`);
 	}
 }
 
 function validatePairingCode(code: string): void {
 	if (!/^[0-9a-f]{6}$/i.test(code)) {
-		throw new Error(`Invalid Telegram pairing code '${code}'`);
+		throw new Error(`Invalid pairing code '${code}'`);
 	}
+}
+
+export function isAccessPluginName(value: string): value is AccessPluginName {
+	return value === 'discord' || value === 'telegram';
 }

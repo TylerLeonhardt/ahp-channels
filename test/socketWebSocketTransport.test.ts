@@ -29,9 +29,7 @@ afterEach(async () => {
 
 describe('SocketWebSocketTransport', () => {
 	it('carries AHP frames over a named pipe or Unix socket', async () => {
-		socketPath = process.platform === 'win32'
-			? `\\\\.\\pipe\\ahp-channels-test-${randomUUID()}`
-			: join(tmpdir(), `ahp-channels-test-${randomUUID()}.sock`);
+		socketPath = createSocketPath();
 		server = createServer();
 		webSocketServer = new WebSocketServer({ server });
 		const connected = new Promise<void>(resolve => {
@@ -74,9 +72,7 @@ describe('SocketWebSocketTransport', () => {
 	});
 
 	it('treats a completed close without a status code as clean', async () => {
-		socketPath = process.platform === 'win32'
-			? `\\\\.\\pipe\\ahp-channels-test-${randomUUID()}`
-			: join(tmpdir(), `ahp-channels-test-${randomUUID()}.sock`);
+		socketPath = createSocketPath();
 		server = createServer();
 		webSocketServer = new WebSocketServer({ server });
 		webSocketServer.once('connection', socket => socket.close());
@@ -90,3 +86,9 @@ describe('SocketWebSocketTransport', () => {
 		assert.equal(await transport.recv(), null);
 	});
 });
+
+function createSocketPath(): string {
+	return process.platform === 'win32'
+		? `\\\\.\\pipe\\ahp-channels-test-${randomUUID()}`
+		: join(tmpdir(), `ahp-${randomUUID()}.sock`);
+}

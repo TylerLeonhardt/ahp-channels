@@ -18,8 +18,11 @@ export function getClaudeConfigDirectory(home: string, name: string): string {
 	return getInstanceRoot(home, name);
 }
 
-export function getTelegramStateDirectory(home: string, name: string): string {
-	return join(getClaudeConfigDirectory(home, name), 'channels', 'telegram');
+export function getPluginStateDirectory(home: string, name: string, plugin: string): string {
+	if (!isValidChannelInstanceName(plugin)) {
+		throw new Error(`Invalid plugin name '${plugin}'`);
+	}
+	return join(getClaudeConfigDirectory(home, name), 'channels', plugin);
 }
 
 export async function removeInstanceState(home: string, name: string): Promise<void> {

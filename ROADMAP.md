@@ -23,7 +23,7 @@
 - OS-keyring secrets with environment-only injection into channel processes.
 - Named instances with isolated state directories.
 - Durable event IDs, pending replay, and bounded deduplication history.
-- First-class secret and Telegram access commands.
+- First-class secret and Telegram/Discord access commands.
 
 ## Next: Operational polish
 
