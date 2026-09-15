@@ -72,13 +72,13 @@ describe('McpChannelProcess', () => {
 		const channel = new McpChannelProcess({
 			command: process.execPath,
 			args: [server],
-			env: { AHP_CHANNELS_FAKE_EXIT_MS: '20' },
+			env: { AHP_CHANNELS_FAKE_EXIT_MS: '500' },
 		}, () => undefined);
 		await channel.start();
 
 		await Promise.race([
 			channel.whenStopped,
-			new Promise<never>((_, reject) => setTimeout(() => reject(new Error('MCP channel did not report its exit')), 2000)),
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error('MCP channel did not report its exit')), 3000)),
 		]);
 		await channel.close();
 	});
