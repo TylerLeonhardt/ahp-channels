@@ -3,12 +3,11 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { withFileLock, writeFileAtomic } from './lockedFile.js';
 
-export const CONFIG_VERSION = 1;
+export const CONFIG_VERSION = 2;
 export const OFFICIAL_MARKETPLACE_NAME = 'claude-plugins-official';
 export const OFFICIAL_MARKETPLACE_SOURCE = 'anthropics/claude-plugins-official';
 const CHANNEL_INSTANCE_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
-const ENVIRONMENT_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export interface MarketplaceConfig {
 	readonly source: string;
@@ -28,7 +27,6 @@ export interface ChannelInstanceConfig {
 	readonly server?: string;
 	readonly host?: string;
 	readonly clientId?: string;
-	readonly secretEnvironment?: readonly string[];
 }
 
 export interface AppConfig {
@@ -59,7 +57,6 @@ export function retargetChannelInstance(
 		...(definition.server ? { server: definition.server } : {}),
 		...(definition.host ? { host: definition.host } : {}),
 		...(definition.clientId ? { clientId: definition.clientId } : {}),
-		...(definition.secretEnvironment?.length ? { secretEnvironment: [...definition.secretEnvironment] } : {}),
 	};
 }
 
@@ -153,8 +150,7 @@ function parseChannelInstance(value: unknown): ChannelInstanceConfig {
 		|| !isOptionalString(value['chat'])
 		|| !isOptionalString(value['server'])
 		|| !isOptionalString(value['host'])
-		|| !isOptionalString(value['clientId'])
-		|| !isOptionalStringArray(value['secretEnvironment'])) {
+		|| !isOptionalString(value['clientId'])) {
 		throw new Error('Invalid channel instance configuration');
 	}
 	return {
@@ -165,7 +161,6 @@ function parseChannelInstance(value: unknown): ChannelInstanceConfig {
 		...(value['server'] ? { server: value['server'] } : {}),
 		...(value['host'] ? { host: value['host'] } : {}),
 		...(value['clientId'] ? { clientId: value['clientId'] } : {}),
-		...(value['secretEnvironment']?.length ? { secretEnvironment: [...new Set(value['secretEnvironment'])] } : {}),
 	};
 }
 
@@ -202,10 +197,6 @@ function parseChannelRecord(value: unknown): Record<string, ChannelInstanceConfi
 
 function isOptionalString(value: unknown): value is string | undefined {
 	return value === undefined || typeof value === 'string';
-}
-
-function isOptionalStringArray(value: unknown): value is string[] | undefined {
-	return value === undefined || (Array.isArray(value) && value.every(item => typeof item === 'string' && ENVIRONMENT_KEY.test(item)));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

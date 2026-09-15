@@ -1,10 +1,15 @@
+import {
+	CustomizationEnablementKind,
+	CustomizationType,
+} from '@microsoft/agent-host-protocol';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 import { ConfigStore } from '../src/config.js';
-import { PluginManager, resolveServerConfig } from '../src/plugins.js';
+import { createPluginCustomization, PluginManager, resolveServerConfig } from '../src/plugins.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -59,6 +64,43 @@ describe('PluginManager', () => {
 				marketplace: 'test',
 				path: pluginPath,
 				version: '1.2.3',
+			},
+		});
+	});
+
+	it('publishes an installed plugin while disabling only the proxied MCP server', async () => {
+		const pluginPath = join(tmpdir(), 'fake-plugin');
+		const customization = createPluginCustomization({
+			name: 'fake',
+			path: pluginPath,
+			version: '1.2.3',
+			servers: {
+				channel: { command: 'node', args: ['server.mjs'] },
+				helper: { command: 'node', args: ['helper.mjs'] },
+			},
+		}, 'client-id', 'channel');
+		const nonce = customization.nonce;
+
+		assert.match(nonce ?? '', /^[0-9a-f-]{36}$/);
+		assert.deepEqual({
+			...customization,
+			nonce: '<nonce>',
+		}, {
+			type: CustomizationType.Plugin,
+			id: 'client-id:plugin:fake',
+			uri: pathToFileURL(pluginPath).href,
+			name: 'fake',
+			version: '1.2.3',
+			enablement: [{
+				kind: CustomizationEnablementKind.Global,
+				enabled: true,
+			}],
+			nonce: '<nonce>',
+			childEnablement: {
+				channel: [{
+					kind: CustomizationEnablementKind.Global,
+					enabled: false,
+				}],
 			},
 		});
 	});

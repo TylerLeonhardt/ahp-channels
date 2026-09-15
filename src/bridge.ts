@@ -9,6 +9,8 @@ import {
 	type ChatState,
 	type ChatToolCallReadyAction,
 	type ChatToolCallStartAction,
+	type ClientPluginCustomization,
+	type SessionActiveClient,
 	type StateAction,
 	type ToolCallResult,
 } from '@microsoft/agent-host-protocol';
@@ -42,6 +44,7 @@ export interface ChannelBridgeOptions {
 	readonly chatSubscription: AsyncIterable<SubscriptionEvent> & { close(): Promise<void> };
 	readonly channel: Pick<McpChannelClient, 'setChannelHandler' | 'callTool' | 'close'>;
 	readonly channelInfo: StartedMcpChannel;
+	readonly customizations: readonly ClientPluginCustomization[];
 	readonly eventJournal?: ChannelEventJournal;
 	readonly autoApproveTools?: boolean;
 	readonly onStatus?: (message: string) => void;
@@ -98,13 +101,11 @@ export class ChannelBridge {
 
 	async start(): Promise<void> {
 		const { client, clientId, session, channelInfo } = this.options;
-		client.dispatch(session, {
-			type: ActionType.SessionActiveClientSet,
-			activeClient: {
-				clientId,
-				displayName: `ahp-channels (${channelInfo.name})`,
-				tools: [...channelInfo.tools],
-			},
+		publishActiveClient(client, session, {
+			clientId,
+			displayName: `ahp-channels (${channelInfo.name})`,
+			tools: [...channelInfo.tools],
+			customizations: [...this.options.customizations],
 		});
 		this.actionLoop = this.consumeChatActions();
 		if (this.options.eventJournal) {
@@ -114,7 +115,7 @@ export class ChannelBridge {
 			}
 		}
 		await this.options.channel.setChannelHandler(event => this.trackChannelEvent(event));
-		this.options.onStatus?.(`bridging ${channelInfo.name} to ${this.options.chat}`);
+		this.options.onStatus?.(`registered ${channelInfo.name} client for ${this.options.chat}`);
 	}
 
 	async close(): Promise<void> {
@@ -390,6 +391,17 @@ export function parseToolInput(input: ChatToolCallReadyAction['toolInput']): Rec
 
 function toError(label: string, error: unknown): Error {
 	return new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+}
+
+export function publishActiveClient(
+	client: Pick<ChannelBridgeOptions['client'], 'dispatch'>,
+	session: string,
+	activeClient: SessionActiveClient,
+): void {
+	client.dispatch(session, {
+		type: ActionType.SessionActiveClientSet,
+		activeClient,
+	});
 }
 
 function journalEventIds(state: ChatState): string[] {

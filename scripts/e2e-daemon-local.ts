@@ -1,6 +1,8 @@
 import {
 	ActionType,
 	ConfirmationOptionKind,
+	CustomizationLoadStatus,
+	CustomizationType,
 	SessionLifecycle,
 	ToolCallConfirmationReason,
 	sessionReducer,
@@ -12,7 +14,7 @@ import {
 } from '@microsoft/agent-host-protocol';
 import type { Subscription, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,8 +23,9 @@ import { ensureDaemonStarted, requestDaemon, stopDaemon } from '../src/daemonCli
 import { discoverLocalAgentHosts, selectAgentHost } from '../src/endpoints.js';
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const testRoot = join(tmpdir(), `ahp-channels-daemon-e2e-${randomUUID()}`);
+const testRoot = await mkdtemp(join(tmpdir(), 'ahp-d-'));
 const pluginRoot = join(testRoot, 'plugin');
+const setupPluginRoot = join(testRoot, 'setup-plugin');
 const outputFile = join(testRoot, 'replies.txt');
 const fixtureServer = join(repositoryRoot, 'test', 'fixtures', 'fake-plugin', 'server.mjs');
 const marker = `DAEMON_SWITCH_${randomUUID()}`;
@@ -38,7 +41,7 @@ const chatSubscriptions: Subscription[] = [];
 let daemonStarted = false;
 
 try {
-	await createTestPlugin();
+	await Promise.all([createTestPlugin(), createSetupPlugin()]);
 	const rootSnapshot = connection.initializeResult.snapshots.find(snapshot => snapshot.resource === 'ahp-root://');
 	const provider = (rootSnapshot?.state as RootState | undefined)?.agents[0]?.provider;
 	if (!provider) {
@@ -120,6 +123,27 @@ try {
 
 	await requestDaemon(testRoot, { command: 'channel.stop', name: 'switch-test' });
 	await requestDaemon(testRoot, { command: 'channel.delete', name: 'switch-test' });
+
+	const setupStatus = await requestDaemon(testRoot, {
+		command: 'channel.create',
+		name: 'setup-test',
+		definition: {
+			plugin: setupPluginRoot,
+			session: sessions[0],
+			enabled: false,
+			host: endpoint.id,
+		},
+		start: true,
+	});
+	const setupChannel = setupStatus.channels.find(candidate => candidate.name === 'setup-test');
+	if (setupChannel?.state !== 'error'
+		|| !setupChannel.error?.includes('MCP channel startup')
+		|| !setupChannel.runtime) {
+		throw new Error(`Expected a customization-only error runtime, received ${JSON.stringify(setupChannel)}`);
+	}
+	await waitForPluginSkill(sessionSubscriptions[0], 'setup-channel', 'configure');
+	console.log('Daemon E2E passed: kept setup-channel skills available after MCP startup failed');
+	await requestDaemon(testRoot, { command: 'channel.delete', name: 'setup-test' });
 } finally {
 	if (daemonStarted) {
 		await stopDaemon(testRoot).catch(error => {
@@ -141,6 +165,32 @@ try {
 	await rm(testRoot, { recursive: true, force: true });
 }
 
+async function createSetupPlugin(): Promise<void> {
+	await mkdir(join(setupPluginRoot, '.claude-plugin'), { recursive: true });
+	await mkdir(join(setupPluginRoot, 'skills', 'configure'), { recursive: true });
+	await writeFile(join(setupPluginRoot, '.claude-plugin', 'plugin.json'), JSON.stringify({
+		name: 'setup-channel',
+		version: '1.0.0',
+	}));
+	await writeFile(join(setupPluginRoot, '.mcp.json'), JSON.stringify({
+		mcpServers: {
+			'setup-channel': {
+				command: process.execPath,
+				args: ['--eval', 'process.stderr.write(\"setup required\\\\n\"); process.exit(1)'],
+			},
+		},
+	}));
+	await writeFile(join(setupPluginRoot, 'skills', 'configure', 'SKILL.md'), [
+		'---',
+		'name: configure',
+		'description: Configure the setup test channel.',
+		'disable-model-invocation: true',
+		'---',
+		'',
+		'Reply with exactly SETUP_SKILL_OK.',
+	].join('\n'));
+}
+
 async function createTestPlugin(): Promise<void> {
 	await mkdir(join(pluginRoot, '.claude-plugin'), { recursive: true });
 	await writeFile(join(pluginRoot, '.claude-plugin', 'plugin.json'), JSON.stringify({
@@ -159,6 +209,40 @@ async function createTestPlugin(): Promise<void> {
 			},
 		},
 	}));
+}
+
+async function waitForPluginSkill(
+	subscription: Subscription,
+	pluginName: string,
+	skillName: string,
+): Promise<void> {
+	const deadline = Date.now() + 60_000;
+	while (Date.now() < deadline) {
+		const event = await nextEvent(subscription, deadline - Date.now());
+		if (event.type !== 'action' || event.params.rejectionReason) {
+			continue;
+		}
+		const action = event.params.action;
+		const customizations = action.type === ActionType.SessionCustomizationUpdated
+			? [action.customization]
+			: action.type === ActionType.SessionCustomizationsChanged
+				? action.customizations
+				: [];
+		for (const customization of customizations) {
+			if (customization.type !== CustomizationType.Plugin || customization.name !== pluginName) {
+				continue;
+			}
+			if (customization.load?.kind === CustomizationLoadStatus.Error) {
+				throw new Error(`Failed to load ${pluginName}: ${customization.load.message}`);
+			}
+			if (customization.children?.some(child =>
+				child.type === CustomizationType.Skill && child.name === skillName
+			)) {
+				return;
+			}
+		}
+	}
+	throw new Error(`Timed out waiting for ${pluginName}:${skillName}`);
 }
 
 async function approveChannelTurn(initial: ChatState, subscription: Subscription, expectedMarker: string): Promise<void> {

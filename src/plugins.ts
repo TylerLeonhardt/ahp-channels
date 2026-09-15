@@ -1,6 +1,12 @@
+import {
+	CustomizationEnablementKind,
+	CustomizationType,
+	type ClientPluginCustomization,
+} from '@microsoft/agent-host-protocol';
+import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ConfigStore, type AppConfig, type InstalledPluginConfig } from './config.js';
 import { runProcess } from './process.js';
 
@@ -31,6 +37,11 @@ export interface ClaudePlugin {
 	readonly description?: string;
 	readonly version?: string;
 	readonly servers: Readonly<Record<string, StdioMcpServerConfig>>;
+}
+
+export interface ResolvedPluginServer {
+	readonly name: string;
+	readonly config: StdioMcpServerConfig;
 }
 
 export class PluginManager {
@@ -175,6 +186,10 @@ export async function inspectPlugin(pluginPath: string): Promise<ClaudePlugin> {
 }
 
 export function resolveServerConfig(plugin: ClaudePlugin, serverName?: string): StdioMcpServerConfig {
+	return resolvePluginServer(plugin, serverName).config;
+}
+
+export function resolvePluginServer(plugin: ClaudePlugin, serverName?: string): ResolvedPluginServer {
 	const selectedName = serverName ?? (Object.keys(plugin.servers).length === 1 ? Object.keys(plugin.servers)[0] : undefined);
 	if (!selectedName) {
 		throw new Error(`Plugin '${plugin.name}' has multiple MCP servers; specify one of: ${Object.keys(plugin.servers).join(', ')}`);
@@ -183,11 +198,42 @@ export function resolveServerConfig(plugin: ClaudePlugin, serverName?: string): 
 	if (!server) {
 		throw new Error(`Plugin '${plugin.name}' has no MCP server named '${selectedName}'`);
 	}
-	return expandServerConfig(server, plugin.path);
+	return {
+		name: selectedName,
+		config: expandServerConfig(server, plugin.path),
+	};
 }
 
 export function listInstalledPlugins(config: AppConfig): ReadonlyArray<[string, InstalledPluginConfig]> {
 	return Object.entries(config.plugins).sort(([a], [b]) => a.localeCompare(b));
+}
+
+export function createPluginCustomization(
+	plugin: ClaudePlugin,
+	clientId: string,
+	proxiedServerName: string,
+): ClientPluginCustomization {
+	if (!plugin.servers[proxiedServerName]) {
+		throw new Error(`Plugin '${plugin.name}' has no MCP server named '${proxiedServerName}'`);
+	}
+	return {
+		type: CustomizationType.Plugin,
+		id: `${clientId}:plugin:${plugin.name}`,
+		uri: pathToFileURL(plugin.path).href,
+		name: plugin.name,
+		...(plugin.version ? { version: plugin.version } : {}),
+		enablement: [{
+			kind: CustomizationEnablementKind.Global,
+			enabled: true,
+		}],
+		nonce: randomUUID(),
+		childEnablement: {
+			[proxiedServerName]: [{
+				kind: CustomizationEnablementKind.Global,
+				enabled: false,
+			}],
+		},
+	};
 }
 
 function parsePluginSpec(spec: string): { pluginName: string; marketplaceName: string } {

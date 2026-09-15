@@ -38,7 +38,6 @@ export class DaemonServer {
 	private readonly restartAttempts = new Map<string, number>();
 	private readonly restartTimers = new Map<string, NodeJS.Timeout>();
 	private readonly stabilityTimers = new Map<string, NodeJS.Timeout>();
-	private readonly suspensionTimers = new Map<string, NodeJS.Timeout>();
 	private operationQueue: Promise<void> = Promise.resolve();
 	private closing = false;
 	private endpointOwned = false;
@@ -121,10 +120,6 @@ export class DaemonServer {
 			clearTimeout(timer);
 		}
 		this.stabilityTimers.clear();
-		for (const timer of this.suspensionTimers.values()) {
-			clearTimeout(timer);
-		}
-		this.suspensionTimers.clear();
 		await this.operationQueue.catch(error => {
 			console.error(`[daemon] In-flight operation failed during shutdown: ${formatError(error)}`);
 		});
@@ -283,33 +278,6 @@ export class DaemonServer {
 						await this.startDesired(request.name, definition);
 					}
 				});
-			case 'channel.suspend':
-				return this.enqueue(async () => {
-					const definition = await this.getDefinition(request.name);
-					const runtime = this.runtimes.get(request.name);
-					if (runtime && !await runtime.quiesce()) {
-						throw new DaemonProtocolError('CHANNEL_BUSY', `Channel '${request.name}' is processing a turn`);
-					}
-					try {
-						await this.stopOne(request.name);
-					} catch (error) {
-						if (definition.enabled) {
-							this.scheduleRestart(request.name);
-						}
-						throw error;
-					}
-					if (definition.enabled) {
-						this.scheduleSuspensionRecovery(request.name);
-					}
-				});
-			case 'channel.resume':
-				return this.enqueue(async () => {
-					this.clearSuspension(request.name);
-					const definition = await this.getDefinition(request.name);
-					if (definition.enabled) {
-						await this.startDesired(request.name, definition);
-					}
-				});
 			case 'channel.switch':
 				return this.enqueue(async () => this.switchOne(request.name, request.session, request.chat));
 			case 'channel.delete':
@@ -350,7 +318,7 @@ export class DaemonServer {
 				return {
 					name,
 					desired: definition.enabled ? 'running' : 'stopped',
-					state: transition ?? (runtime ? 'running' : failure ? 'error' : 'stopped'),
+					state: transition ?? (failure ? 'error' : runtime ? 'running' : 'stopped'),
 					definition,
 					...(runtime ? { runtime: runtime.snapshot } : {}),
 					...(failure ? { error: failure } : {}),
@@ -383,7 +351,6 @@ export class DaemonServer {
 		if (existing) {
 			return;
 		}
-		this.clearSuspension(name);
 		this.clearRestart(name);
 		this.transitions.set(name, 'starting');
 		try {
@@ -391,8 +358,13 @@ export class DaemonServer {
 				console.log(`[channel:${name}] ${message}`);
 			});
 			this.runtimes.set(name, runtime);
-			this.failures.delete(name);
-			this.markStableAfterDelay(name, runtime);
+			if (runtime.snapshot.error) {
+				this.failures.set(name, runtime.snapshot.error);
+				this.scheduleRestart(name);
+			} else {
+				this.failures.delete(name);
+				this.markStableAfterDelay(name, runtime);
+			}
 			void runtime.whenStopped.then(
 				() => this.handleUnexpectedStop(name, runtime, new Error('Channel runtime stopped unexpectedly')),
 				error => this.handleUnexpectedStop(name, runtime, error),
@@ -415,10 +387,12 @@ export class DaemonServer {
 		}
 	}
 
-	private async stopOne(name: string): Promise<void> {
+	private async stopOne(name: string, preserveRestartAttempts = false): Promise<void> {
 		this.clearRestart(name);
 		this.clearStability(name);
-		this.restartAttempts.delete(name);
+		if (!preserveRestartAttempts) {
+			this.restartAttempts.delete(name);
+		}
 		const runtime = this.runtimes.get(name);
 		if (!runtime) {
 			return;
@@ -429,31 +403,6 @@ export class DaemonServer {
 			await runtime.close();
 		} finally {
 			this.transitions.delete(name);
-		}
-	}
-
-	private scheduleSuspensionRecovery(name: string): void {
-		this.clearSuspension(name);
-		const timer = setTimeout(() => {
-			this.suspensionTimers.delete(name);
-			void this.enqueue(async () => {
-				const definition = (await this.configStore.read()).channels[name];
-				if (definition?.enabled && !this.runtimes.has(name)) {
-					await this.startDesired(name, definition);
-				}
-			}).catch(error => {
-				console.error(`[channel:${name}] Failed to recover suspended channel: ${formatError(error)}`);
-			});
-		}, 30_000);
-		timer.unref();
-		this.suspensionTimers.set(name, timer);
-	}
-
-	private clearSuspension(name: string): void {
-		const timer = this.suspensionTimers.get(name);
-		if (timer) {
-			clearTimeout(timer);
-			this.suspensionTimers.delete(name);
 		}
 	}
 
@@ -540,8 +489,16 @@ export class DaemonServer {
 			this.restartTimers.delete(name);
 			void this.enqueue(async () => {
 				const definition = (await this.configStore.read()).channels[name];
-				if (!definition?.enabled || this.runtimes.has(name)) {
+				const runtime = this.runtimes.get(name);
+				if (!definition?.enabled || (runtime && !runtime.snapshot.error)) {
 					return;
+				}
+				if (runtime) {
+					if (!await runtime.quiesce()) {
+						this.scheduleRestart(name);
+						return;
+					}
+					await this.stopOne(name, true);
 				}
 				try {
 					await this.startOne(name, definition);

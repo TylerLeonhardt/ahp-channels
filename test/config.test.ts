@@ -3,7 +3,7 @@ import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
-import { ConfigStore, isValidChannelInstanceName } from '../src/config.js';
+import { CONFIG_VERSION, ConfigStore, isValidChannelInstanceName } from '../src/config.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -12,23 +12,16 @@ afterEach(async () => {
 });
 
 describe('ConfigStore', () => {
-	it('migrates an existing version 1 config without channels', async () => {
+	it('rejects unsupported configuration versions', async () => {
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
 		temporaryDirectories.push(home);
 		await writeFile(join(home, 'config.json'), JSON.stringify({
-			version: 1,
+			version: CONFIG_VERSION - 1,
 			marketplaces: {},
 			plugins: {},
 		}));
 
-		const config = await new ConfigStore(home).read();
-
-		assert.deepEqual(config, {
-			version: 1,
-			marketplaces: {},
-			plugins: {},
-			channels: {},
-		});
+		await assert.rejects(new ConfigStore(home).read(), /Unsupported ahp-channels config version/);
 	});
 
 	it('serializes concurrent updates through a lock', async () => {
@@ -64,7 +57,7 @@ describe('ConfigStore', () => {
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
 		temporaryDirectories.push(home);
 		await writeFile(join(home, 'config.json'), JSON.stringify({
-			version: 1,
+			version: CONFIG_VERSION,
 			marketplaces: {},
 			plugins: {},
 			channels: {
@@ -94,7 +87,7 @@ describe('ConfigStore', () => {
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
 		temporaryDirectories.push(home);
 		await writeFile(join(home, 'config.json'), JSON.stringify({
-			version: 1,
+			version: CONFIG_VERSION,
 			marketplaces: {},
 			plugins: {},
 			channels: {
