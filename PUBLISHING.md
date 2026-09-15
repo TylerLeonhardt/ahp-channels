@@ -24,6 +24,14 @@ The local bootstrap disables provenance because it does not run in an OIDC
 environment. All later workflow publishes use trusted publishing and generate
 provenance automatically.
 
+For a package's first prerelease, npm may also assign `latest` even when
+`--tag next` was supplied. Verify and remove that unintended tag:
+
+```powershell
+npm view ahp-channels dist-tags --json
+npm dist-tag rm ahp-channels latest
+```
+
 Then open npmjs.com → `ahp-channels` → Settings → Trusted Publisher and set:
 
 - Provider: GitHub Actions

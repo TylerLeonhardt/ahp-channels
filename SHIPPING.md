@@ -13,9 +13,10 @@
 - [x] Confirm the `ahp-channels` npm package name is available.
 - [x] Choose and add the repository license (MIT).
 - [x] Add the tag-driven OIDC publish workflow and release documentation.
-- [ ] Bootstrap the package and configure npm trusted publishing for `TylerLeonhardt/ahp-channels`.
+- [x] Bootstrap `0.1.0-alpha.1` under the npm `next` tag.
+- [ ] Remove npm's unintended `latest` tag from the bootstrap prerelease.
+- [ ] Configure npm trusted publishing for `TylerLeonhardt/ahp-channels`.
 - [ ] Run a fresh-machine Telegram setup on macOS or Linux.
-- [ ] Publish `0.1.0-alpha.1` under the npm `next` tag.
 
 ## `0.1.0`
 
