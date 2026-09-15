@@ -24,12 +24,13 @@ The local bootstrap disables provenance because it does not run in an OIDC
 environment. All later workflow publishes use trusted publishing and generate
 provenance automatically.
 
-For a package's first prerelease, npm may also assign `latest` even when
-`--tag next` was supplied. Verify and remove that unintended tag:
+For a package's first prerelease, npm also assigns `latest` even when
+`--tag next` was supplied. The registry does not allow removing that initial
+`latest` tag (it returns HTTP 400). Leave it in place; later prereleases update
+`next` without moving `latest`, and the first stable release replaces `latest`.
 
 ```powershell
 npm view ahp-channels dist-tags --json
-npm dist-tag rm ahp-channels latest
 ```
 
 Then open npmjs.com → `ahp-channels` → Settings → Trusted Publisher and set:

@@ -14,7 +14,7 @@
 - [x] Choose and add the repository license (MIT).
 - [x] Add the tag-driven OIDC publish workflow and release documentation.
 - [x] Bootstrap `0.1.0-alpha.1` under the npm `next` tag.
-- [ ] Remove npm's unintended `latest` tag from the bootstrap prerelease.
+- [x] Verify npm's required first-version `latest` behavior.
 - [ ] Configure npm trusted publishing for `TylerLeonhardt/ahp-channels`.
 - [ ] Run a fresh-machine Telegram setup on macOS or Linux.
 
