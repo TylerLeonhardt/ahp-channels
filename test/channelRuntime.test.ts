@@ -172,40 +172,7 @@ class TestMcpChannel implements McpChannelClient {
 }
 
 describe('ChannelRuntime', () => {
-	it('isolates state for supported channel plugins', async () => {
-		const cases: readonly {
-			readonly plugin: string;
-			readonly stateEnvironment?: string;
-		}[] = [
-			{ plugin: 'discord', stateEnvironment: 'DISCORD_STATE_DIR' },
-			{ plugin: 'imessage', stateEnvironment: 'IMESSAGE_STATE_DIR' },
-			{ plugin: 'telegram', stateEnvironment: 'TELEGRAM_STATE_DIR' },
-			{ plugin: 'fake' },
-		];
-		for (const { plugin, stateEnvironment } of cases) {
-			const environment = await resolveChannelEnvironment(
-				'home',
-				new InMemorySecretStore(),
-				'personal',
-				plugin,
-				{
-					plugin,
-					session: sessionUri,
-					enabled: true,
-				},
-				{},
-			);
-
-			assert.deepEqual(environment, {
-				CLAUDE_CONFIG_DIR: resolve('home', 'instances', 'personal'),
-				...(stateEnvironment ? {
-					[stateEnvironment]: resolve('home', 'instances', 'personal', 'channels', plugin),
-				} : {}),
-			});
-		}
-	});
-
-	it('resolves keyring secrets with environment overrides', async () => {
+	it('isolates state and resolves keyring secrets with environment overrides', async () => {
 		const secrets = new InMemorySecretStore();
 		await secrets.set('personal', 'TOKEN', 'stored');
 		await secrets.set('personal', 'OVERRIDE', 'old');
@@ -214,7 +181,6 @@ describe('ChannelRuntime', () => {
 			'home',
 			secrets,
 			'personal',
-			'fake',
 			{
 				plugin: 'fake',
 				session: sessionUri,
@@ -223,6 +189,7 @@ describe('ChannelRuntime', () => {
 			},
 			{ OVERRIDE: 'new' },
 		);
+
 		assert.deepEqual(environment, {
 			CLAUDE_CONFIG_DIR: resolve('home', 'instances', 'personal'),
 			TOKEN: 'stored',
@@ -236,7 +203,6 @@ describe('ChannelRuntime', () => {
 				'home',
 				new InMemorySecretStore(),
 				'personal',
-				'fake',
 				{
 					plugin: 'fake',
 					session: sessionUri,

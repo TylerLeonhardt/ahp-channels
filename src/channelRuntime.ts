@@ -5,7 +5,7 @@ import { ChannelBridge } from './bridge.js';
 import type { ChannelInstanceConfig } from './config.js';
 import { discoverLocalAgentHosts, selectAgentHost, type AgentHostEndpoint } from './endpoints.js';
 import { FileChannelEventJournal, type ChannelEventJournal } from './eventJournal.js';
-import { getClaudeConfigDirectory, getPluginStateDirectory } from './instancePaths.js';
+import { getClaudeConfigDirectory } from './instancePaths.js';
 import { McpChannelProcess, type McpChannelClient, type StartedMcpChannel } from './mcpChannel.js';
 import { PluginManager, resolveServerConfig, type ClaudePlugin, type StdioMcpServerConfig } from './plugins.js';
 import type { SecretStore } from './secrets.js';
@@ -29,7 +29,7 @@ export interface ChannelRuntimeServices {
 	connectAgentHost(endpoint: AgentHostEndpoint, clientId: string): Promise<ChannelHostConnection>;
 	createMcpChannel(config: StdioMcpServerConfig): McpChannelClient;
 	createEventJournal?(name: string): ChannelEventJournal;
-	resolveEnvironment?(name: string, definition: ChannelInstanceConfig, plugin: ClaudePlugin): Promise<Readonly<Record<string, string>>>;
+	resolveEnvironment?(name: string, definition: ChannelInstanceConfig): Promise<Readonly<Record<string, string>>>;
 }
 
 export interface ChannelSubscription extends AsyncIterable<SubscriptionEvent> {
@@ -71,8 +71,8 @@ export function createChannelRuntimeServices(
 		createMcpChannel: config => new McpChannelProcess(config),
 		...(home ? { createEventJournal: (name: string) => new FileChannelEventJournal(home, name) } : {}),
 		...(home && secretStore ? {
-			resolveEnvironment: (name: string, definition: ChannelInstanceConfig, plugin: ClaudePlugin) =>
-				resolveChannelEnvironment(home, secretStore, name, plugin.name, definition, options.environment),
+			resolveEnvironment: (name: string, definition: ChannelInstanceConfig) =>
+				resolveChannelEnvironment(home, secretStore, name, definition, options.environment),
 		} : {}),
 	};
 }
@@ -89,7 +89,6 @@ export async function resolveChannelEnvironment(
 	home: string,
 	secretStore: SecretStore,
 	name: string,
-	pluginName: string,
 	definition: ChannelInstanceConfig,
 	environment: NodeJS.ProcessEnv = process.env,
 ): Promise<Readonly<Record<string, string>>> {
@@ -104,24 +103,7 @@ export async function resolveChannelEnvironment(
 		}
 		result[key] = value;
 	}
-	const stateEnvironment = pluginStateEnvironment(pluginName);
-	if (stateEnvironment) {
-		result[stateEnvironment] = getPluginStateDirectory(home, name, pluginName);
-	}
 	return result;
-}
-
-function pluginStateEnvironment(pluginName: string): string | undefined {
-	switch (pluginName) {
-		case 'discord':
-			return 'DISCORD_STATE_DIR';
-		case 'imessage':
-			return 'IMESSAGE_STATE_DIR';
-		case 'telegram':
-			return 'TELEGRAM_STATE_DIR';
-		default:
-			return undefined;
-	}
 }
 
 export class ChannelRuntime {
@@ -154,7 +136,7 @@ export class ChannelRuntime {
 		try {
 			const plugin = await services.resolvePlugin(definition.plugin);
 			const server = resolveServerConfig(plugin, definition.server);
-			const runtimeEnvironment = await services.resolveEnvironment?.(name, definition, plugin);
+			const runtimeEnvironment = await services.resolveEnvironment?.(name, definition);
 			const runtimeServer: StdioMcpServerConfig = runtimeEnvironment
 				? { ...server, env: { ...server.env, ...runtimeEnvironment } }
 				: server;

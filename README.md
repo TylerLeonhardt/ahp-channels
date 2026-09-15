@@ -23,12 +23,11 @@ node .\dist\cli.js channel start telegram
 The CLI stores configuration under `~/.ahp-channels` by default. Override this
 with `AHP_CHANNELS_HOME`.
 
-Telegram and Discord currently require Bun, matching the upstream plugins. The adapter
+Telegram currently requires Bun, matching the upstream plugin. The adapter
 supports standalone TCP hosts and normal editor Agent Hosts over Windows named
 pipes or Unix domain sockets.
 
-DM a Telegram or Discord bot once it starts, then approve and lock down the
-sender locally:
+DM the bot once it starts, then approve and lock down the sender locally:
 
 ```powershell
 ahp-channels channel access status telegram
@@ -36,19 +35,9 @@ ahp-channels channel access pair telegram <code>
 ahp-channels channel access policy telegram allowlist
 ```
 
-Replace `telegram` with the configured Discord channel name when managing a
-Discord bot.
-
-Access updates briefly suspend a running Telegram or Discord channel so they cannot race the
-plugin's own state writes. If the channel is processing a turn, retry the
-command from a terminal after the turn finishes. A waiter started as a tool
-call in that same turn cannot make progress because the tool call keeps the
-turn active.
-
 Secrets are stored in Windows Credential Manager, macOS Keychain, or a
-persistent Linux Secret Service. Named instances receive isolated plugin state
-under `~/.ahp-channels/instances/<name>`, including explicit state-directory
-wiring for the official Discord, iMessage, and Telegram plugins.
+persistent Linux Secret Service. Named instances receive isolated plugin state under
+`~/.ahp-channels/instances/<name>`.
 
 ## Status
 
