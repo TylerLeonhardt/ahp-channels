@@ -26,11 +26,13 @@
   "files": [
     "dist",
     "LICENSE",
+    "PUBLISHING.md",
     "README.md",
     "ROADMAP.md",
     "SHIPPING.md"
   ],
   "scripts": {
+    "prebuild": "node scripts/sync-version.mjs --check",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "node --test --import tsx test/*.test.ts",
@@ -38,7 +40,8 @@
     "e2e:local": "tsx scripts/e2e-local.ts",
     "e2e:daemon": "npm run build && tsx scripts/e2e-daemon-local.ts",
     "check": "npm run typecheck && npm test && npm run build",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "version": "node scripts/sync-version.mjs"
   },
   "engines": {
     "node": ">=22"

@@ -92,4 +92,5 @@ npm run e2e:local
 npm run e2e:daemon
 ```
 
-See [SHIPPING.md](./SHIPPING.md) for the npm prerelease gates.
+See [SHIPPING.md](./SHIPPING.md) for the npm prerelease gates and
+[PUBLISHING.md](./PUBLISHING.md) for the tag-driven release process.
