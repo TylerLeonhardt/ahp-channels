@@ -30,7 +30,7 @@ export interface ChannelRuntimeSnapshot {
 }
 
 export interface ChannelRuntimeServices {
-	resolvePlugin(nameOrPath: string): Promise<ClaudePlugin>;
+	resolvePlugin(nameOrPath: string, installation?: string): Promise<ClaudePlugin>;
 	discoverAgentHosts(): Promise<readonly AgentHostEndpoint[]>;
 	connectAgentHost(endpoint: AgentHostEndpoint, clientId: string): Promise<ChannelHostConnection>;
 	createMcpChannel(config: StdioMcpServerConfig): McpChannelClient;
@@ -69,7 +69,7 @@ export function createChannelRuntimeServices(
 ): ChannelRuntimeServices {
 	const { home } = options;
 	return {
-		resolvePlugin: nameOrPath => plugins.resolvePlugin(nameOrPath),
+		resolvePlugin: (nameOrPath, installation) => plugins.resolvePlugin(nameOrPath, installation),
 		discoverAgentHosts: () => discoverLocalAgentHosts(),
 		connectAgentHost: async (endpoint, clientId) => connectAgentHost(endpoint, clientId),
 		createMcpChannel: config => new McpChannelProcess(config),
@@ -78,7 +78,7 @@ export function createChannelRuntimeServices(
 }
 
 export async function validateChannelDefinition(plugins: PluginManager, definition: ChannelInstanceConfig): Promise<void> {
-	const plugin = await plugins.resolvePlugin(definition.plugin);
+	const plugin = await plugins.resolvePlugin(definition.plugin, definition.installation);
 	resolveServerConfig(plugin, definition.server);
 }
 
@@ -111,7 +111,7 @@ export class ChannelRuntime {
 		let mcp: McpChannelClient | undefined;
 		let bridge: ChannelBridge | undefined;
 		try {
-			const plugin = await services.resolvePlugin(definition.plugin);
+			const plugin = await services.resolvePlugin(definition.plugin, definition.installation);
 			const server = resolvePluginServer(plugin, definition.server);
 			const clientId = definition.clientId ?? createChannelClientId(name, definition.session);
 			const connected = await connectOwningHost(
@@ -132,7 +132,12 @@ export class ChannelRuntime {
 				throw new Error(`Agent Host returned no state snapshot for chat ${chat}`);
 			}
 
-			const customization = createPluginCustomization(plugin, connection.clientId, server.name);
+			const customization = createPluginCustomization(
+				plugin,
+				connection.clientId,
+				server.name,
+				definition.installation,
+			);
 			publishActiveClient(connection.client, definition.session, {
 				clientId: connection.clientId,
 				displayName: `ahp-channels (${plugin.name})`,
