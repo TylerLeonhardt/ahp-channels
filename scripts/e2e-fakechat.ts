@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { access, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket, { type RawData } from 'ws';
 import { connectAgentHost, resolveChat, type ConnectedAgentHost } from '../src/ahp.js';
@@ -87,7 +87,7 @@ try {
 	connection = await connectAgentHost(endpoint);
 	const client = connection.client;
 	await mkdir(fakeHome, { recursive: true });
-	await installOfficialFakechat(testRoot);
+	const installedFakechat = await installOfficialFakechat(testRoot);
 
 	const rootSnapshot = connection.initializeResult.snapshots.find(snapshot => snapshot.resource === 'ahp-root://');
 	const provider = (rootSnapshot?.state as RootState | undefined)?.agents[0]?.provider;
@@ -121,6 +121,7 @@ try {
 		name: CHANNEL_NAME,
 		definition: {
 			plugin: PLUGIN_NAME,
+			installation: installedFakechat.installation,
 			session,
 			enabled: false,
 			host: endpoint.id,
@@ -128,9 +129,13 @@ try {
 		start: true,
 	});
 	channelCreated = true;
-	const clientId = requireRunningChannel(created);
+	const clientId = requireRunningChannel(created, installedFakechat.installation);
 	sessionState = await waitForFakechatContribution(sessionState, sessionSubscription, clientId);
 	await waitForFakechatReady(testRoot, port);
+	await access(join(installedFakechat.path, 'node_modules'));
+	await assertMissing(
+		join(testRoot, 'marketplaces', OFFICIAL_MARKETPLACE_NAME, 'external_plugins', PLUGIN_NAME, 'node_modules'),
+	);
 
 	let socket = await connectFakechat(port);
 	sockets.add(socket);
@@ -152,7 +157,7 @@ try {
 
 	const restarted = await ensureDaemonStarted(testRoot);
 	daemonStarted = true;
-	const restartedClientId = requireRunningChannel(restarted);
+	const restartedClientId = requireRunningChannel(restarted, installedFakechat.installation);
 	sessionState = await waitForFakechatContribution(
 		sessionState,
 		sessionSubscription,
@@ -232,7 +237,12 @@ async function requireBun(): Promise<void> {
 	}
 }
 
-async function installOfficialFakechat(home: string): Promise<void> {
+interface InstalledFakechat {
+	readonly installation: string;
+	readonly path: string;
+}
+
+async function installOfficialFakechat(home: string): Promise<InstalledFakechat> {
 	await runProcess(process.execPath, [
 		join(repositoryRoot, 'dist', 'cli.js'),
 		'plugin',
@@ -251,14 +261,18 @@ async function installOfficialFakechat(home: string): Promise<void> {
 	if (installed?.marketplace !== OFFICIAL_MARKETPLACE_NAME) {
 		throw new Error('The CLI did not register fakechat from claude-plugins-official');
 	}
-	const plugin = await new PluginManager(store).resolvePlugin(PLUGIN_NAME);
+	const installation = installed.activeInstallation;
+	const plugin = await new PluginManager(store).resolvePlugin(PLUGIN_NAME, installation);
 	const relativePath = relative(home, plugin.path);
+	const expectedPath = join(home, 'plugins', OFFICIAL_MARKETPLACE_NAME, PLUGIN_NAME, installation);
 	if (plugin.name !== PLUGIN_NAME
 		|| relativePath === '..'
 		|| relativePath.startsWith(`..${sep}`)
-		|| isAbsolute(relativePath)) {
-		throw new Error(`Official fakechat was not installed under the isolated home: ${plugin.path}`);
+		|| isAbsolute(relativePath)
+		|| resolve(plugin.path) !== resolve(expectedPath)) {
+		throw new Error(`Official fakechat was not installed as the expected immutable snapshot: ${plugin.path}`);
 	}
+	return { installation, path: plugin.path };
 }
 
 async function allocateLoopbackPort(): Promise<number> {
@@ -282,9 +296,12 @@ async function allocateLoopbackPort(): Promise<number> {
 	}
 }
 
-function requireRunningChannel(status: DaemonStatus): string {
+function requireRunningChannel(status: DaemonStatus, installation: string): string {
 	const channel = status.channels.find(candidate => candidate.name === CHANNEL_NAME);
-	if (channel?.state !== 'running' || !channel.runtime || channel.error) {
+	if (channel?.state !== 'running'
+		|| !channel.runtime
+		|| channel.error
+		|| channel.definition.installation !== installation) {
 		throw new Error(`fakechat channel did not start: ${JSON.stringify(channel)}`);
 	}
 	return channel.runtime.clientId;
@@ -385,6 +402,18 @@ async function waitForFakechatStopped(port: number): Promise<void> {
 		await delay(100);
 	}
 	throw new Error(`fakechat UI kept port ${port} open after daemon shutdown`);
+}
+
+async function assertMissing(path: string): Promise<void> {
+	try {
+		await access(path);
+	} catch (error) {
+		if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+			return;
+		}
+		throw error;
+	}
+	throw new Error(`Official fakechat modified its marketplace source: ${path}`);
 }
 
 async function connectFakechat(port: number): Promise<WebSocket> {

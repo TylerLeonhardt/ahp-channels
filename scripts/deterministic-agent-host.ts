@@ -409,7 +409,8 @@ export class DeterministicAgentHost {
 				continue;
 			}
 			const load = this.loadCustomization(peer, sessionChannel, customization)
-				.catch(error => this.publishCustomizationError(sessionChannel, peer, customization, error));
+				.catch(error => this.publishCustomizationError(sessionChannel, peer, customization, error))
+				.finally(() => this.customizationLoads.delete(key));
 			this.customizationLoads.set(key, load);
 		}
 	}
