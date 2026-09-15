@@ -85,6 +85,18 @@ export interface RemovedPluginInstallation {
 	readonly config: PluginInstallationConfig;
 }
 
+export class PluginIntegrityError extends Error {
+	constructor(error: unknown) {
+		super(error instanceof Error ? error.message : String(error), { cause: error });
+	}
+}
+
+export class PluginLoadingError extends Error {
+	constructor(error: unknown) {
+		super(error instanceof Error ? error.message : String(error), { cause: error });
+	}
+}
+
 export class PluginManager {
 	constructor(private readonly store: ConfigStore) { }
 
@@ -191,21 +203,39 @@ export class PluginManager {
 			if (installation) {
 				throw new Error('An installation ID cannot be used with a plugin path');
 			}
-			return inspectPlugin(resolve(nameOrPath));
+			try {
+				return await inspectPlugin(resolve(nameOrPath));
+			} catch (error) {
+				throw new PluginLoadingError(error);
+			}
 		}
-		const installed = await this.getInstalledPlugin(nameOrPath);
-		const selected = installation ?? installed.activeInstallation;
-		const version = installed.installations[selected];
-		if (!version) {
-			throw new Error(`Plugin '${nameOrPath}' has no installation '${selected}'`);
+		let installed: InstalledPluginConfig;
+		let selected: string;
+		try {
+			installed = await this.getInstalledPlugin(nameOrPath);
+			selected = installation ?? installed.activeInstallation;
+			if (!installed.installations[selected]) {
+				throw new Error(`Plugin '${nameOrPath}' has no installation '${selected}'`);
+			}
+		} catch (error) {
+			throw new PluginIntegrityError(error);
 		}
-		const resolved = await resolvePluginInstallation(
-			this.store.home,
-			installed.marketplace,
-			nameOrPath,
-			selected,
-		);
-		return inspectPlugin(resolved.path);
+		let resolved: Awaited<ReturnType<typeof resolvePluginInstallation>>;
+		try {
+			resolved = await resolvePluginInstallation(
+				this.store.home,
+				installed.marketplace,
+				nameOrPath,
+				selected,
+			);
+		} catch (error) {
+			throw new PluginIntegrityError(error);
+		}
+		try {
+			return await inspectPlugin(resolved.path);
+		} catch (error) {
+			throw new PluginLoadingError(error);
+		}
 	}
 
 	async versions(pluginName: string): Promise<readonly PluginVersion[]> {
@@ -214,6 +244,7 @@ export class PluginManager {
 		if (!plugin) {
 			throw new Error(`Plugin '${pluginName}' is not installed`);
 		}
+
 		return Object.entries(plugin.installations)
 			.map(([id, installation]) => ({
 				id,

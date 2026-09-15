@@ -34,7 +34,8 @@
 - [ ] Run a fresh-machine Telegram setup from the published prerelease using
       plugin-owned configuration.
 - [ ] Soak the alpha with fakechat, Telegram, and Discord.
-- [ ] Add log rotation and actionable health diagnostics.
+- [x] Add actionable channel health diagnostics.
+- [ ] Add log rotation.
 - [ ] Document credential injection and restart requirements for plugins that
       accept credentials only through their environment.
 - [ ] Resolve alpha feedback and document host, protocol, and plugin

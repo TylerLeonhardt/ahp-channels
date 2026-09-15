@@ -37,6 +37,36 @@ describe('daemon control protocol', () => {
 			(error: unknown) => error instanceof DaemonProtocolError && error.code === 'INVALID_RESPONSE',
 		);
 		assert.throws(
+			() => parseDaemonResponse({
+				version: DAEMON_PROTOCOL_VERSION,
+				ok: true,
+				result: {
+					pid: 1,
+					startedAt: new Date(0).toISOString(),
+					channels: [{
+						name: 'personal',
+						desired: 'running',
+						state: 'error',
+						definition: {
+							plugin: 'fake',
+							session: 'ahp-session:/one',
+							enabled: true,
+						},
+						health: {
+							state: 'unhealthy',
+							failure: {
+								stage: 'message-text-guessed-stage',
+								summary: 'failed',
+								failedAt: new Date(0).toISOString(),
+								guidance: 'fix it',
+							},
+						},
+					}],
+				},
+			}),
+			(error: unknown) => error instanceof DaemonProtocolError && error.code === 'INVALID_RESPONSE',
+		);
+		assert.throws(
 			() => parseDaemonRequest({
 				version: DAEMON_PROTOCOL_VERSION,
 				token: 'x'.repeat(32),

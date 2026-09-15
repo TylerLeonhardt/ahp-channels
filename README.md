@@ -69,7 +69,8 @@ setup turn finishes and activates the channel server when it becomes runnable.
 ## Status
 
 The compatibility bridge and durable daemon control milestones are complete.
-See [ROADMAP.md](./ROADMAP.md) for the remaining setup, reliability, and
+Channel status includes structured operational health diagnostics. See
+[ROADMAP.md](./ROADMAP.md) for the remaining setup, reliability, and
 distribution work.
 
 ## Manage a channel
@@ -82,6 +83,38 @@ ahp-channels channel stop telegram
 ahp-channels channel start telegram
 ahp-channels channel delete telegram
 ```
+
+`channel status <name>` reports both the runtime state and bridge-owned health:
+
+```text
+telegram: error (degraded) @ 0123456789ab → ahp-session:/work (ahp-chat:/main)
+Mode: customizations available; channel MCP server unavailable
+Failure stage: mcp-startup
+Error: MCP channel startup: required plugin setup is incomplete
+Failed at: 2026-09-15T22:30:00.000Z
+Recovery: Run the plugin setup skill in the target session, then wait for retry or restart the channel.
+Retry: attempt 2 (scheduled)
+Next retry: 2026-09-15T22:30:04.000Z
+```
+
+Failure stages identify the bridge operation that failed: Agent Host discovery
+or connection, session/chat resolution, plugin installation integrity or
+loading, MCP startup or unexpected exit, and retry scheduling or exhaustion.
+Stages are assigned at operation boundaries, not inferred from plugin error
+text. The original one-line error summary is retained with common credential
+values redacted.
+
+Use `--json` for the type-stable `health` object. Healthy running channels
+report `health.state: "healthy"` without a failure. Intentionally stopped
+channels report `health.state: "stopped"`. An MCP startup failure reports
+`"degraded"` when plugin customizations and setup skills remain available;
+failures without a usable runtime report `"unhealthy"`.
+
+The daemon atomically stores only the latest actionable failure and retry
+metadata under the channel's bridge-owned instance directory. Runtime facts
+are derived when status is read. A successful recovery removes the active
+failure, while invalid persisted health data prevents daemon startup with an
+explicit path-specific error.
 
 The daemon starts on demand, remembers desired running channels, and restarts
 them after a daemon or channel-process restart. A switch is rejected while the

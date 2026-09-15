@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { ConfigStore, type ChannelInstanceConfig } from '../src/config.js';
+import { ChannelOperationError } from '../src/channelHealth.js';
 import { requestDaemon } from '../src/daemonClient.js';
 import { getOrCreateDaemonToken } from '../src/daemonPaths.js';
 import { DaemonProtocolError } from '../src/daemonProtocol.js';
@@ -42,8 +44,14 @@ class TestRuntime implements ManagedChannelRuntime {
 			channelName: 'fake-channel',
 			startedAt: new Date(0).toISOString(),
 			busy: this.busy,
-			...(this.startupError ? { error: this.startupError } : {}),
+			mode: this.startupError ? 'customization-only' : 'mcp',
 		};
+	}
+
+	get startupFailure(): ChannelOperationError | undefined {
+		return this.startupError
+			? new ChannelOperationError('mcp-startup', this.startupError)
+			: undefined;
 	}
 
 	async quiesce(): Promise<boolean> {
@@ -80,7 +88,7 @@ class TestRuntimeFactory implements DaemonRuntimeFactory {
 	async start(name: string, definition: ChannelInstanceConfig): Promise<TestRuntime> {
 		await this.startHook?.(definition);
 		if (definition.session === this.failSession) {
-			throw new Error(`failed to connect ${definition.session}`);
+			throw new ChannelOperationError('session-resolution', `failed to connect ${definition.session}`);
 		}
 		const runtime = new TestRuntime(name, definition, this.runtimeError);
 		this.runtimes.push(runtime);
@@ -108,6 +116,7 @@ describe('DaemonServer', () => {
 				start: true,
 			});
 			assert.equal(status.channels[0]?.state, 'running');
+			assert.deepEqual(status.channels[0]?.health, { state: 'healthy' });
 			assert.equal(factory.runtimes.length, 1);
 
 			factory.runtimes[0].busy = true;
@@ -208,6 +217,12 @@ describe('DaemonServer', () => {
 
 			const beforeRestart = factory.runtimes.length;
 			factory.runtimes.at(-1)?.stopUnexpectedly();
+			await waitFor(async () => {
+				const channel = (await requestDaemon(home, { command: 'status' })).channels[0];
+				return channel?.health.failure?.stage === 'mcp-exit'
+					&& channel.health.retry?.attempt === 1
+					&& channel.health.retry.nextRetryAt !== undefined;
+			}, 500);
 			await waitFor(async () => factory.runtimes.length > beforeRestart, 3000);
 			status = await requestDaemon(home, { command: 'status' });
 			assert.equal(status.channels[0]?.state, 'running');
@@ -221,6 +236,7 @@ describe('DaemonServer', () => {
 			status = await requestDaemon(home, { command: 'channel.stop', name: 'personal' });
 			assert.equal(status.channels[0]?.state, 'stopped');
 			assert.equal(status.channels[0]?.desired, 'stopped');
+			assert.deepEqual(status.channels[0]?.health, { state: 'stopped' });
 
 			status = await requestDaemon(home, { command: 'channel.start', name: 'personal' });
 			assert.equal(status.channels[0]?.state, 'running');
@@ -255,11 +271,24 @@ describe('DaemonServer', () => {
 
 			assert.deepEqual({
 				state: status.channels[0]?.state,
-				error: status.channels[0]?.error,
+				health: status.channels[0]?.health,
 				hasRuntime: status.channels[0]?.runtime !== undefined,
 			}, {
 				state: 'error',
-				error: 'Plugin setup required',
+				health: {
+					state: 'degraded',
+					failure: {
+						stage: 'mcp-startup',
+						summary: 'Plugin setup required',
+						failedAt: status.channels[0]?.health.failure?.failedAt,
+						guidance: 'Run the plugin setup skill in the target session, then wait for retry or restart the channel.',
+					},
+					retry: {
+						attempt: 1,
+						state: 'scheduled',
+						nextRetryAt: status.channels[0]?.health.retry?.nextRetryAt,
+					},
+				},
 				hasRuntime: true,
 			});
 
@@ -268,13 +297,110 @@ describe('DaemonServer', () => {
 			const recovered = await requestDaemon(home, { command: 'status' });
 			assert.deepEqual({
 				state: recovered.channels[0]?.state,
-				error: recovered.channels[0]?.error,
+				health: recovered.channels[0]?.health,
 				failedRuntimeClosed: factory.runtimes[0]?.closed,
 			}, {
 				state: 'running',
-				error: undefined,
+				health: { state: 'healthy' },
 				failedRuntimeClosed: true,
 			});
+			await assert.rejects(access(join(home, 'instances', 'personal', 'health.json')));
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('preserves failure and retry attempts across a daemon restart', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await store.update(config => ({
+			...config,
+			channels: {
+				remembered: {
+					plugin: 'fake',
+					session: 'ahp-session:/remembered',
+					enabled: true,
+				},
+			},
+		}));
+
+		const firstFactory = new TestRuntimeFactory();
+		firstFactory.failSession = 'ahp-session:/remembered';
+		const first = new DaemonServer(home, await getOrCreateDaemonToken(home), store, firstFactory);
+		await first.start();
+		const firstStatus = await requestDaemon(home, { command: 'status' });
+		assert.equal(firstStatus.channels[0]?.health.failure?.summary, 'failed to connect ahp-session:/remembered');
+		assert.equal(firstStatus.channels[0]?.health.retry?.attempt, 1);
+		await first.close();
+
+		const secondFactory = new TestRuntimeFactory();
+		secondFactory.failSession = 'ahp-session:/remembered';
+		const second = new DaemonServer(home, await getOrCreateDaemonToken(home), store, secondFactory);
+		await second.start();
+		try {
+			const secondStatus = await requestDaemon(home, { command: 'status' });
+			assert.equal(secondStatus.channels[0]?.health.failure?.summary, 'failed to connect ahp-session:/remembered');
+			assert.equal(secondStatus.channels[0]?.health.retry?.attempt, 2);
+			assert.ok(secondStatus.channels[0]?.health.retry?.nextRetryAt);
+		} finally {
+			await second.close();
+		}
+	});
+
+	it('fails explicitly when persisted health state is invalid', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await store.update(config => ({
+			...config,
+			channels: {
+				remembered: {
+					plugin: 'fake',
+					session: 'ahp-session:/remembered',
+					enabled: false,
+				},
+			},
+		}));
+		const healthDirectory = join(home, 'instances', 'remembered');
+		await mkdir(healthDirectory, { recursive: true });
+		await writeFile(join(healthDirectory, 'health.json'), '{"version":1,"failure":{"stage":"made-up"}}');
+		const server = new DaemonServer(home, await getOrCreateDaemonToken(home), store, new TestRuntimeFactory());
+
+		await assert.rejects(server.start(), /Invalid channel health state/);
+		await server.close();
+	});
+
+	it('prints actionable diagnostics without exposing secrets', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		const factory = new TestRuntimeFactory();
+		factory.runtimeError = 'token=super-secret setup required';
+		const server = new DaemonServer(home, await getOrCreateDaemonToken(home), store, factory);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake',
+					session: 'ahp-session:/one',
+					enabled: false,
+				},
+				start: true,
+			});
+
+			const output = await runCli(home, ['channel', 'status', 'personal']);
+			assert.match(output, /personal: (?:error|starting) \(degraded\)/);
+			assert.match(output, /Mode: customizations available; channel MCP server unavailable/);
+			assert.match(output, /Failure stage: mcp-startup/);
+			assert.match(output, /Error: token=\[redacted\] setup required/);
+			assert.match(output, /Failed at: /);
+			assert.match(output, /Recovery: Run the plugin setup skill/);
+			assert.match(output, /Retry: attempt [1-9][0-9]* \(scheduled\)/);
+			assert.match(output, /Next retry: /);
+			assert.doesNotMatch(output, /super-secret/);
 		} finally {
 			await server.close();
 		}
@@ -403,6 +529,28 @@ describe('DaemonServer', () => {
 			await winner.close();
 		}
 	});
+
+	it('does not report healthy channels as failed while shutting down', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await store.update(config => ({
+			...config,
+			channels: {
+				personal: {
+					plugin: 'fake',
+					session: 'ahp-session:/one',
+					enabled: true,
+				},
+			},
+		}));
+		const server = new DaemonServer(home, await getOrCreateDaemonToken(home), store, new TestRuntimeFactory());
+		await server.start();
+
+		const status = await requestDaemon(home, { command: 'shutdown' });
+		assert.deepEqual(status.channels[0]?.health, { state: 'healthy' });
+		await server.whenClosed;
+	});
 });
 
 async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs: number): Promise<void> {
@@ -414,4 +562,34 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs: n
 		await new Promise(resolve => setTimeout(resolve, 20));
 	}
 	throw new Error('Timed out waiting for condition');
+}
+
+function runCli(home: string, args: readonly string[]): Promise<string> {
+	return new Promise((resolveRun, reject) => {
+		const child = spawn(process.execPath, [
+			'--import',
+			'tsx',
+			join(import.meta.dirname, '..', 'src', 'cli.ts'),
+			...args,
+		], {
+			cwd: join(import.meta.dirname, '..'),
+			env: { ...process.env, AHP_CHANNELS_HOME: home },
+			stdio: ['ignore', 'pipe', 'pipe'],
+			shell: false,
+		});
+		let stdout = '';
+		let stderr = '';
+		child.stdout.setEncoding('utf8');
+		child.stderr.setEncoding('utf8');
+		child.stdout.on('data', chunk => stdout += chunk);
+		child.stderr.on('data', chunk => stderr += chunk);
+		child.once('error', reject);
+		child.once('exit', code => {
+			if (code === 0) {
+				resolveRun(stdout);
+			} else {
+				reject(new Error(`CLI exited with ${code}: ${stderr}`));
+			}
+		});
+	});
 }

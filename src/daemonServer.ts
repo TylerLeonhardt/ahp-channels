@@ -2,6 +2,14 @@ import { timingSafeEqual } from 'node:crypto';
 import { chmod, rm } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
 import { ChannelRuntime, validateChannelDefinition, type ChannelRuntimeSnapshot } from './channelRuntime.js';
+import {
+	ChannelOperationError,
+	FileChannelHealthStore,
+	failureFromError,
+	recoveryGuidance,
+	type ChannelHealth,
+	type PersistedChannelHealth,
+} from './channelHealth.js';
 import { ConfigStore, isValidChannelInstanceName, retargetChannelInstance, type AppConfig, type ChannelInstanceConfig } from './config.js';
 import { getDaemonPaths } from './daemonPaths.js';
 import {
@@ -20,6 +28,7 @@ import type { PluginManager } from './plugins.js';
 export interface ManagedChannelRuntime {
 	readonly snapshot: ChannelRuntimeSnapshot;
 	readonly whenStopped: Promise<void>;
+	readonly startupFailure?: ChannelOperationError;
 	quiesce(): Promise<boolean>;
 	close(): Promise<void>;
 }
@@ -34,7 +43,7 @@ export class DaemonServer {
 	private readonly startedAt = new Date().toISOString();
 	private readonly runtimes = new Map<string, ManagedChannelRuntime>();
 	private readonly transitions = new Map<string, ChannelDaemonState>();
-	private readonly failures = new Map<string, string>();
+	private readonly healthRecords = new Map<string, PersistedChannelHealth>();
 	private readonly restartAttempts = new Map<string, number>();
 	private readonly restartTimers = new Map<string, NodeJS.Timeout>();
 	private readonly stabilityTimers = new Map<string, NodeJS.Timeout>();
@@ -47,6 +56,7 @@ export class DaemonServer {
 	private rejectReady!: (error: unknown) => void;
 	private resolveListening!: () => void;
 	private rejectListening!: (error: unknown) => void;
+	private readonly healthStore: FileChannelHealthStore;
 	readonly whenClosed = new Promise<void>(resolve => {
 		this.resolveClosed = resolve;
 	});
@@ -66,6 +76,7 @@ export class DaemonServer {
 		private readonly runtimeFactory: DaemonRuntimeFactory,
 	) {
 		this.server = createServer(socket => this.handleConnection(socket));
+		this.healthStore = new FileChannelHealthStore(home);
 		void this.whenReady.catch(() => undefined);
 		void this.whenListening.catch(() => undefined);
 	}
@@ -73,6 +84,8 @@ export class DaemonServer {
 	async start(): Promise<void> {
 		const endpoint = getDaemonPaths(this.home).endpoint;
 		try {
+			const config = await this.configStore.read();
+			await this.loadHealth(config);
 			await new Promise<void>((resolve, reject) => {
 				const onError = (error: Error) => {
 					this.server.off('listening', onListening);
@@ -92,7 +105,7 @@ export class DaemonServer {
 			if (process.platform !== 'win32') {
 				await chmod(endpoint, 0o600);
 			}
-			const initialization = this.operationQueue.then(() => this.reconcileEnabledChannels());
+			const initialization = this.operationQueue.then(() => this.reconcileEnabledChannels(config));
 			this.operationQueue = initialization.catch(() => undefined);
 			await initialization;
 			this.resolveReady();
@@ -252,9 +265,14 @@ export class DaemonServer {
 					await this.configStore.update(current => withChannel(current, request.name, { ...definition, enabled: false }));
 					try {
 						await this.stopOne(request.name);
-						this.failures.delete(request.name);
+						await this.clearHealth(request.name);
 					} catch (error) {
-						this.failures.set(request.name, formatError(error));
+						await this.recordFailure(request.name, new ChannelOperationError(
+							'mcp-exit',
+							formatError(error),
+							'Inspect daemon logs and retry stopping the channel.',
+							{ cause: error },
+						));
 						throw error;
 					}
 				});
@@ -270,7 +288,13 @@ export class DaemonServer {
 						await this.stopOne(request.name);
 					} catch (error) {
 						if (definition.enabled) {
-							this.scheduleRestart(request.name);
+							await this.recordFailure(request.name, new ChannelOperationError(
+								'mcp-exit',
+								formatError(error),
+								'Inspect daemon logs and retry the channel restart.',
+								{ cause: error },
+							));
+							await this.scheduleRestart(request.name);
 						}
 						throw error;
 					}
@@ -295,7 +319,7 @@ export class DaemonServer {
 						stopError = error;
 					}
 					await this.configStore.update(current => withoutChannel(current, request.name));
-					this.failures.delete(request.name);
+					await this.clearHealth(request.name);
 					if (stopError) {
 						throw stopError;
 					}
@@ -316,14 +340,30 @@ export class DaemonServer {
 			.map(([name, definition]) => {
 				const runtime = this.runtimes.get(name);
 				const transition = this.transitions.get(name);
-				const failure = this.failures.get(name);
+				const healthRecord = this.healthRecords.get(name);
+				let health: ChannelHealth;
+				if (!definition.enabled) {
+					health = { state: 'stopped' };
+				} else if (runtime && !runtime.startupFailure) {
+					health = { state: 'healthy' };
+				} else if (this.closing && !healthRecord) {
+					health = { state: 'healthy' };
+				} else {
+					if (!healthRecord) {
+						throw new Error(`Channel '${name}' is unhealthy without actionable health information`);
+					}
+					health = {
+						state: runtime ? 'degraded' : 'unhealthy',
+						...healthRecord,
+					};
+				}
 				return {
 					name,
 					desired: definition.enabled ? 'running' : 'stopped',
-					state: transition ?? (failure ? 'error' : runtime ? 'running' : 'stopped'),
+					state: transition ?? (healthRecord ? 'error' : runtime ? 'running' : 'stopped'),
 					definition,
 					...(runtime ? { runtime: runtime.snapshot } : {}),
-					...(failure ? { error: failure } : {}),
+					health,
 				};
 			});
 		return {
@@ -333,8 +373,7 @@ export class DaemonServer {
 		};
 	}
 
-	private async reconcileEnabledChannels(): Promise<void> {
-		const config = await this.configStore.read();
+	private async reconcileEnabledChannels(config: AppConfig): Promise<void> {
 		for (const [name, definition] of Object.entries(config.channels)) {
 			if (!definition.enabled) {
 				continue;
@@ -342,8 +381,7 @@ export class DaemonServer {
 			try {
 				await this.startOne(name, definition);
 			} catch (error) {
-				this.failures.set(name, formatError(error));
-				this.scheduleRestart(name);
+				await this.scheduleRestart(name);
 			}
 		}
 	}
@@ -360,11 +398,11 @@ export class DaemonServer {
 				console.log(`[channel:${name}] ${message}`);
 			});
 			this.runtimes.set(name, runtime);
-			if (runtime.snapshot.error) {
-				this.failures.set(name, runtime.snapshot.error);
-				this.scheduleRestart(name);
+			if (runtime.startupFailure) {
+				await this.recordFailure(name, runtime.startupFailure);
+				await this.scheduleRestart(name);
 			} else {
-				this.failures.delete(name);
+				await this.clearHealth(name);
 				this.markStableAfterDelay(name, runtime);
 			}
 			void runtime.whenStopped.then(
@@ -372,7 +410,7 @@ export class DaemonServer {
 				error => this.handleUnexpectedStop(name, runtime, error),
 			);
 		} catch (error) {
-			this.failures.set(name, formatError(error));
+			await this.recordFailure(name, error);
 			throw error;
 		} finally {
 			this.transitions.delete(name);
@@ -381,10 +419,13 @@ export class DaemonServer {
 
 	private async startDesired(name: string, definition: ChannelInstanceConfig): Promise<void> {
 		this.restartAttempts.delete(name);
+		if (!this.runtimes.has(name)) {
+			await this.clearHealth(name);
+		}
 		try {
 			await this.startOne(name, definition);
 		} catch (error) {
-			this.scheduleRestart(name);
+			await this.scheduleRestart(name);
 			throw error;
 		}
 	}
@@ -437,7 +478,13 @@ export class DaemonServer {
 			await this.stopOne(name);
 		} catch (error) {
 			if (previous.enabled) {
-				this.scheduleRestart(name);
+				await this.recordFailure(name, new ChannelOperationError(
+					'mcp-exit',
+					formatError(error),
+					'Inspect daemon logs and retry the channel operation.',
+					{ cause: error },
+				));
+				await this.scheduleRestart(name);
 			}
 			throw error;
 		}
@@ -455,7 +502,8 @@ export class DaemonServer {
 					await this.startOne(name, previous);
 				} catch (rollbackError) {
 					errors.push(toError('rollback', rollbackError));
-					this.scheduleRestart(name);
+					await this.recordFailure(name, rollbackError);
+					await this.scheduleRestart(name);
 				}
 			}
 			throw new AggregateError(errors, `Failed to switch channel '${name}'`);
@@ -477,9 +525,14 @@ export class DaemonServer {
 		}
 		this.runtimes.delete(name);
 		this.clearStability(name);
-		this.failures.set(name, formatError(error));
 		this.transitions.set(name, 'stopping');
 		void this.enqueue(async () => {
+			await this.recordFailure(name, new ChannelOperationError(
+				'mcp-exit',
+				formatError(error),
+				recoveryGuidance('mcp-exit'),
+				{ cause: error },
+			));
 			try {
 				await runtime.close();
 			} catch (closeError) {
@@ -489,31 +542,54 @@ export class DaemonServer {
 			}
 			const definition = (await this.configStore.read()).channels[name];
 			if (definition?.enabled) {
-				this.scheduleRestart(name);
+				await this.scheduleRestart(name);
 			}
 		}).catch(cleanupError => {
 			console.error(`[channel:${name}] Failed to process runtime exit: ${formatError(cleanupError)}`);
 		});
 	}
 
-	private scheduleRestart(name: string): void {
+	private async scheduleRestart(name: string): Promise<void> {
 		if (this.closing || this.restartTimers.has(name)) {
 			return;
 		}
 		const attempt = (this.restartAttempts.get(name) ?? 0) + 1;
 		this.restartAttempts.set(name, attempt);
 		const delay = Math.min(30_000, 1000 * 2 ** Math.min(attempt - 1, 5));
+		const failure = this.healthRecords.get(name)?.failure;
+		if (!failure) {
+			throw new Error(`Cannot schedule retry for channel '${name}' without an actionable failure`);
+		}
+		const retry = {
+			attempt,
+			state: 'scheduled' as const,
+			nextRetryAt: new Date(Date.now() + delay).toISOString(),
+		};
+		const health = { failure, retry };
+		this.healthRecords.set(name, health);
+		try {
+			await this.healthStore.write(name, health);
+		} catch (error) {
+			const schedulingFailure = failureFromError(new ChannelOperationError(
+				'retry-scheduling',
+				formatError(error),
+				recoveryGuidance('retry-scheduling'),
+				{ cause: error },
+			));
+			this.healthRecords.set(name, { failure: schedulingFailure });
+			throw error;
+		}
 		const timer = setTimeout(() => {
 			this.restartTimers.delete(name);
 			void this.enqueue(async () => {
 				const definition = (await this.configStore.read()).channels[name];
 				const runtime = this.runtimes.get(name);
-				if (!definition?.enabled || (runtime && !runtime.snapshot.error)) {
+				if (!definition?.enabled || (runtime && !runtime.startupFailure)) {
 					return;
 				}
 				if (runtime) {
 					if (!await runtime.quiesce()) {
-						this.scheduleRestart(name);
+						await this.scheduleRestart(name);
 						return;
 					}
 					await this.stopOne(name, true);
@@ -522,7 +598,7 @@ export class DaemonServer {
 					await this.startOne(name, definition);
 				} catch (error) {
 					console.error(`[channel:${name}] Restart attempt failed: ${formatError(error)}`);
-					this.scheduleRestart(name);
+					await this.scheduleRestart(name);
 				}
 			}).catch(error => {
 				console.error(`[channel:${name}] Restart failed: ${formatError(error)}`);
@@ -530,6 +606,39 @@ export class DaemonServer {
 		}, delay);
 		timer.unref();
 		this.restartTimers.set(name, timer);
+	}
+
+	private async loadHealth(config: AppConfig): Promise<void> {
+		for (const [name, definition] of Object.entries(config.channels)) {
+			const health = await this.healthStore.read(name);
+			if (!health) {
+				continue;
+			}
+			if (!definition.enabled) {
+				await this.healthStore.clear(name);
+				continue;
+			}
+			this.healthRecords.set(name, health);
+			if (health.retry) {
+				this.restartAttempts.set(name, health.retry.attempt);
+			}
+		}
+	}
+
+	private async recordFailure(name: string, error: unknown): Promise<void> {
+		const failure = failureFromError(error);
+		const previousRetry = this.healthRecords.get(name)?.retry;
+		const health = {
+			failure,
+			...(previousRetry ? { retry: previousRetry } : {}),
+		};
+		this.healthRecords.set(name, health);
+		await this.healthStore.write(name, health);
+	}
+
+	private async clearHealth(name: string): Promise<void> {
+		this.healthRecords.delete(name);
+		await this.healthStore.clear(name);
 	}
 
 	private clearRestart(name: string): void {
