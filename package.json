@@ -20,8 +20,8 @@
   },
   "type": "module",
   "bin": {
-    "ahp-channels": "./dist/cli.js",
-    "ahp-channels-daemon": "./dist/daemonMain.js"
+    "ahp-channels": "dist/cli.js",
+    "ahp-channels-daemon": "dist/daemonMain.js"
   },
   "files": [
     "dist",
