@@ -1,5 +1,29 @@
 # Roadmap
 
+## Product boundary
+
+`ahp-channels` is a thin compatibility bridge between Open Plugin channel
+infrastructure and Agent Host Protocol sessions.
+
+The bridge owns:
+
+- marketplace resolution and reproducible plugin installation;
+- AHP client customizations and read-only plugin resource serving;
+- the selected channel MCP process and its client-owned tools;
+- channel notification, tool-call, and permission-relay translation;
+- host discovery, session/chat bindings, daemon lifecycle, and delivery
+  journals.
+
+The plugin owns:
+
+- setup and access skills;
+- credentials, state files, and dependency installation;
+- sender pairing, allowlists, and platform permissions;
+- channel-specific configuration and external-service behavior.
+
+Core bridge code must not switch on plugin names or interpret plugin-owned
+files.
+
 ## Completed: Runnable compatibility bridge
 
 - Install relative-path plugins from Claude-style Git marketplaces.
@@ -26,22 +50,32 @@
 - Durable event IDs, pending replay, and bounded deduplication history.
 - Plugin-owned setup, credentials, state, and access management.
 
-## Next: Operational polish
+## Next: Reproducible plugin lifecycle
 
-- Log rotation and richer health diagnostics.
-- Stable aliases for explicitly selected remote Agent Hosts.
-- Additional channel-specific configuration profiles.
+- Install selected plugins into immutable, versioned directories instead of
+  executing them from marketplace checkouts
+  ([#1](https://github.com/TylerLeonhardt/ahp-channels/issues/1)).
+- Record marketplace revision, plugin version, and source provenance.
+- Make plugin upgrades explicit and atomic.
+- Support rollback and remove unreferenced installations safely.
 
-## Later: Broader compatibility
+## Next: Operational reliability
+
+- Rotate and bound daemon logs.
+- Report actionable health for host discovery, plugin loading, MCP startup,
+  retries, and customization-only runtimes.
+- Add stable aliases for explicitly selected remote Agent Hosts.
+- Improve host, session, and chat selection without replacing URI-based
+  bindings.
+
+## Later: Protocol coverage
 
 - Permission relay with sanitized previews and expiring request IDs.
-- Git subdirectory, URL, npm, and pip marketplace sources.
-- Virtual plugin projection for channel instructions and management skills.
 - Attachment and resource-reference translation.
 
-## Later: Governance and distribution
+## Later: Marketplace and distribution
 
+- Git subdirectory, URL, npm, and pip marketplace sources.
 - Signed or pinned marketplace policy.
 - Runtime-enforced channel and permission-relay allowlists.
-- OS credential-store integrations.
 - Packaged binaries and service installation.
