@@ -1,15 +1,20 @@
 import type { ChatState, ListSessionsResult, SessionState, StateAction, SubscribeResult } from '@microsoft/agent-host-protocol';
-import type { DispatchHandle, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
+import type { DispatchHandle, ResourceRequestHandlers, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { connectAgentHost, createChannelClientId, resolveChat } from './ahp.js';
-import { ChannelBridge } from './bridge.js';
+import { ChannelBridge, publishActiveClient } from './bridge.js';
 import type { ChannelInstanceConfig } from './config.js';
 import { discoverLocalAgentHosts, selectAgentHost, type AgentHostEndpoint } from './endpoints.js';
 import { FileChannelEventJournal, type ChannelEventJournal } from './eventJournal.js';
-import { getClaudeConfigDirectory } from './instancePaths.js';
 import { McpChannelProcess, type McpChannelClient, type StartedMcpChannel } from './mcpChannel.js';
-import { PluginManager, resolveServerConfig, type ClaudePlugin, type StdioMcpServerConfig } from './plugins.js';
-import type { SecretStore } from './secrets.js';
-import { validateSecretKey } from './secrets.js';
+import { createPluginResourceRequestHandlers } from './pluginResources.js';
+import {
+	createPluginCustomization,
+	PluginManager,
+	resolvePluginServer,
+	resolveServerConfig,
+	type ClaudePlugin,
+	type StdioMcpServerConfig,
+} from './plugins.js';
 
 export interface ChannelRuntimeSnapshot {
 	readonly name: string;
@@ -21,6 +26,7 @@ export interface ChannelRuntimeSnapshot {
 	readonly channelName: string;
 	readonly startedAt: string;
 	readonly busy: boolean;
+	readonly error?: string;
 }
 
 export interface ChannelRuntimeServices {
@@ -29,7 +35,6 @@ export interface ChannelRuntimeServices {
 	connectAgentHost(endpoint: AgentHostEndpoint, clientId: string): Promise<ChannelHostConnection>;
 	createMcpChannel(config: StdioMcpServerConfig): McpChannelClient;
 	createEventJournal?(name: string): ChannelEventJournal;
-	resolveEnvironment?(name: string, definition: ChannelInstanceConfig): Promise<Readonly<Record<string, string>>>;
 }
 
 export interface ChannelSubscription extends AsyncIterable<SubscriptionEvent> {
@@ -38,6 +43,7 @@ export interface ChannelSubscription extends AsyncIterable<SubscriptionEvent> {
 
 export interface ChannelHostClient {
 	dispatch(channel: string, action: StateAction, clientSeq?: number): DispatchHandle;
+	setResourceRequestHandlers(handlers: ResourceRequestHandlers | null): void;
 	request(method: 'listSessions', params: {
 		readonly channel: 'ahp-root://';
 		readonly cursor?: string;
@@ -55,55 +61,25 @@ export interface ChannelHostConnection {
 
 export interface ChannelRuntimeServiceOptions {
 	readonly home?: string;
-	readonly secretStore?: SecretStore;
-	readonly environment?: NodeJS.ProcessEnv;
 }
 
 export function createChannelRuntimeServices(
 	plugins: PluginManager,
 	options: ChannelRuntimeServiceOptions = {},
 ): ChannelRuntimeServices {
-	const { home, secretStore } = options;
+	const { home } = options;
 	return {
 		resolvePlugin: nameOrPath => plugins.resolvePlugin(nameOrPath),
 		discoverAgentHosts: () => discoverLocalAgentHosts(),
 		connectAgentHost: async (endpoint, clientId) => connectAgentHost(endpoint, clientId),
 		createMcpChannel: config => new McpChannelProcess(config),
 		...(home ? { createEventJournal: (name: string) => new FileChannelEventJournal(home, name) } : {}),
-		...(home && secretStore ? {
-			resolveEnvironment: (name: string, definition: ChannelInstanceConfig) =>
-				resolveChannelEnvironment(home, secretStore, name, definition, options.environment),
-		} : {}),
 	};
 }
 
 export async function validateChannelDefinition(plugins: PluginManager, definition: ChannelInstanceConfig): Promise<void> {
 	const plugin = await plugins.resolvePlugin(definition.plugin);
 	resolveServerConfig(plugin, definition.server);
-	for (const key of definition.secretEnvironment ?? []) {
-		validateSecretKey(key);
-	}
-}
-
-export async function resolveChannelEnvironment(
-	home: string,
-	secretStore: SecretStore,
-	name: string,
-	definition: ChannelInstanceConfig,
-	environment: NodeJS.ProcessEnv = process.env,
-): Promise<Readonly<Record<string, string>>> {
-	const result: Record<string, string> = {
-		CLAUDE_CONFIG_DIR: getClaudeConfigDirectory(home, name),
-	};
-	for (const key of definition.secretEnvironment ?? []) {
-		validateSecretKey(key);
-		const value = environment[key] ?? await secretStore.get(name, key);
-		if (!value) {
-			throw new Error(`Secret '${key}' is not configured for channel '${name}'`);
-		}
-		result[key] = value;
-	}
-	return result;
 }
 
 export class ChannelRuntime {
@@ -120,6 +96,7 @@ export class ChannelRuntime {
 		private readonly channelInfo: StartedMcpChannel,
 		private readonly chat: string,
 		private readonly startedAt: string,
+		private readonly startupError?: string,
 	) { }
 
 	static async start(
@@ -135,11 +112,7 @@ export class ChannelRuntime {
 		let bridge: ChannelBridge | undefined;
 		try {
 			const plugin = await services.resolvePlugin(definition.plugin);
-			const server = resolveServerConfig(plugin, definition.server);
-			const runtimeEnvironment = await services.resolveEnvironment?.(name, definition);
-			const runtimeServer: StdioMcpServerConfig = runtimeEnvironment
-				? { ...server, env: { ...server.env, ...runtimeEnvironment } }
-				: server;
+			const server = resolvePluginServer(plugin, definition.server);
 			const clientId = definition.clientId ?? createChannelClientId(name, definition.session);
 			const connected = await connectOwningHost(
 				services,
@@ -148,6 +121,9 @@ export class ChannelRuntime {
 				clientId,
 			);
 			connection = connected.connection;
+			connection.client.setResourceRequestHandlers(
+				await createPluginResourceRequestHandlers(plugin.path),
+			);
 			sessionSubscription = connected.subscription;
 			const endpoint = connected.endpoint;
 			const chat = resolveChat(connected.state, definition.chat, definition.session);
@@ -156,8 +132,26 @@ export class ChannelRuntime {
 				throw new Error(`Agent Host returned no state snapshot for chat ${chat}`);
 			}
 
-			mcp = services.createMcpChannel(runtimeServer);
-			const channelInfo = await mcp.start();
+			const customization = createPluginCustomization(plugin, connection.clientId, server.name);
+			publishActiveClient(connection.client, definition.session, {
+				clientId: connection.clientId,
+				displayName: `ahp-channels (${plugin.name})`,
+				tools: [],
+				customizations: [customization],
+			});
+			mcp = services.createMcpChannel(server.config);
+			let channelInfo: StartedMcpChannel;
+			let startupError: string | undefined;
+			try {
+				channelInfo = await mcp.start();
+			} catch (error) {
+				const errors = [toError('MCP channel startup', error)];
+				await cleanup('MCP channel cleanup', () => mcp?.close(), errors);
+				startupError = errors.map(candidate => candidate.message).join('; ');
+				onStatus?.(startupError);
+				mcp = new CustomizationOnlyChannel(plugin.name);
+				channelInfo = await mcp.start();
+			}
 			bridge = new ChannelBridge({
 				client: connection.client,
 				clientId: connection.clientId,
@@ -167,6 +161,7 @@ export class ChannelRuntime {
 				chatSubscription: chatSubscription.subscription,
 				channel: mcp,
 				channelInfo,
+				customizations: [customization],
 				eventJournal: services.createEventJournal?.(name),
 				onStatus,
 			});
@@ -182,6 +177,7 @@ export class ChannelRuntime {
 				channelInfo,
 				chat,
 				new Date().toISOString(),
+				startupError,
 			);
 		} catch (error) {
 			const cleanupErrors: Error[] = [];
@@ -210,6 +206,7 @@ export class ChannelRuntime {
 			channelName: this.channelInfo.name,
 			startedAt: this.startedAt,
 			busy: this.bridge.busy,
+			...(this.startupError ? { error: this.startupError } : {}),
 		};
 	}
 
@@ -234,6 +231,29 @@ export class ChannelRuntime {
 		if (errors.length > 0) {
 			throw new AggregateError(errors, `Failed to stop channel '${this.name}'`);
 		}
+	}
+}
+
+class CustomizationOnlyChannel implements McpChannelClient {
+	private resolveStopped!: () => void;
+	readonly whenStopped = new Promise<void>(resolve => {
+		this.resolveStopped = resolve;
+	});
+
+	constructor(private readonly name: string) { }
+
+	async start(): Promise<StartedMcpChannel> {
+		return { name: this.name, tools: [] };
+	}
+
+	async setChannelHandler(): Promise<void> { }
+
+	async callTool(): Promise<never> {
+		throw new Error('Customization-only channels do not provide tools');
+	}
+
+	async close(): Promise<void> {
+		this.resolveStopped();
 	}
 }
 

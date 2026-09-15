@@ -1,5 +1,5 @@
 import { rm } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { isValidChannelInstanceName } from './config.js';
 
 export function getInstanceRoot(home: string, name: string): string {
@@ -12,14 +12,6 @@ export function getInstanceRoot(home: string, name: string): string {
 		throw new Error(`Channel instance path escapes ${instances}`);
 	}
 	return instance;
-}
-
-export function getClaudeConfigDirectory(home: string, name: string): string {
-	return getInstanceRoot(home, name);
-}
-
-export function getTelegramStateDirectory(home: string, name: string): string {
-	return join(getClaudeConfigDirectory(home, name), 'channels', 'telegram');
 }
 
 export async function removeInstanceState(home: string, name: string): Promise<void> {

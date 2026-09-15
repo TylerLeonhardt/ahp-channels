@@ -4,7 +4,9 @@ Run Claude Code channel plugins against any Agent Host Protocol server.
 
 `ahp-channels` is an experimental compatibility adapter. It launches a
 Claude-style MCP channel plugin, forwards inbound channel notifications to an
-AHP chat, and exposes the plugin's MCP tools as AHP client tools.
+AHP chat, exposes the plugin's MCP tools as AHP client tools, and contributes
+the installed Open Plugin to the AHP session so the host can discover its
+skills and other customizations.
 
 ## Quick start
 
@@ -12,32 +14,51 @@ AHP chat, and exposes the plugin's MCP tools as AHP client tools.
 npm install
 npm run build
 
-node .\dist\cli.js plugin install telegram@claude-plugins-official
+node .\dist\cli.js plugin install fakechat@claude-plugins-official
 node .\dist\cli.js host discover
 node .\dist\cli.js session list
-node .\dist\cli.js channel create telegram --plugin telegram --session <session-uri>
-node .\dist\cli.js channel secret set telegram TELEGRAM_BOT_TOKEN
-node .\dist\cli.js channel start telegram
+node .\dist\cli.js channel create fakechat --plugin fakechat --session <session-uri>
+node .\dist\cli.js channel start fakechat
 ```
 
 The CLI stores configuration under `~/.ahp-channels` by default. Override this
 with `AHP_CHANNELS_HOME`.
 
-Telegram currently requires Bun, matching the upstream plugin. The adapter
+The official preview plugins currently require Bun. The adapter
 supports standalone TCP hosts and normal editor Agent Hosts over Windows named
 pipes or Unix domain sockets.
 
-DM the bot once it starts, then approve and lock down the sender locally:
+## Ownership boundary
 
-```powershell
-ahp-channels channel access status telegram
-ahp-channels channel access pair telegram <code>
-ahp-channels channel access policy telegram allowlist
-```
+`ahp-channels` owns the compatibility boundary:
 
-Secrets are stored in Windows Credential Manager, macOS Keychain, or a
-persistent Linux Secret Service. Named instances receive isolated plugin state under
-`~/.ahp-channels/instances/<name>`.
+- installing and resolving Open Plugins;
+- serving contributed plugin files through read-only AHP resource requests;
+- publishing plugin customizations and client-owned MCP tools;
+- starting the selected channel MCP server;
+- routing events and tool calls between MCP and AHP;
+- daemon lifecycle, session bindings, and durable event delivery.
+
+The selected channel MCP server is disabled inside the contributed plugin
+because the client already runs and proxies it. Other plugin children remain
+available to the Agent Host.
+
+The plugin owns its behavior and data:
+
+- setup and access skills;
+- credentials and state files;
+- sender pairing, allowlists, and platform permissions;
+- dependency installation and external-service behavior.
+
+Follow each plugin's own setup instructions. `ahp-channels` does not interpret
+plugin state, store plugin credentials, or implement platform-specific access
+commands. Once a channel is running, its contributed skills appear in the
+target AHP session under the plugin's namespace.
+
+If the plugin's MCP server cannot start before setup, the channel reports the
+startup error but keeps its plugin customizations active. Run the contributed
+setup skill in the target session. The daemon retries automatically after the
+setup turn finishes and activates the channel server when it becomes runnable.
 
 ## Status
 
@@ -61,8 +82,8 @@ channel is processing a turn, so an in-flight reply is never silently orphaned.
 Inbound events with stable platform IDs are journaled before AHP dispatch and
 deduplicated across process restarts.
 
-Deleting a channel also removes its keyring entries and isolated state,
-including allowlists, downloaded attachments, and pending event data.
+Deleting a channel removes its AHP binding and bridge-owned delivery journal.
+It does not delete state or credentials owned by the plugin.
 
 ```powershell
 ahp-channels daemon status

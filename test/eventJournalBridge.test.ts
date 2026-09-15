@@ -87,6 +87,7 @@ describe('ChannelBridge event journal', () => {
 				async close() { },
 			},
 			channelInfo: { name: 'telegram', tools: [] },
+			customizations: [],
 			eventJournal: journal,
 		});
 
@@ -163,6 +164,7 @@ describe('ChannelBridge event journal', () => {
 				async close() { },
 			},
 			channelInfo: { name: 'telegram', tools: [] },
+			customizations: [],
 			eventJournal: journal,
 		});
 		await bridge.start();

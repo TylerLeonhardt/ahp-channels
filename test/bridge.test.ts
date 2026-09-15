@@ -1,6 +1,8 @@
 import {
 	ActionType,
 	ConfirmationOptionKind,
+	CustomizationEnablementKind,
+	CustomizationType,
 	MessageKind,
 	PendingMessageKind,
 	ToolCallConfirmationReason,
@@ -101,6 +103,17 @@ describe('ChannelBridge', () => {
 					inputSchema: { type: 'object' },
 				}],
 			},
+			customizations: [{
+				type: CustomizationType.Plugin,
+				id: 'channel-client:plugin:fake',
+				uri: 'file:///plugins/fake',
+				name: 'fake',
+				enablement: [{
+					kind: CustomizationEnablementKind.Global,
+					enabled: true,
+				}],
+				nonce: 'plugin-nonce',
+			}],
 			autoApproveTools: true,
 			onStatus: message => statuses.push(message),
 		});
@@ -164,6 +177,17 @@ describe('ChannelBridge', () => {
 						clientId: 'channel-client',
 						displayName: 'ahp-channels (fake)',
 						tools: [{ name: 'reply', inputSchema: { type: 'object' } }],
+						customizations: [{
+							type: CustomizationType.Plugin,
+							id: 'channel-client:plugin:fake',
+							uri: 'file:///plugins/fake',
+							name: 'fake',
+							enablement: [{
+								kind: CustomizationEnablementKind.Global,
+								enabled: true,
+							}],
+							nonce: 'plugin-nonce',
+						}],
 					},
 				},
 			},
@@ -238,6 +262,7 @@ describe('ChannelBridge', () => {
 				name: 'fake',
 				tools: [],
 			},
+			customizations: [],
 		});
 
 		await bridge.start();

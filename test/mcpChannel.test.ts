@@ -1,9 +1,30 @@
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { McpChannelProcess, convertToolResult } from '../src/mcpChannel.js';
+import { McpChannelProcess, convertToolResult, createChannelEnvironment } from '../src/mcpChannel.js';
 
 describe('McpChannelProcess', () => {
+	it('inherits the parent environment with server overrides', () => {
+		const key = 'AHP_CHANNELS_ENVIRONMENT_TEST';
+		const previous = process.env[key];
+		process.env[key] = 'parent';
+		try {
+			assert.deepEqual({
+				inherited: createChannelEnvironment()[key],
+				overridden: createChannelEnvironment({ [key]: 'server' })[key],
+			}, {
+				inherited: 'parent',
+				overridden: 'server',
+			});
+		} finally {
+			if (previous === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = previous;
+			}
+		}
+	});
+
 	it('receives channel notifications and calls tools', async () => {
 		const server = fileURLToPath(new URL('./fixtures/fake-plugin/server.mjs', import.meta.url));
 		const channel = new McpChannelProcess({

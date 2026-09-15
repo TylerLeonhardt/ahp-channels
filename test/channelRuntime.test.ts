@@ -7,20 +7,18 @@ import {
 	type StateAction,
 	type SubscribeResult,
 } from '@microsoft/agent-host-protocol';
-import type { DispatchHandle, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
+import type { DispatchHandle, ResourceRequestHandlers, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import {
 	ChannelRuntime,
-	resolveChannelEnvironment,
 	type ChannelHostClient,
 	type ChannelRuntimeServices,
 	type ChannelSubscription,
 } from '../src/channelRuntime.js';
 import type { AgentHostEndpoint } from '../src/endpoints.js';
 import type { McpChannelClient, StartedMcpChannel } from '../src/mcpChannel.js';
-import { InMemorySecretStore } from '../src/secrets.js';
 
 const sessionUri = 'ahp-session:/session';
 const chatUri = 'ahp-chat:/chat';
@@ -63,6 +61,12 @@ class TestHostClient implements ChannelHostClient {
 	readonly dispatched: Array<{ channel: string; action: StateAction }> = [];
 	readonly subscriptions = new Map<string, TestSubscription>();
 	shutDown = false;
+	resourceHandlers: ResourceRequestHandlers | null | undefined;
+	resourceHandlersSetBeforeActiveClient = false;
+
+	setResourceRequestHandlers(handlers: ResourceRequestHandlers | null): void {
+		this.resourceHandlers = handlers;
+	}
 
 	async subscribe(uri: string): Promise<{ result: SubscribeResult; subscription: TestSubscription }> {
 		const subscription = new TestSubscription();
@@ -129,6 +133,9 @@ class TestHostClient implements ChannelHostClient {
 	}
 
 	dispatch(channel: string, action: StateAction): DispatchHandle {
+		if (action.type === ActionType.SessionActiveClientSet) {
+			this.resourceHandlersSetBeforeActiveClient = this.resourceHandlers !== undefined;
+		}
 		this.dispatched.push({ channel, action });
 		return { clientSeq: this.dispatched.length };
 	}
@@ -152,7 +159,12 @@ class TestMcpChannel implements McpChannelClient {
 		this.resolveStopped = resolve;
 	});
 
+	constructor(private readonly startError?: Error) { }
+
 	async start(): Promise<StartedMcpChannel> {
+		if (this.startError) {
+			throw this.startError;
+		}
 		return {
 			name: 'fake-channel',
 			tools: [{ name: 'reply', inputSchema: { type: 'object' } }],
@@ -172,49 +184,6 @@ class TestMcpChannel implements McpChannelClient {
 }
 
 describe('ChannelRuntime', () => {
-	it('isolates state and resolves keyring secrets with environment overrides', async () => {
-		const secrets = new InMemorySecretStore();
-		await secrets.set('personal', 'TOKEN', 'stored');
-		await secrets.set('personal', 'OVERRIDE', 'old');
-
-		const environment = await resolveChannelEnvironment(
-			'home',
-			secrets,
-			'personal',
-			{
-				plugin: 'fake',
-				session: sessionUri,
-				enabled: true,
-				secretEnvironment: ['TOKEN', 'OVERRIDE'],
-			},
-			{ OVERRIDE: 'new' },
-		);
-
-		assert.deepEqual(environment, {
-			CLAUDE_CONFIG_DIR: resolve('home', 'instances', 'personal'),
-			TOKEN: 'stored',
-			OVERRIDE: 'new',
-		});
-	});
-
-	it('fails explicitly when a configured secret is unavailable', async () => {
-		await assert.rejects(
-			resolveChannelEnvironment(
-				'home',
-				new InMemorySecretStore(),
-				'personal',
-				{
-					plugin: 'fake',
-					session: sessionUri,
-					enabled: true,
-					secretEnvironment: ['TOKEN'],
-				},
-				{},
-			),
-			/Secret 'TOKEN' is not configured/,
-		);
-	});
-
 	it('starts and closes every owned resource', async () => {
 		const client = new TestHostClient();
 		const mcp = new TestMcpChannel();
@@ -235,6 +204,7 @@ describe('ChannelRuntime', () => {
 			chatClosed: client.subscriptions.get(chatUri)?.closed,
 			clientShutDown: client.shutDown,
 			mcpClosed: mcp.closed,
+			resourceHandlersSetBeforeActiveClient: client.resourceHandlersSetBeforeActiveClient,
 		}, {
 			snapshot: {
 				name: 'personal',
@@ -249,13 +219,55 @@ describe('ChannelRuntime', () => {
 			},
 			actionTypes: [
 				ActionType.SessionActiveClientSet,
+				ActionType.SessionActiveClientSet,
 				ActionType.SessionActiveClientRemoved,
 			],
 			sessionClosed: true,
 			chatClosed: true,
 			clientShutDown: true,
 			mcpClosed: true,
+			resourceHandlersSetBeforeActiveClient: true,
 		});
+	});
+
+	it('keeps plugin skills contributed when the MCP server cannot start', async () => {
+		const client = new TestHostClient();
+		const mcp = new TestMcpChannel(new Error('DISCORD_BOT_TOKEN required'));
+		const runtime = await ChannelRuntime.start('personal', {
+			plugin: 'fake',
+			session: sessionUri,
+			enabled: true,
+		}, createServices(client, mcp));
+		const registration = client.dispatched.find(item => item.action.type === ActionType.SessionActiveClientSet);
+		assert.ok(registration?.action.type === ActionType.SessionActiveClientSet);
+
+		assert.deepEqual({
+			state: runtime.snapshot,
+			tools: registration.action.activeClient.tools,
+			customizationName: registration.action.activeClient.customizations?.[0]?.name,
+			failedMcpClosed: mcp.closed,
+			clientShutDown: client.shutDown,
+		}, {
+			state: {
+				name: 'personal',
+				plugin: 'fake',
+				session: sessionUri,
+				chat: chatUri,
+				host: endpoint.id,
+				clientId: 'client',
+				channelName: 'fake',
+				startedAt: runtime.snapshot.startedAt,
+				busy: false,
+				error: 'MCP channel startup: DISCORD_BOT_TOKEN required',
+			},
+			tools: [],
+			customizationName: 'fake',
+			failedMcpClosed: true,
+			clientShutDown: false,
+		});
+
+		await runtime.close();
+		assert.equal(client.shutDown, true);
 	});
 
 	it('finds the session owner when the newest Agent Host does not have it', async () => {
@@ -335,7 +347,7 @@ function createServices(client: TestHostClient, mcp: TestMcpChannel): ChannelRun
 		async resolvePlugin() {
 			return {
 				name: 'fake',
-				path: 'fake',
+				path: resolve(import.meta.dirname, 'fixtures', 'fake-plugin'),
 				servers: {
 					fake: { command: 'fake', args: [] },
 				},

@@ -20,10 +20,11 @@
 ## Completed: Alpha reliability gates
 
 - Normal editor endpoints over Windows named pipes and Unix sockets.
-- OS-keyring secrets with environment-only injection into channel processes.
-- Named instances with isolated state directories.
+- Client-contributed Open Plugin customizations.
+- Read-only reverse AHP resource serving for contributed plugins.
+- Named bridge instances with isolated delivery journals.
 - Durable event IDs, pending replay, and bounded deduplication history.
-- First-class secret and Telegram access commands.
+- Plugin-owned setup, credentials, state, and access management.
 
 ## Next: Operational polish
 

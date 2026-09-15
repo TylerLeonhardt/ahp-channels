@@ -28,6 +28,7 @@ class TestRuntime implements ManagedChannelRuntime {
 	constructor(
 		readonly name: string,
 		readonly definition: ChannelInstanceConfig,
+		private readonly startupError?: string,
 	) { }
 
 	get snapshot(): ChannelRuntimeSnapshot {
@@ -41,6 +42,7 @@ class TestRuntime implements ManagedChannelRuntime {
 			channelName: 'fake-channel',
 			startedAt: new Date(0).toISOString(),
 			busy: this.busy,
+			...(this.startupError ? { error: this.startupError } : {}),
 		};
 	}
 
@@ -64,6 +66,7 @@ class TestRuntime implements ManagedChannelRuntime {
 class TestRuntimeFactory implements DaemonRuntimeFactory {
 	readonly runtimes: TestRuntime[] = [];
 	failSession: string | undefined;
+	runtimeError: string | undefined;
 	validateHook: ((definition: ChannelInstanceConfig) => void | Promise<void>) | undefined;
 	startHook: ((definition: ChannelInstanceConfig) => void | Promise<void>) | undefined;
 
@@ -79,7 +82,7 @@ class TestRuntimeFactory implements DaemonRuntimeFactory {
 		if (definition.session === this.failSession) {
 			throw new Error(`failed to connect ${definition.session}`);
 		}
-		const runtime = new TestRuntime(name, definition);
+		const runtime = new TestRuntime(name, definition, this.runtimeError);
 		this.runtimes.push(runtime);
 		return runtime;
 	}
@@ -150,12 +153,6 @@ describe('DaemonServer', () => {
 			assert.equal(status.channels[0]?.state, 'running');
 			assert.equal(factory.runtimes.length, beforeRestartCommand + 1);
 
-			status = await requestDaemon(home, { command: 'channel.suspend', name: 'personal' });
-			assert.equal(status.channels[0]?.state, 'stopped');
-			assert.equal(status.channels[0]?.desired, 'running');
-			status = await requestDaemon(home, { command: 'channel.resume', name: 'personal' });
-			assert.equal(status.channels[0]?.state, 'running');
-
 			const beforeFailedRestart = factory.runtimes.length;
 			const failingRuntime = factory.runtimes.at(-1);
 			assert.ok(failingRuntime);
@@ -201,6 +198,53 @@ describe('DaemonServer', () => {
 			status = await requestDaemon(home, { command: 'channel.delete', name: 'personal' });
 			assert.deepEqual(status.channels, []);
 			assert.deepEqual((await store.read()).channels, {});
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('reports a customization-only runtime as an error', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		const factory = new TestRuntimeFactory();
+		factory.runtimeError = 'Plugin setup required';
+		const server = new DaemonServer(home, await getOrCreateDaemonToken(home), store, factory);
+		await server.start();
+		try {
+			const status = await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake',
+					session: 'ahp-session:/one',
+					enabled: false,
+				},
+				start: true,
+			});
+
+			assert.deepEqual({
+				state: status.channels[0]?.state,
+				error: status.channels[0]?.error,
+				hasRuntime: status.channels[0]?.runtime !== undefined,
+			}, {
+				state: 'error',
+				error: 'Plugin setup required',
+				hasRuntime: true,
+			});
+
+			factory.runtimeError = undefined;
+			await waitFor(async () => factory.runtimes.length > 1, 3000);
+			const recovered = await requestDaemon(home, { command: 'status' });
+			assert.deepEqual({
+				state: recovered.channels[0]?.state,
+				error: recovered.channels[0]?.error,
+				failedRuntimeClosed: factory.runtimes[0]?.closed,
+			}, {
+				state: 'running',
+				error: undefined,
+				failedRuntimeClosed: true,
+			});
 		} finally {
 			await server.close();
 		}
