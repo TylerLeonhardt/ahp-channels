@@ -1,8 +1,9 @@
 import { z } from 'zod';
+import { ChannelFailureStageSchema, type ChannelHealth } from './channelHealth.js';
 import type { ChannelInstanceConfig } from './config.js';
 import type { ChannelRuntimeSnapshot } from './channelRuntime.js';
 
-export const DAEMON_PROTOCOL_VERSION = 3;
+export const DAEMON_PROTOCOL_VERSION = 4;
 export const MAX_DAEMON_MESSAGE_BYTES = 1024 * 1024;
 
 const ChannelInstanceSchema = z.strictObject({
@@ -71,8 +72,42 @@ const RuntimeSnapshotSchema = z.strictObject({
 	channelName: z.string(),
 	startedAt: z.string(),
 	busy: z.boolean(),
-	error: z.string().optional(),
+	mode: z.enum(['mcp', 'customization-only']),
 });
+
+const ChannelFailureSchema = z.strictObject({
+	stage: ChannelFailureStageSchema,
+	summary: z.string().min(1),
+	failedAt: z.iso.datetime(),
+	guidance: z.string().min(1),
+});
+
+const ChannelRetrySchema = z.discriminatedUnion('state', [
+	z.strictObject({
+		attempt: z.number().int().positive(),
+		state: z.literal('scheduled'),
+		nextRetryAt: z.iso.datetime(),
+	}),
+	z.strictObject({
+		attempt: z.number().int().nonnegative(),
+		state: z.literal('exhausted'),
+	}),
+]);
+
+const ChannelHealthSchema = z.discriminatedUnion('state', [
+	z.strictObject({ state: z.literal('healthy') }),
+	z.strictObject({ state: z.literal('stopped') }),
+	z.strictObject({
+		state: z.literal('degraded'),
+		failure: ChannelFailureSchema,
+		retry: ChannelRetrySchema.optional(),
+	}),
+	z.strictObject({
+		state: z.literal('unhealthy'),
+		failure: ChannelFailureSchema,
+		retry: ChannelRetrySchema.optional(),
+	}),
+]);
 
 const ChannelStatusSchema = z.strictObject({
 	name: z.string(),
@@ -80,7 +115,7 @@ const ChannelStatusSchema = z.strictObject({
 	state: z.enum(['stopped', 'starting', 'running', 'stopping', 'error']),
 	definition: ChannelInstanceSchema,
 	runtime: RuntimeSnapshotSchema.optional(),
-	error: z.string().optional(),
+	health: ChannelHealthSchema,
 });
 
 const DaemonStatusSchema = z.strictObject({
@@ -116,7 +151,7 @@ export interface ChannelDaemonStatus {
 	readonly state: ChannelDaemonState;
 	readonly definition: ChannelInstanceConfig;
 	readonly runtime?: ChannelRuntimeSnapshot;
-	readonly error?: string;
+	readonly health: ChannelHealth;
 }
 
 export interface DaemonStatus {

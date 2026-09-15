@@ -9,7 +9,12 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 import { ConfigStore } from '../src/config.js';
-import { createPluginCustomization, PluginManager, resolveServerConfig } from '../src/plugins.js';
+import {
+	createPluginCustomization,
+	PluginIntegrityError,
+	PluginManager,
+	resolveServerConfig,
+} from '../src/plugins.js';
 import { runProcess, runProcessOutput } from '../src/process.js';
 
 const temporaryDirectories: string[] = [];
@@ -89,7 +94,12 @@ describe('PluginManager', () => {
 		await writeFile(join(pluginPath, 'server.mjs'), 'dirty marketplace');
 		await assert.rejects(manager.upgrade('fake'), /Marketplace has local changes/);
 		await writeFile(join(installed.plugin.path, 'server.mjs'), 'tampered installation');
-		await assert.rejects(manager.resolvePlugin('fake'), /does not match digest/);
+		await assert.rejects(
+			manager.resolvePlugin('fake'),
+			(error: unknown) => error instanceof PluginIntegrityError
+				&& /does not match digest/.test(error.message)
+				&& error.cause instanceof Error,
+		);
 	});
 
 	it('upgrades explicitly, keeps channel pins, rolls back, and prunes only unreferenced versions', async () => {

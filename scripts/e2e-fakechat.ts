@@ -300,7 +300,7 @@ function requireRunningChannel(status: DaemonStatus, installation: string): stri
 	const channel = status.channels.find(candidate => candidate.name === CHANNEL_NAME);
 	if (channel?.state !== 'running'
 		|| !channel.runtime
-		|| channel.error
+		|| channel.health.state !== 'healthy'
 		|| channel.definition.installation !== installation) {
 		throw new Error(`fakechat channel did not start: ${JSON.stringify(channel)}`);
 	}
@@ -382,7 +382,7 @@ async function waitForFakechatReady(home: string, port: number): Promise<void> {
 		const status = await probeDaemon(home);
 		const channel = status?.channels.find(candidate => candidate.name === CHANNEL_NAME);
 		if (channel?.state === 'error') {
-			throw new Error(`fakechat channel failed before its UI became ready: ${channel.error ?? 'unknown error'}`);
+			throw new Error(`fakechat channel failed before its UI became ready: ${channel.health.failure?.summary ?? 'unknown error'}`);
 		}
 		await delay(100);
 	}

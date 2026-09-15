@@ -62,14 +62,19 @@ files.
   process trees.
 - Official fakechat external-UI coverage across a daemon restart in CI.
 
+## Completed: Actionable channel health diagnostics
+
+- Structured health for host discovery and connection, session and chat
+  resolution, plugin integrity and loading, MCP startup and exits, retries,
+  and customization-only runtimes.
+- Latest bridge-owned root cause, recovery guidance, failure time, and retry
+  state preserved atomically across daemon restarts and cleared on recovery.
+- Strict daemon protocol and persisted-state validation with secret-safe,
+  actionable CLI output.
+
 ## Next: Operational reliability
 
 - Rotate and bound daemon logs while retaining recent failure context.
-- Report structured, actionable health for host discovery, session resolution,
-  plugin integrity and loading, MCP startup and exits, retries, and
-  customization-only runtimes.
-- Preserve the latest root cause, recovery guidance, and retry state across
-  daemon restarts.
 
 ## Next: Host selection and release validation
 

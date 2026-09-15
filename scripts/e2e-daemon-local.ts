@@ -152,7 +152,8 @@ try {
 	});
 	const setupChannel = setupStatus.channels.find(candidate => candidate.name === 'setup-test');
 	if (setupChannel?.state !== 'error'
-		|| !setupChannel.error?.includes('MCP channel startup')
+		|| setupChannel.health.failure?.stage !== 'mcp-startup'
+		|| !setupChannel.health.failure.summary.includes('MCP channel startup')
 		|| !setupChannel.runtime) {
 		throw new Error(`Expected a customization-only error runtime, received ${JSON.stringify(setupChannel)}`);
 	}

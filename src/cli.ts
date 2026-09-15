@@ -512,7 +512,8 @@ function printChannelTable(channels: readonly ChannelDaemonStatus[]): void {
 		installation: channel.definition.installation?.slice(0, 12) ?? '',
 		session: channel.definition.session,
 		chat: channel.runtime?.chat ?? channel.definition.chat ?? 'default',
-		error: channel.error ?? '',
+		health: channel.health.state,
+		failure: channel.health.failure?.summary ?? '',
 	})));
 }
 
@@ -520,9 +521,21 @@ function printChannelStatus(channel: ChannelDaemonStatus): void {
 	const installation = channel.definition.installation
 		? ` @ ${channel.definition.installation.slice(0, 12)}`
 		: '';
-	console.log(`${channel.name}: ${channel.state}${installation} → ${channel.definition.session}${channel.runtime ? ` (${channel.runtime.chat})` : ''}`);
-	if (channel.error) {
-		console.log(`Error: ${channel.error}`);
+	console.log(`${channel.name}: ${channel.state} (${channel.health.state})${installation} → ${channel.definition.session}${channel.runtime ? ` (${channel.runtime.chat})` : ''}`);
+	if (channel.runtime?.mode === 'customization-only') {
+		console.log('Mode: customizations available; channel MCP server unavailable');
+	}
+	if (channel.health.failure) {
+		console.log(`Failure stage: ${channel.health.failure.stage}`);
+		console.log(`Error: ${channel.health.failure.summary}`);
+		console.log(`Failed at: ${channel.health.failure.failedAt}`);
+		console.log(`Recovery: ${channel.health.failure.guidance}`);
+	}
+	if (channel.health.retry) {
+		console.log(`Retry: attempt ${channel.health.retry.attempt} (${channel.health.retry.state})`);
+		if (channel.health.retry.nextRetryAt) {
+			console.log(`Next retry: ${channel.health.retry.nextRetryAt}`);
+		}
 	}
 }
 
@@ -569,6 +582,7 @@ function stoppedChannelStatus(name: string, definition: ChannelInstanceConfig): 
 		desired: definition.enabled ? 'running' : 'stopped',
 		state: 'stopped',
 		definition,
+		health: { state: 'stopped' },
 	};
 }
 

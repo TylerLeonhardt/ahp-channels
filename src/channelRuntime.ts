@@ -2,6 +2,11 @@ import type { ChatState, ListSessionsResult, SessionState, StateAction, Subscrib
 import type { DispatchHandle, ResourceRequestHandlers, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { connectAgentHost, createChannelClientId, resolveChat } from './ahp.js';
 import { ChannelBridge, publishActiveClient } from './bridge.js';
+import {
+	ChannelOperationError,
+	recoveryGuidance,
+	type ChannelFailureStage,
+} from './channelHealth.js';
 import type { ChannelInstanceConfig } from './config.js';
 import { discoverLocalAgentHosts, selectAgentHost, type AgentHostEndpoint } from './endpoints.js';
 import { FileChannelEventJournal, type ChannelEventJournal } from './eventJournal.js';
@@ -10,6 +15,7 @@ import { createPluginResourceRequestHandlers } from './pluginResources.js';
 import {
 	createPluginCustomization,
 	PluginManager,
+	PluginIntegrityError,
 	resolvePluginServer,
 	resolveServerConfig,
 	type ClaudePlugin,
@@ -26,7 +32,7 @@ export interface ChannelRuntimeSnapshot {
 	readonly channelName: string;
 	readonly startedAt: string;
 	readonly busy: boolean;
-	readonly error?: string;
+	readonly mode: 'mcp' | 'customization-only';
 }
 
 export interface ChannelRuntimeServices {
@@ -96,7 +102,7 @@ export class ChannelRuntime {
 		private readonly channelInfo: StartedMcpChannel,
 		private readonly chat: string,
 		private readonly startedAt: string,
-		private readonly startupError?: string,
+		readonly startupFailure?: ChannelOperationError,
 	) { }
 
 	static async start(
@@ -111,33 +117,71 @@ export class ChannelRuntime {
 		let mcp: McpChannelClient | undefined;
 		let bridge: ChannelBridge | undefined;
 		try {
-			const plugin = await services.resolvePlugin(definition.plugin, definition.installation);
-			const server = resolvePluginServer(plugin, definition.server);
+			let plugin: ClaudePlugin;
+			try {
+				plugin = await services.resolvePlugin(definition.plugin, definition.installation);
+			} catch (error) {
+				throw operationError(error instanceof PluginIntegrityError ? 'plugin-integrity' : 'plugin-loading', error);
+			}
+			let server: ReturnType<typeof resolvePluginServer>;
+			try {
+				server = resolvePluginServer(plugin, definition.server);
+			} catch (error) {
+				throw operationError('plugin-loading', error);
+			}
 			const clientId = definition.clientId ?? createChannelClientId(name, definition.session);
-			const connected = await connectOwningHost(
-				services,
-				await services.discoverAgentHosts(),
-				definition,
-				clientId,
-			);
+			let endpoints: readonly AgentHostEndpoint[];
+			try {
+				endpoints = await services.discoverAgentHosts();
+			} catch (error) {
+				throw operationError('agent-host-discovery', error);
+			}
+			if (endpoints.length === 0) {
+				throw operationError('agent-host-discovery', new Error('No running local Agent Host endpoints were discovered'));
+			}
+			let connected: Awaited<ReturnType<typeof connectOwningHost>>;
+			try {
+				connected = await connectOwningHost(
+					services,
+					endpoints,
+					definition,
+					clientId,
+				);
+			} catch (error) {
+				throw operationError('agent-host-connection', error);
+			}
 			connection = connected.connection;
-			connection.client.setResourceRequestHandlers(
-				await createPluginResourceRequestHandlers(plugin.path),
-			);
+			try {
+				connection.client.setResourceRequestHandlers(
+					await createPluginResourceRequestHandlers(plugin.path),
+				);
+			} catch (error) {
+				throw operationError('plugin-loading', error);
+			}
 			sessionSubscription = connected.subscription;
 			const endpoint = connected.endpoint;
-			const chat = resolveChat(connected.state, definition.chat, definition.session);
-			chatSubscription = await connection.client.subscribe(chat);
-			if (!chatSubscription.result.snapshot) {
-				throw new Error(`Agent Host returned no state snapshot for chat ${chat}`);
+			let chat: string;
+			try {
+				chat = resolveChat(connected.state, definition.chat, definition.session);
+				chatSubscription = await connection.client.subscribe(chat);
+				if (!chatSubscription.result.snapshot) {
+					throw new Error(`Agent Host returned no state snapshot for chat ${chat}`);
+				}
+			} catch (error) {
+				throw operationError('session-resolution', error);
 			}
 
-			const customization = createPluginCustomization(
-				plugin,
-				connection.clientId,
-				server.name,
-				definition.installation,
-			);
+			let customization: ReturnType<typeof createPluginCustomization>;
+			try {
+				customization = createPluginCustomization(
+					plugin,
+					connection.clientId,
+					server.name,
+					definition.installation,
+				);
+			} catch (error) {
+				throw operationError('plugin-loading', error);
+			}
 			publishActiveClient(connection.client, definition.session, {
 				clientId: connection.clientId,
 				displayName: `ahp-channels (${plugin.name})`,
@@ -146,14 +190,17 @@ export class ChannelRuntime {
 			});
 			mcp = services.createMcpChannel(server.config);
 			let channelInfo: StartedMcpChannel;
-			let startupError: string | undefined;
+			let startupFailure: ChannelOperationError | undefined;
 			try {
 				channelInfo = await mcp.start();
 			} catch (error) {
 				const errors = [toError('MCP channel startup', error)];
 				await cleanup('MCP channel cleanup', () => mcp?.close(), errors);
-				startupError = errors.map(candidate => candidate.message).join('; ');
-				onStatus?.(startupError);
+				startupFailure = operationError(
+					'mcp-startup',
+					new AggregateError(errors, errors.map(candidate => candidate.message).join('; ')),
+				);
+				onStatus?.(startupFailure.message);
 				mcp = new CustomizationOnlyChannel(plugin.name);
 				channelInfo = await mcp.start();
 			}
@@ -182,7 +229,7 @@ export class ChannelRuntime {
 				channelInfo,
 				chat,
 				new Date().toISOString(),
-				startupError,
+				startupFailure,
 			);
 		} catch (error) {
 			const cleanupErrors: Error[] = [];
@@ -194,6 +241,14 @@ export class ChannelRuntime {
 			await cleanup('session subscription', () => sessionSubscription?.close(), cleanupErrors);
 			await cleanup('AHP client', () => connection?.client.shutdown(), cleanupErrors);
 			if (cleanupErrors.length > 0) {
+				if (error instanceof ChannelOperationError) {
+					throw new ChannelOperationError(
+						error.stage,
+						error.message,
+						error.guidance,
+						{ cause: new AggregateError([error, ...cleanupErrors], `Failed to start channel '${name}'`) },
+					);
+				}
 				throw new AggregateError([toError('channel startup', error), ...cleanupErrors], `Failed to start channel '${name}'`);
 			}
 			throw error;
@@ -211,7 +266,7 @@ export class ChannelRuntime {
 			channelName: this.channelInfo.name,
 			startedAt: this.startedAt,
 			busy: this.bridge.busy,
-			...(this.startupError ? { error: this.startupError } : {}),
+			mode: this.startupFailure ? 'customization-only' : 'mcp',
 		};
 	}
 
@@ -280,13 +335,33 @@ async function connectOwningHost(
 		throw new Error('No running local Agent Host endpoints were discovered');
 	}
 	const errors: Error[] = [];
+	let failureStage: ChannelFailureStage = 'agent-host-connection';
 	for (const endpoint of candidates) {
 		let connection: ChannelHostConnection | undefined;
 		let subscription: ChannelSubscription | undefined;
 		try {
-			connection = await services.connectAgentHost(endpoint, clientId);
-			if (!definition.host && !await hostHasSession(connection.client, definition.session)) {
-				throw new Error('Session is not present in this Agent Host catalog');
+			try {
+				connection = await services.connectAgentHost(endpoint, clientId);
+			} catch (error) {
+				throw operationError('agent-host-connection', error);
+			}
+			try {
+				if (!definition.host && !await hostHasSession(connection.client, definition.session)) {
+					throw new Error('Session is not present in this Agent Host catalog');
+				}
+				const subscribed = await connection.client.subscribe(definition.session);
+				subscription = subscribed.subscription;
+				if (!subscribed.result.snapshot) {
+					throw new Error('Agent Host returned no session state snapshot');
+				}
+				return {
+					endpoint,
+					connection,
+					subscription,
+					state: subscribed.result.snapshot.state as SessionState,
+				};
+			} catch (error) {
+				throw operationError('session-resolution', error);
 			}
 
 			async function hostHasSession(client: ChannelHostClient, session: string): Promise<boolean> {
@@ -312,24 +387,33 @@ async function connectOwningHost(
 				}
 				throw new Error('Agent Host session catalog exceeded 100 pages');
 			}
-			const subscribed = await connection.client.subscribe(definition.session);
-			subscription = subscribed.subscription;
-			if (!subscribed.result.snapshot) {
-				throw new Error('Agent Host returned no session state snapshot');
-			}
-			return {
-				endpoint,
-				connection,
-				subscription,
-				state: subscribed.result.snapshot.state as SessionState,
-			};
 		} catch (error) {
+			if (error instanceof ChannelOperationError && error.stage === 'session-resolution') {
+				failureStage = 'session-resolution';
+			}
 			errors.push(toError(endpoint.id, error));
 			await cleanup(endpoint.id, () => subscription?.close(), errors);
 			await cleanup(endpoint.id, () => connection?.client.shutdown(), errors);
 		}
 	}
-	throw new AggregateError(errors, `No discovered Agent Host owns session ${definition.session}`);
+	throw new ChannelOperationError(
+		failureStage,
+		`No discovered Agent Host owns session ${definition.session}: ${errors.map(error => error.message).join('; ')}`,
+		recoveryGuidance(failureStage),
+		{ cause: new AggregateError(errors) },
+	);
+}
+
+function operationError(stage: ChannelFailureStage, error: unknown): ChannelOperationError {
+	if (error instanceof ChannelOperationError) {
+		return error;
+	}
+	return new ChannelOperationError(
+		stage,
+		error instanceof Error ? error.message : String(error),
+		recoveryGuidance(stage),
+		{ cause: error },
+	);
 }
 
 async function cleanup(label: string, operation: () => Promise<unknown> | undefined, errors: Error[]): Promise<void> {

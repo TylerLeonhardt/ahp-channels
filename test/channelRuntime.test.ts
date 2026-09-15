@@ -17,8 +17,10 @@ import {
 	type ChannelRuntimeServices,
 	type ChannelSubscription,
 } from '../src/channelRuntime.js';
+import { ChannelOperationError } from '../src/channelHealth.js';
 import type { AgentHostEndpoint } from '../src/endpoints.js';
 import type { McpChannelClient, StartedMcpChannel } from '../src/mcpChannel.js';
+import { PluginIntegrityError, PluginLoadingError } from '../src/plugins.js';
 
 const sessionUri = 'ahp-session:/session';
 const chatUri = 'ahp-chat:/chat';
@@ -223,6 +225,7 @@ describe('ChannelRuntime', () => {
 				channelName: 'fake-channel',
 				startedAt: snapshot.startedAt,
 				busy: false,
+				mode: 'mcp',
 			},
 			actionTypes: [
 				ActionType.SessionActiveClientSet,
@@ -251,6 +254,10 @@ describe('ChannelRuntime', () => {
 
 		assert.deepEqual({
 			state: runtime.snapshot,
+			failure: runtime.startupFailure && {
+				stage: runtime.startupFailure.stage,
+				message: runtime.startupFailure.message,
+			},
 			tools: registration.action.activeClient.tools,
 			customizationName: registration.action.activeClient.customizations?.[0]?.name,
 			failedMcpClosed: mcp.closed,
@@ -266,7 +273,11 @@ describe('ChannelRuntime', () => {
 				channelName: 'fake',
 				startedAt: runtime.snapshot.startedAt,
 				busy: false,
-				error: 'MCP channel startup: DISCORD_BOT_TOKEN required',
+				mode: 'customization-only',
+			},
+			failure: {
+				stage: 'mcp-startup',
+				message: 'MCP channel startup: DISCORD_BOT_TOKEN required',
 			},
 			tools: [],
 			customizationName: 'fake',
@@ -338,7 +349,9 @@ describe('ChannelRuntime', () => {
 				session: sessionUri,
 				enabled: true,
 			}, createServices(client, mcp)),
-			/no state snapshot for chat/,
+			(error: unknown) => error instanceof ChannelOperationError
+				&& error.stage === 'session-resolution'
+				&& /no state snapshot for chat/.test(error.message),
 		);
 		assert.deepEqual({
 			clientShutDown: client.shutDown,
@@ -347,6 +360,61 @@ describe('ChannelRuntime', () => {
 			clientShutDown: true,
 			mcpClosed: false,
 		});
+	});
+
+	it('categorizes Agent Host discovery at its operation boundary', async () => {
+			const services = createServices(new TestHostClient(), new TestMcpChannel());
+			services.discoverAgentHosts = async () => {
+				throw new Error('registry unavailable');
+			};
+
+			await assert.rejects(
+				ChannelRuntime.start('personal', {
+					plugin: 'fake',
+					session: sessionUri,
+					enabled: true,
+				}, services),
+				(error: unknown) => error instanceof ChannelOperationError
+					&& error.stage === 'agent-host-discovery'
+					&& error.cause instanceof Error,
+			);
+	});
+
+	it('categorizes session resolution without parsing the error message', async () => {
+			const client = new TestHostClient();
+			client.request = async () => ({ items: [] });
+
+			await assert.rejects(
+				ChannelRuntime.start('personal', {
+					plugin: 'fake',
+					session: sessionUri,
+					enabled: true,
+				}, createServices(client, new TestMcpChannel())),
+				(error: unknown) => error instanceof ChannelOperationError
+					&& error.stage === 'session-resolution',
+			);
+	});
+
+	it('distinguishes plugin integrity from plugin loading failures', async () => {
+			for (const expected of [
+				{ error: new PluginIntegrityError(new Error('digest mismatch')), stage: 'plugin-integrity' },
+				{ error: new PluginLoadingError(new Error('invalid manifest')), stage: 'plugin-loading' },
+			] as const) {
+				const services = createServices(new TestHostClient(), new TestMcpChannel());
+				services.resolvePlugin = async () => {
+					throw expected.error;
+				};
+				await assert.rejects(
+					ChannelRuntime.start('personal', {
+						plugin: 'fake',
+						session: sessionUri,
+						enabled: true,
+					}, services),
+					(error: unknown) => error instanceof ChannelOperationError
+						&& error.stage === expected.stage
+						&& error.cause === expected.error,
+				);
+			}
 	});
 });
 
