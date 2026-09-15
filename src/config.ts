@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { withFileLock, writeFileAtomic } from './lockedFile.js';
 
 export const CONFIG_VERSION = 3;
@@ -15,7 +15,6 @@ export interface MarketplaceConfig {
 }
 
 export interface PluginInstallationConfig {
-	readonly path: string;
 	readonly source: string;
 	readonly version?: string;
 	readonly marketplaceRevision?: string;
@@ -107,7 +106,7 @@ export class ConfigStore {
 
 		const value: unknown = JSON.parse(raw);
 		const config = parseConfig(value);
-		validateReferences(config, this.home);
+		validateReferences(config);
 		return config;
 	}
 
@@ -120,6 +119,7 @@ export class ConfigStore {
 	}
 
 	async write(config: AppConfig): Promise<void> {
+		validateReferences(config);
 		await writeFileAtomic(this.configPath, `${JSON.stringify(config, undefined, 2)}\n`);
 	}
 
@@ -139,16 +139,10 @@ function parseConfig(value: unknown): AppConfig {
 	};
 }
 
-function validateReferences(config: AppConfig, home: string): void {
+function validateReferences(config: AppConfig): void {
 	for (const [name, plugin] of Object.entries(config.plugins)) {
 		if (!config.marketplaces[plugin.marketplace]) {
 			throw new Error(`Plugin '${name}' references unknown marketplace '${plugin.marketplace}'`);
-		}
-		for (const [id, installation] of Object.entries(plugin.installations)) {
-			const expected = resolve(home, 'plugins', plugin.marketplace, name, id);
-			if (resolve(installation.path) !== expected) {
-				throw new Error(`Plugin '${name}' installation '${id}' has an invalid path`);
-			}
 		}
 	}
 	for (const [name, channel] of Object.entries(config.channels)) {
@@ -199,8 +193,6 @@ function parseInstalledPlugin(value: unknown): InstalledPluginConfig {
 
 function parsePluginInstallation(value: unknown): PluginInstallationConfig {
 	if (!isRecord(value)
-		|| typeof value['path'] !== 'string'
-		|| !isAbsolute(value['path'])
 		|| typeof value['source'] !== 'string'
 		|| value['source'].length === 0
 		|| (value['version'] !== undefined && typeof value['version'] !== 'string')
@@ -210,7 +202,6 @@ function parsePluginInstallation(value: unknown): PluginInstallationConfig {
 		throw new Error('Invalid plugin installation');
 	}
 	return {
-		path: value['path'],
 		source: value['source'],
 		...(value['version'] ? { version: value['version'] } : {}),
 		...(value['marketplaceRevision'] ? { marketplaceRevision: value['marketplaceRevision'] } : {}),

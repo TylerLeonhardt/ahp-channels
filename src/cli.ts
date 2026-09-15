@@ -75,7 +75,7 @@ plugin
 			version: version.config.version ?? '',
 			marketplaceRevision: version.config.marketplaceRevision ?? '',
 			channels: version.channels.join(', '),
-			path: version.config.path,
+			path: version.path,
 		})));
 	});
 plugin
@@ -105,12 +105,13 @@ plugin
 	.action(async () => {
 		for (const [name, installed] of listInstalledPlugins(await store.read())) {
 			const active = activeInstallation(installed);
+			const plugin = await plugins.resolvePlugin(name);
 			console.log([
 				name,
 				installed.marketplace,
 				active.version ?? '',
 				installed.activeInstallation,
-				active.path,
+				plugin.path,
 			].join('\t'));
 		}
 	});

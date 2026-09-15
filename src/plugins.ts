@@ -16,8 +16,10 @@ import {
 	type PluginInstallationConfig,
 } from './config.js';
 import {
+	getPluginInstallationPath,
 	installPluginSnapshot,
 	removePluginInstallation,
+	resolvePluginInstallation,
 } from './pluginInstallations.js';
 import { runProcess, runProcessOutput } from './process.js';
 
@@ -71,6 +73,7 @@ export interface PluginVersion {
 	readonly id: string;
 	readonly active: boolean;
 	readonly config: PluginInstallationConfig;
+	readonly path: string;
 	readonly channels: readonly string[];
 }
 
@@ -134,7 +137,13 @@ export class PluginManager {
 		if (!candidate) {
 			throw new Error(`Plugin '${pluginName}' has no installation '${installation}'`);
 		}
-		await inspectPlugin(candidate.path);
+		const resolved = await resolvePluginInstallation(
+			this.store.home,
+			installed.marketplace,
+			pluginName,
+			installation,
+		);
+		await inspectPlugin(resolved.path);
 		let result: PluginInstallationConfig | undefined;
 		await this.store.update(config => {
 			const plugin = config.plugins[pluginName];
@@ -190,7 +199,13 @@ export class PluginManager {
 		if (!version) {
 			throw new Error(`Plugin '${nameOrPath}' has no installation '${selected}'`);
 		}
-		return inspectPlugin(version.path);
+		const resolved = await resolvePluginInstallation(
+			this.store.home,
+			installed.marketplace,
+			nameOrPath,
+			selected,
+		);
+		return inspectPlugin(resolved.path);
 	}
 
 	async versions(pluginName: string): Promise<readonly PluginVersion[]> {
@@ -204,6 +219,7 @@ export class PluginManager {
 				id,
 				active: id === plugin.activeInstallation,
 				config: installation,
+				path: getPluginInstallationPath(this.store.home, plugin.marketplace, pluginName, id),
 				channels: referencedChannels(config.channels, pluginName, id),
 			}))
 			.sort((left, right) => left.id.localeCompare(right.id));
@@ -225,10 +241,11 @@ export class PluginManager {
 				}
 				const installations = { ...plugin.installations };
 				for (const [id, installation] of Object.entries(plugin.installations)) {
+					const path = getPluginInstallationPath(this.store.home, plugin.marketplace, name, id);
 					if (id === plugin.activeInstallation
 						|| referencedChannels(config.channels, name, id).length > 0
 						|| Object.values(config.channels).some(channel =>
-							isPluginPath(channel.plugin) && resolve(channel.plugin) === installation.path
+							isPluginPath(channel.plugin) && resolve(channel.plugin) === path
 						)) {
 						continue;
 					}
@@ -237,7 +254,7 @@ export class PluginManager {
 						marketplace: plugin.marketplace,
 						plugin: name,
 						installation: id,
-						path: installation.path,
+						path,
 						config: installation,
 					});
 				}
@@ -306,7 +323,7 @@ export class PluginManager {
 			...(sourcePlugin.version ? { version: sourcePlugin.version } : {}),
 			...(provenance.revision ? { marketplaceRevision: provenance.revision } : {}),
 		}, provenance.trackedFiles);
-		const plugin = await inspectPlugin(snapshot.config.path);
+		const plugin = await inspectPlugin(snapshot.path);
 		await this.store.update(current => ({
 			...current,
 			plugins: {
@@ -511,21 +528,20 @@ interface MarketplaceProvenance {
 }
 
 async function marketplaceProvenance(path: string, pluginPath: string): Promise<MarketplaceProvenance> {
-	try {
-		await stat(join(path, '.git'));
-	} catch (error) {
-		if (isNodeError(error) && error.code === 'ENOENT') {
-			return {};
-		}
-		throw error;
+	const gitRoot = await findGitRoot(path);
+	if (!gitRoot) {
+		return {};
 	}
+	const relativeMarketplacePath = normalizeRelativePath(relative(gitRoot, path));
 	const status = await runProcessOutput('git', [
 		'-C',
-		path,
+		gitRoot,
 		'status',
 		'--porcelain=v1',
 		'-z',
 		'--untracked-files=normal',
+		'--',
+		relativeMarketplacePath || '.',
 	]);
 	const changes = status.stdout
 		.split('\0')
@@ -537,15 +553,15 @@ async function marketplaceProvenance(path: string, pluginPath: string): Promise<
 	if (changes.length > 0) {
 		throw new Error(`Marketplace has local changes; refusing reproducible installation: ${changes.join(', ')}`);
 	}
-	const result = await runProcessOutput('git', ['-C', path, 'rev-parse', 'HEAD']);
+	const result = await runProcessOutput('git', ['-C', gitRoot, 'rev-parse', 'HEAD']);
 	const revision = result.stdout.trim();
 	if (!/^[a-f0-9]{40,64}$/i.test(revision)) {
 		throw new Error(`Git returned an invalid marketplace revision: ${revision}`);
 	}
-	const relativePluginPath = normalizeRelativePath(relative(path, pluginPath));
+	const relativePluginPath = normalizeRelativePath(relative(gitRoot, pluginPath));
 	const tracked = await runProcessOutput('git', [
 		'-C',
-		path,
+		gitRoot,
 		'ls-files',
 		'-z',
 		'--',
@@ -563,6 +579,25 @@ async function marketplaceProvenance(path: string, pluginPath: string): Promise<
 		revision: revision.toLowerCase(),
 		trackedFiles,
 	};
+}
+
+async function findGitRoot(path: string): Promise<string | undefined> {
+	let current = resolve(path);
+	while (true) {
+		try {
+			await stat(join(current, '.git'));
+			return current;
+		} catch (error) {
+			if (!isNodeError(error) || error.code !== 'ENOENT') {
+				throw error;
+			}
+		}
+		const parent = resolve(current, '..');
+		if (parent === current) {
+			return undefined;
+		}
+		current = parent;
+	}
 }
 
 function isPluginPath(value: string): boolean {

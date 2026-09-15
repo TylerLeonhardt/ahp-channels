@@ -30,7 +30,8 @@ describe('PluginManager', () => {
 	it('installs a relative marketplace plugin into a content-addressed copy', async () => {
 		const root = await mkdtemp(join(tmpdir(), 'ahp-channels-plugin-'));
 		temporaryDirectories.push(root);
-		const marketplace = join(root, 'marketplace');
+		const repository = join(root, 'repository');
+		const marketplace = join(repository, 'catalog');
 		const pluginPath = join(marketplace, 'plugins', 'fake');
 		await mkdir(marketplace, { recursive: true });
 		await writeFile(join(marketplace, 'marketplace.json'), JSON.stringify({
@@ -41,9 +42,9 @@ describe('PluginManager', () => {
 		}));
 		await writePlugin(pluginPath, '1.2.3', 'version one');
 		await writeFile(join(marketplace, '.gitignore'), '**/.env\n');
-		await initializeGitRepository(marketplace);
+		await initializeGitRepository(repository);
 		await writeFile(join(pluginPath, '.env'), 'SHOULD_NOT_BE_COPIED=true\n');
-		const marketplaceRevision = (await runProcessOutput('git', ['-C', marketplace, 'rev-parse', 'HEAD'])).stdout.trim();
+		const marketplaceRevision = (await runProcessOutput('git', ['-C', repository, 'rev-parse', 'HEAD'])).stdout.trim();
 
 		const store = new ConfigStore(join(root, 'home'));
 		const manager = new PluginManager(store);
@@ -75,7 +76,6 @@ describe('PluginManager', () => {
 				activeInstallation: installed.installation,
 				installations: {
 					[installed.installation]: {
-						path: installed.plugin.path,
 						source: './plugins/fake',
 						version: '1.2.3',
 						marketplaceRevision,
@@ -83,11 +83,13 @@ describe('PluginManager', () => {
 				},
 			},
 		});
-		assert.equal(storedInstallation.path, installed.plugin.path);
+		assert.deepEqual(storedInstallation, installed.config);
 		await assert.rejects(access(join(installed.plugin.path, '.env')));
 		await assert.rejects(manager.install('fake@test'), /already installed/);
 		await writeFile(join(pluginPath, 'server.mjs'), 'dirty marketplace');
 		await assert.rejects(manager.upgrade('fake'), /Marketplace has local changes/);
+		await writeFile(join(installed.plugin.path, 'server.mjs'), 'tampered installation');
+		await assert.rejects(manager.resolvePlugin('fake'), /does not match digest/);
 	});
 
 	it('upgrades explicitly, keeps channel pins, rolls back, and prunes only unreferenced versions', async () => {
@@ -143,11 +145,13 @@ describe('PluginManager', () => {
 			id: first.installation,
 			active: false,
 			config: first.config,
+			path: first.plugin.path,
 			channels: ['first'],
 		}, {
 			id: second.installation,
 			active: true,
 			config: second.config,
+			path: second.plugin.path,
 			channels: ['second'],
 		}].sort((left, right) => left.id.localeCompare(right.id)));
 		assert.deepEqual(await manager.prune('fake'), []);

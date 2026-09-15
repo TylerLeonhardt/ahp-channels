@@ -56,16 +56,16 @@ describe('plugin installations', () => {
 		assert.deepEqual({
 			first,
 			repeated,
-			server: await readFile(join(first.config.path, 'server.mjs'), 'utf8'),
+			server: await readFile(join(first.path, 'server.mjs'), 'utf8'),
 			metadata: JSON.parse(await readFile(
-				join(first.config.path, '.ahp-channels-installation.json'),
+				join(first.path, '.ahp-channels-installation.json'),
 				'utf8',
 			)),
 		}, {
 			first: {
 				id: first.id,
+				path: getPluginInstallationPath(join(root, 'home'), 'test', 'fake', first.id),
 				config: {
-					path: getPluginInstallationPath(join(root, 'home'), 'test', 'fake', first.id),
 					source: './plugins/fake',
 					version: '1.0.0',
 					marketplaceRevision: 'revision-one',
@@ -74,22 +74,33 @@ describe('plugin installations', () => {
 			},
 			repeated: {
 				id: first.id,
+				path: first.path,
 				config: first.config,
 				created: false,
 			},
 			server: 'export const version = 1;\n',
 			metadata: {
-				schemaVersion: 1,
+				schemaVersion: 2,
 				id: first.id,
 				marketplace: 'test',
 				plugin: 'fake',
 				source: './plugins/fake',
 				version: '1.0.0',
 				marketplaceRevision: 'revision-one',
+				entries: [{
+					kind: 'directory',
+					path: '.claude-plugin',
+				}, {
+					kind: 'file',
+					path: '.claude-plugin/plugin.json',
+				}, {
+					kind: 'file',
+					path: 'server.mjs',
+				}],
 			},
 		});
-		await assert.rejects(access(join(first.config.path, 'node_modules')));
-		await assert.rejects(access(join(first.config.path, '.git')));
+		await assert.rejects(access(join(first.path, 'node_modules')));
+		await assert.rejects(access(join(first.path, '.git')));
 
 		await writeFile(join(source, 'server.mjs'), 'export const version = 2;\n', { mode: 0o755 });
 		const second = await installPluginSnapshot(join(root, 'home'), source, {
@@ -101,8 +112,8 @@ describe('plugin installations', () => {
 		});
 
 		assert.notEqual(second.id, first.id);
-		assert.equal(await readFile(join(first.config.path, 'server.mjs'), 'utf8'), 'export const version = 1;\n');
-		assert.equal(await readFile(join(second.config.path, 'server.mjs'), 'utf8'), 'export const version = 2;\n');
+		assert.equal(await readFile(join(first.path, 'server.mjs'), 'utf8'), 'export const version = 1;\n');
+		assert.equal(await readFile(join(second.path, 'server.mjs'), 'utf8'), 'export const version = 2;\n');
 	});
 
 	it('copies internal relative symlinks and rejects escaping symlinks', {
@@ -119,7 +130,7 @@ describe('plugin installations', () => {
 			plugin: 'fake',
 			source: './plugin',
 		});
-		assert.equal(await readFile(join(installed.config.path, 'link.txt'), 'utf8'), 'inside');
+		assert.equal(await readFile(join(installed.path, 'link.txt'), 'utf8'), 'inside');
 
 		const outside = join(root, 'outside.txt');
 		await writeFile(outside, 'outside');
@@ -151,7 +162,7 @@ describe('plugin installations', () => {
 			installPluginSnapshot(join(root, 'home'), source, provenance),
 			installPluginSnapshot(join(root, 'home'), source, provenance),
 		]);
-		const parent = dirname(installed[0].config.path);
+		const parent = dirname(installed[0].path);
 
 		assert.equal(new Set(installed.map(candidate => candidate.id)).size, 1);
 		assert.equal(installed.filter(candidate => candidate.created).length, 1);

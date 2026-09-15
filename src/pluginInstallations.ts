@@ -30,6 +30,7 @@ export interface PluginInstallationProvenance {
 
 export interface InstalledPluginSnapshot {
 	readonly id: string;
+	readonly path: string;
 	readonly config: PluginInstallationConfig;
 	readonly created: boolean;
 }
@@ -77,20 +78,39 @@ export async function installPluginSnapshot(
 		try {
 			await writeSnapshot(temporary, entries);
 			await writeFile(join(temporary, INSTALLATION_METADATA), `${JSON.stringify({
-				schemaVersion: 1,
+				schemaVersion: 2,
 				id,
 				...provenance,
+				entries: entries.map(entry => ({
+					kind: entry.kind,
+					path: normalizePath(entry.path),
+				})),
 			}, undefined, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
 			await rename(temporary, installationPath);
 			return {
 				id,
-				config: installationConfig(installationPath, provenance),
+				path: installationPath,
+				config: installationConfig(provenance),
 				created: true,
 			};
 		} finally {
 			await rm(temporary, { recursive: true, force: true });
 		}
 	});
+}
+
+export async function resolvePluginInstallation(
+	home: string,
+	marketplace: string,
+	plugin: string,
+	id: string,
+): Promise<InstalledPluginSnapshot> {
+	return readInstalledSnapshot(
+		getPluginInstallationPath(home, marketplace, plugin, id),
+		id,
+		marketplace,
+		plugin,
+	);
 }
 
 export function getPluginInstallationPath(
@@ -263,12 +283,8 @@ async function writeSnapshot(root: string, entries: readonly SnapshotEntry[]): P
 	}
 }
 
-function installationConfig(
-	path: string,
-	provenance: PluginInstallationProvenance,
-): PluginInstallationConfig {
+function installationConfig(provenance: PluginInstallationProvenance): PluginInstallationConfig {
 	return {
-		path,
 		source: provenance.source,
 		...(provenance.version ? { version: provenance.version } : {}),
 		...(provenance.marketplaceRevision
@@ -291,19 +307,25 @@ async function readInstalledSnapshot(
 		throw new Error(`Failed to read plugin installation metadata ${metadataPath}`, { cause: error });
 	}
 	if (!isRecord(value)
-		|| value['schemaVersion'] !== 1
+		|| value['schemaVersion'] !== 2
 		|| value['id'] !== id
 		|| value['marketplace'] !== marketplace
 		|| value['plugin'] !== plugin
 		|| typeof value['source'] !== 'string'
 		|| (value['version'] !== undefined && typeof value['version'] !== 'string')
-		|| (value['marketplaceRevision'] !== undefined && typeof value['marketplaceRevision'] !== 'string')) {
+		|| (value['marketplaceRevision'] !== undefined && typeof value['marketplaceRevision'] !== 'string')
+		|| !Array.isArray(value['entries'])) {
 		throw new Error(`Invalid plugin installation metadata ${metadataPath}`);
+	}
+	const entries = await Promise.all(value['entries'].map(entry => readInstalledEntry(path, entry)));
+	const actualId = digestEntries(entries.sort((left, right) => left.path.localeCompare(right.path)));
+	if (actualId !== id) {
+		throw new Error(`Plugin installation content does not match digest '${id}': ${path}`);
 	}
 	return {
 		id,
+		path,
 		config: {
-			path,
 			source: value['source'],
 			...(value['version'] ? { version: value['version'] } : {}),
 			...(value['marketplaceRevision']
@@ -311,6 +333,55 @@ async function readInstalledSnapshot(
 				: {}),
 		},
 		created: false,
+	};
+}
+
+async function readInstalledEntry(root: string, value: unknown): Promise<SnapshotEntry> {
+	if (!isRecord(value)
+		|| (value['kind'] !== 'file' && value['kind'] !== 'directory' && value['kind'] !== 'symlink')
+		|| typeof value['path'] !== 'string') {
+		throw new Error(`Invalid plugin installation entry in ${root}`);
+	}
+	const relativePath = value['path'];
+	if (!relativePath
+		|| relativePath === '..'
+		|| relativePath.startsWith('../')
+		|| isAbsolute(relativePath)) {
+		throw new Error(`Invalid plugin installation path '${relativePath}'`);
+	}
+	const path = resolve(root, ...relativePath.split('/'));
+	if (!isWithin(root, path)) {
+		throw new Error(`Plugin installation path escapes its root: ${relativePath}`);
+	}
+	const metadata = await lstat(path);
+	if (value['kind'] === 'directory') {
+		if (!metadata.isDirectory()) {
+			throw new Error(`Expected plugin installation directory: ${path}`);
+		}
+		return {
+			kind: 'directory',
+			path: relativePath,
+			mode: metadata.mode & 0o777,
+		};
+	}
+	if (value['kind'] === 'file') {
+		if (!metadata.isFile()) {
+			throw new Error(`Expected plugin installation file: ${path}`);
+		}
+		return {
+			kind: 'file',
+			path: relativePath,
+			content: await readFile(path),
+			mode: metadata.mode & 0o777,
+		};
+	}
+	if (!metadata.isSymbolicLink()) {
+		throw new Error(`Expected plugin installation symlink: ${path}`);
+	}
+	return {
+		kind: 'symlink',
+		path: relativePath,
+		target: await readlink(path),
 	};
 }
 

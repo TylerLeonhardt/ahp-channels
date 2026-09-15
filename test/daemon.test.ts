@@ -162,7 +162,6 @@ describe('DaemonServer', () => {
 						activeInstallation: installation,
 						installations: {
 							[installation]: {
-								path: join(home, 'plugins', 'test', 'fake', installation),
 								source: './plugins/fake',
 							},
 						},

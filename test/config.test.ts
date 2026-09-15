@@ -58,7 +58,6 @@ describe('ConfigStore', () => {
 		temporaryDirectories.push(home);
 		const installation = 'a'.repeat(64);
 		const marketplaceRevision = 'b'.repeat(40);
-		const path = join(home, 'plugins', 'test', 'fake', installation);
 		await writeFile(join(home, 'config.json'), JSON.stringify({
 			version: CONFIG_VERSION,
 			marketplaces: { test: { source: './marketplace' } },
@@ -68,7 +67,6 @@ describe('ConfigStore', () => {
 					activeInstallation: installation,
 					installations: {
 						[installation]: {
-							path,
 							source: './plugins/fake',
 							version: '1.0.0',
 							marketplaceRevision,
@@ -95,7 +93,6 @@ describe('ConfigStore', () => {
 					activeInstallation: installation,
 					installations: {
 						[installation]: {
-							path,
 							source: './plugins/fake',
 							version: '1.0.0',
 							marketplaceRevision,
@@ -173,24 +170,34 @@ describe('ConfigStore', () => {
 		}));
 		await assert.rejects(new ConfigStore(home).read(), /Invalid channel instance configuration/);
 
-		await writeFile(join(home, 'config.json'), JSON.stringify({
+	});
+
+	it('rejects invalid references before writing an update', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await store.write({
 			version: CONFIG_VERSION,
-			marketplaces: { test: { source: './marketplace' } },
-			plugins: {
-				fake: {
-					marketplace: 'test',
-					activeInstallation: installation,
-					installations: {
-						[installation]: {
-							path: join(home, 'outside', installation),
-							source: './plugins/fake',
-						},
+			marketplaces: {},
+			plugins: {},
+			channels: {},
+		});
+
+		await assert.rejects(
+			store.update(config => ({
+				...config,
+				channels: {
+					personal: {
+						plugin: 'fake',
+						installation: 'a'.repeat(64),
+						session: 'ahp-session:/one',
+						enabled: false,
 					},
 				},
-			},
-			channels: {},
-		}));
-		await assert.rejects(new ConfigStore(home).read(), /has an invalid path/);
+			})),
+			/references missing fake installation/,
+		);
+		assert.deepEqual((await store.read()).channels, {});
 	});
 
 	it('rejects channel names that alias on case-insensitive filesystems', async () => {
