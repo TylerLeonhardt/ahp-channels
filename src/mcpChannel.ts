@@ -42,6 +42,7 @@ export class McpChannelProcess implements McpChannelClient {
 	private channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
 	private readonly pendingEvents: ChannelEvent[] = [];
 	private resolveStopped!: () => void;
+	private stopped = false;
 	readonly whenStopped = new Promise<void>(resolve => {
 		this.resolveStopped = resolve;
 	});
@@ -50,7 +51,10 @@ export class McpChannelProcess implements McpChannelClient {
 		private readonly config: StdioMcpServerConfig,
 		private readonly onStderr: (chunk: string) => void = chunk => process.stderr.write(chunk),
 	) {
-		this.client.onclose = () => this.resolveStopped();
+		this.client.onclose = () => {
+			this.stopped = true;
+			this.resolveStopped();
+		};
 		this.client.setNotificationHandler(ChannelNotificationSchema, async notification => {
 			const event: ChannelEvent = {
 				content: notification.params.content,
@@ -132,7 +136,16 @@ export class McpChannelProcess implements McpChannelClient {
 	}
 
 	async close(): Promise<void> {
-		await this.client.close();
+		if (this.stopped) {
+			return;
+		}
+		try {
+			await this.client.close();
+		} catch (error) {
+			if (!this.stopped) {
+				throw error;
+			}
+		}
 	}
 }
 
