@@ -4,7 +4,8 @@
   "description": "Run Claude Code channel plugins against Agent Host Protocol servers.",
   "type": "module",
   "bin": {
-    "ahp-channels": "./dist/cli.js"
+    "ahp-channels": "./dist/cli.js",
+    "ahp-channels-daemon": "./dist/daemonMain.js"
   },
   "files": [
     "dist",
@@ -16,6 +17,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "node --test --import tsx test/*.test.ts",
     "e2e:local": "tsx scripts/e2e-local.ts",
+    "e2e:daemon": "npm run build && tsx scripts/e2e-daemon-local.ts",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "engines": {
@@ -25,10 +27,12 @@
     "@microsoft/agent-host-protocol": "^0.9.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "commander": "^14.0.0",
+    "proper-lockfile": "^4.1.2",
     "zod": "^4.1.11"
   },
   "devDependencies": {
     "@types/node": "^24.7.2",
+    "@types/proper-lockfile": "^4.1.4",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }

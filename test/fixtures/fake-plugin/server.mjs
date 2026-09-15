@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises';
+import { appendFile } from 'node:fs/promises';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -29,7 +29,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async request => {
 	const text = String(request.params.arguments?.text ?? '');
 	if (process.env.AHP_CHANNELS_FAKE_OUTPUT) {
-		await writeFile(process.env.AHP_CHANNELS_FAKE_OUTPUT, text, 'utf8');
+		await appendFile(process.env.AHP_CHANNELS_FAKE_OUTPUT, `${text}\n`, 'utf8');
 	}
 	return {
 		content: [{
@@ -40,6 +40,9 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 });
 
 await server.connect(new StdioServerTransport());
+if (process.env.AHP_CHANNELS_FAKE_EXIT_MS) {
+	setTimeout(() => process.exit(17), Number(process.env.AHP_CHANNELS_FAKE_EXIT_MS));
+}
 setTimeout(() => {
 	void server.notification({
 		method: 'notifications/claude/channel',

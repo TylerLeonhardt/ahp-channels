@@ -1,6 +1,6 @@
 # Roadmap
 
-## Phase 1: Runnable compatibility bridge
+## Completed: Runnable compatibility bridge
 
 - Install relative-path plugins from Claude-style Git marketplaces.
 - Discover local VS Code Agent Host endpoints.
@@ -9,21 +9,29 @@
 - Translate channel notifications and client-owned tool calls.
 - Verify against a live local Agent Host.
 
-## Phase 2: Durable channel instances
+## Completed: Durable channel control
+
+- Named instances with persistent channel-to-session bindings.
+- Authenticated background daemon with start, stop, status, switch, and logs.
+- Desired-state restoration and bounded exponential restart retries.
+- Busy-session switch protection and failed-switch rollback.
+- Atomic cross-process configuration updates.
+
+## Next: Setup and delivery reliability
 
 - Named instances with isolated state directories and secret references.
-- Persistent channel-to-session bindings.
-- Background supervisor with start, stop, status, and logs.
-- Reliable event deduplication and delivery tracking.
+- Deterministic event IDs, deduplication, and delivery tracking.
+- First-class configure and access commands for known channel plugins.
+- Log rotation and richer health diagnostics.
 
-## Phase 3: Broader compatibility
+## Later: Broader compatibility
 
 - Permission relay with sanitized previews and expiring request IDs.
 - Git subdirectory, URL, npm, and pip marketplace sources.
 - Virtual plugin projection for channel instructions and management skills.
 - Attachment and resource-reference translation.
 
-## Phase 4: Governance and distribution
+## Later: Governance and distribution
 
 - Signed or pinned marketplace policy.
 - Runtime-enforced channel and permission-relay allowlists.

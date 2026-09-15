@@ -2,6 +2,7 @@ import {
 	ActionType,
 	ConfirmationOptionKind,
 	MessageKind,
+	PendingMessageKind,
 	ToolCallConfirmationReason,
 	ToolCallContributorKind,
 	ToolResultContentType,
@@ -196,6 +197,62 @@ describe('ChannelBridge', () => {
 				},
 			},
 		});
+	});
+
+	it('stays busy while queued messages are pending', async () => {
+		const subscription = new TestSubscription();
+		let dispatchCount = 0;
+		let channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
+		const bridge = new ChannelBridge({
+			client: {
+				dispatch(): DispatchHandle {
+					dispatchCount++;
+					return { clientSeq: dispatchCount };
+				},
+			},
+			clientId: 'channel-client',
+			session: 'ahp-session:/session',
+			chat: 'ahp-chat:/chat',
+			chatState: {
+				resource: 'ahp-chat:/chat',
+				title: 'Chat',
+				status: 1,
+				modifiedAt: new Date(0).toISOString(),
+				turns: [],
+				queuedMessages: [{
+					id: 'queued',
+					message: { text: 'queued', origin: { kind: MessageKind.User } },
+				}],
+			},
+			chatSubscription: subscription,
+			channel: {
+				async setChannelHandler(handler) {
+					channelHandler = handler;
+				},
+				async callTool(): Promise<never> {
+					throw new Error('Unexpected tool call');
+				},
+				async close() { },
+			},
+			channelInfo: {
+				name: 'fake',
+				tools: [],
+			},
+		});
+
+		await bridge.start();
+		assert.equal(bridge.busy, true);
+		assert.equal(bridge.tryQuiesce(), false);
+		subscription.push(actionEvent({
+			type: ActionType.ChatPendingMessageRemoved,
+			kind: PendingMessageKind.Queued,
+			id: 'queued',
+		}));
+		await waitFor(() => !bridge.busy);
+		assert.equal(bridge.tryQuiesce(), true);
+		await channelHandler?.({ content: 'ignored' });
+		assert.equal(dispatchCount, 1);
+		await bridge.close();
 	});
 });
 

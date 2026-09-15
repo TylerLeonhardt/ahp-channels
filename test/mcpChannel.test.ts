@@ -61,4 +61,20 @@ describe('McpChannelProcess', () => {
 			error: { message: 'nope' },
 		});
 	});
+
+	it('reports an unexpected MCP process exit', async () => {
+		const server = fileURLToPath(new URL('./fixtures/fake-plugin/server.mjs', import.meta.url));
+		const channel = new McpChannelProcess({
+			command: process.execPath,
+			args: [server],
+			env: { AHP_CHANNELS_FAKE_EXIT_MS: '20' },
+		}, () => undefined);
+		await channel.start();
+
+		await Promise.race([
+			channel.whenStopped,
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error('MCP channel did not report its exit')), 2000)),
+		]);
+		await channel.close();
+	});
 });

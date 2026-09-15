@@ -24,7 +24,15 @@ export interface StartedMcpChannel {
 	readonly tools: readonly ToolDefinition[];
 }
 
-export class McpChannelProcess {
+export interface McpChannelClient {
+	readonly whenStopped: Promise<void>;
+	start(): Promise<StartedMcpChannel>;
+	setChannelHandler(handler: (event: ChannelEvent) => void | Promise<void>): Promise<void>;
+	callTool(name: string, args: Record<string, unknown>): Promise<ToolCallResult>;
+	close(): Promise<void>;
+}
+
+export class McpChannelProcess implements McpChannelClient {
 	private readonly client = new Client({
 		name: 'ahp-channels',
 		version: '0.1.0',
@@ -32,11 +40,16 @@ export class McpChannelProcess {
 	private transport: StdioClientTransport | undefined;
 	private channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
 	private readonly pendingEvents: ChannelEvent[] = [];
+	private resolveStopped!: () => void;
+	readonly whenStopped = new Promise<void>(resolve => {
+		this.resolveStopped = resolve;
+	});
 
 	constructor(
 		private readonly config: StdioMcpServerConfig,
 		private readonly onStderr: (chunk: string) => void = chunk => process.stderr.write(chunk),
 	) {
+		this.client.onclose = () => this.resolveStopped();
 		this.client.setNotificationHandler(ChannelNotificationSchema, async notification => {
 			const event: ChannelEvent = {
 				content: notification.params.content,
