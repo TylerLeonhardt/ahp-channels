@@ -2,6 +2,7 @@
   "name": "ahp-channels",
   "version": "0.1.0-alpha.1",
   "description": "Run Claude Code channel plugins against Agent Host Protocol servers.",
+  "license": "MIT",
   "keywords": [
     "agent-host-protocol",
     "ahp",
@@ -24,6 +25,7 @@
   },
   "files": [
     "dist",
+    "LICENSE",
     "README.md",
     "ROADMAP.md",
     "SHIPPING.md"

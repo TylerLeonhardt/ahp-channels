@@ -11,7 +11,7 @@
 - [x] Installed-package smoke test.
 - [x] Live direct bridge and two-session daemon switch tests.
 - [x] Confirm the `ahp-channels` npm package name is available.
-- [ ] Choose and add the repository license.
+- [x] Choose and add the repository license (MIT).
 - [ ] Configure npm trusted publishing for `TylerLeonhardt/ahp-channels`.
 - [ ] Run a fresh-machine Telegram setup on macOS or Linux.
 - [ ] Publish `0.1.0-alpha.1` under the npm `next` tag.

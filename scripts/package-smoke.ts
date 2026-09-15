@@ -20,6 +20,11 @@ try {
 	if (!Array.isArray(result) || !isRecord(result[0]) || typeof result[0]['filename'] !== 'string') {
 		throw new Error(`npm pack returned an unexpected result: ${packed.stdout}`);
 	}
+	const packedFiles = result[0]['files'];
+	if (!Array.isArray(packedFiles)
+		|| !packedFiles.some(file => isRecord(file) && file['path'] === 'LICENSE')) {
+		throw new Error('Packed npm artifact does not contain LICENSE');
+	}
 	tarball = join(root, result[0]['filename']);
 	if (basename(tarball) !== `ahp-channels-${VERSION}.tgz`) {
 		throw new Error(`Expected prerelease tarball ahp-channels-${VERSION}.tgz, received ${basename(tarball)}`);
