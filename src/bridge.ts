@@ -15,6 +15,11 @@ import {
 import type { DispatchHandle, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { randomUUID } from 'node:crypto';
 import { formatChannelPrompt, type ChannelEvent } from './channelPrompt.js';
+import {
+	readJournalEventId,
+	withJournalEventId,
+	type ChannelEventJournal,
+} from './eventJournal.js';
 import type { McpChannelClient, StartedMcpChannel } from './mcpChannel.js';
 
 interface PendingClientTool {
@@ -37,6 +42,7 @@ export interface ChannelBridgeOptions {
 	readonly chatSubscription: AsyncIterable<SubscriptionEvent> & { close(): Promise<void> };
 	readonly channel: Pick<McpChannelClient, 'setChannelHandler' | 'callTool' | 'close'>;
 	readonly channelInfo: StartedMcpChannel;
+	readonly eventJournal?: ChannelEventJournal;
 	readonly autoApproveTools?: boolean;
 	readonly onStatus?: (message: string) => void;
 }
@@ -45,9 +51,15 @@ export class ChannelBridge {
 	private activeTurnId: string | undefined;
 	private readonly queuedMessageIds: Set<string>;
 	private readonly pendingTools = new Map<string, PendingClientTool>();
+	private readonly inFlightEventHandlers = new Set<Promise<void>>();
 	private actionLoop: Promise<void> | undefined;
 	private acceptingEvents = true;
 	private closed = false;
+	private eventFailureSignalled = false;
+	private resolveEventFailure!: (error: Error) => void;
+	private readonly eventFailure = new Promise<Error>(resolve => {
+		this.resolveEventFailure = resolve;
+	});
 
 	constructor(private readonly options: ChannelBridgeOptions) {
 		this.activeTurnId = options.chatState.activeTurn?.id;
@@ -59,14 +71,24 @@ export class ChannelBridge {
 	}
 
 	get whenStopped(): Promise<void> {
-		return this.actionLoop ?? Promise.resolve();
+		return Promise.race([
+			this.actionLoop ?? new Promise<void>(() => undefined),
+			this.eventFailure.then(error => {
+				throw error;
+			}),
+		]);
 	}
 
-	tryQuiesce(): boolean {
+	async quiesce(): Promise<boolean> {
 		if (this.closed) {
 			return false;
 		}
 		this.acceptingEvents = false;
+		if (this.busy) {
+			this.acceptingEvents = true;
+			return false;
+		}
+		await this.drainEventHandlers();
 		if (this.busy) {
 			this.acceptingEvents = true;
 			return false;
@@ -84,8 +106,14 @@ export class ChannelBridge {
 				tools: [...channelInfo.tools],
 			},
 		});
-		await this.options.channel.setChannelHandler(event => this.handleChannelEvent(event));
 		this.actionLoop = this.consumeChatActions();
+		if (this.options.eventJournal) {
+			await this.options.eventJournal.markDelivered(journalEventIds(this.options.chatState));
+			for (const pending of await this.options.eventJournal.pending()) {
+				this.dispatchChannelEvent(pending.event, pending.id);
+			}
+		}
+		await this.options.channel.setChannelHandler(event => this.trackChannelEvent(event));
 		this.options.onStatus?.(`bridging ${channelInfo.name} to ${this.options.chat}`);
 	}
 
@@ -96,6 +124,12 @@ export class ChannelBridge {
 		this.closed = true;
 		this.acceptingEvents = false;
 		const errors: Error[] = [];
+		try {
+			await this.options.channel.close();
+		} catch (error) {
+			errors.push(toError('MCP channel', error));
+		}
+		await this.drainEventHandlers();
 		try {
 			this.options.client.dispatch(this.options.session, {
 				type: ActionType.SessionActiveClientRemoved,
@@ -118,24 +152,59 @@ export class ChannelBridge {
 		} catch (error) {
 			errors.push(toError('chat action loop', error));
 		}
-		try {
-			await this.options.channel.close();
-		} catch (error) {
-			errors.push(toError('MCP channel', error));
-		}
 		if (errors.length > 0) {
 			throw new AggregateError(errors, 'Failed to close channel bridge');
 		}
 	}
 
-	private handleChannelEvent(event: ChannelEvent): void {
-		if (!this.acceptingEvents) {
-			this.options.onStatus?.('ignored channel event while the bridge was stopping');
+	private async handleChannelEvent(event: ChannelEvent): Promise<void> {
+		if (!this.options.eventJournal) {
+			if (this.acceptingEvents) {
+				this.dispatchChannelEvent(event);
+			} else {
+				this.options.onStatus?.('ignored channel event while the bridge was stopping');
+			}
 			return;
 		}
+		const journaled = await this.options.eventJournal.enqueue(this.options.channelInfo.name, event);
+		if (!journaled) {
+			this.options.onStatus?.('ignored duplicate channel event');
+			return;
+		}
+		if (!this.acceptingEvents) {
+			this.options.onStatus?.('journaled channel event for replay after restart');
+			return;
+		}
+		this.dispatchChannelEvent(journaled.event, journaled.id);
+	}
+
+	private trackChannelEvent(event: ChannelEvent): Promise<void> {
+		const handler = this.handleChannelEvent(event);
+		this.inFlightEventHandlers.add(handler);
+		void handler.then(
+			() => this.inFlightEventHandlers.delete(handler),
+			error => {
+				this.inFlightEventHandlers.delete(handler);
+				if (!this.eventFailureSignalled) {
+					this.eventFailureSignalled = true;
+					this.resolveEventFailure(toError('channel event', error));
+				}
+			},
+		);
+		return handler;
+	}
+
+	private async drainEventHandlers(): Promise<void> {
+		while (this.inFlightEventHandlers.size > 0) {
+			await Promise.allSettled([...this.inFlightEventHandlers]);
+		}
+	}
+
+	private dispatchChannelEvent(event: ChannelEvent, eventId?: string): void {
 		const message = {
 			text: formatChannelPrompt(this.options.channelInfo.name, event, this.options.channelInfo.instructions),
 			origin: { kind: MessageKind.User },
+			...(eventId ? { _meta: withJournalEventId(undefined, eventId) } : {}),
 		};
 		if (this.busy) {
 			const id = randomUUID();
@@ -166,6 +235,10 @@ export class ChannelBridge {
 				continue;
 			}
 			if (event.params.rejectionReason) {
+				const rejectedEventId = event.params.action.type === ActionType.ChatTurnStarted
+					|| event.params.action.type === ActionType.ChatPendingMessageSet
+					? readJournalEventId(event.params.action.message._meta)
+					: undefined;
 				if (event.params.action.type === ActionType.ChatTurnStarted
 					&& this.activeTurnId === event.params.action.turnId) {
 					this.activeTurnId = undefined;
@@ -174,6 +247,9 @@ export class ChannelBridge {
 					this.queuedMessageIds.delete(event.params.action.id);
 				}
 				this.options.onStatus?.(`action rejected: ${event.params.rejectionReason}`);
+				if (rejectedEventId && this.options.eventJournal) {
+					throw new Error(`Journaled channel event ${rejectedEventId} was rejected: ${event.params.rejectionReason}`);
+				}
 				continue;
 			}
 			await this.handleAction(event.params);
@@ -182,6 +258,12 @@ export class ChannelBridge {
 
 	private async handleAction(envelope: ActionEnvelope): Promise<void> {
 		const action = envelope.action;
+		if (action.type === ActionType.ChatTurnStarted || action.type === ActionType.ChatPendingMessageSet) {
+			const eventId = readJournalEventId(action.message._meta);
+			if (eventId) {
+				await this.options.eventJournal?.markDelivered([eventId]);
+			}
+		}
 		switch (action.type) {
 			case ActionType.ChatTurnStarted:
 				this.activeTurnId = action.turnId;
@@ -308,4 +390,14 @@ export function parseToolInput(input: ChatToolCallReadyAction['toolInput']): Rec
 
 function toError(label: string, error: unknown): Error {
 	return new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+}
+
+function journalEventIds(state: ChatState): string[] {
+	const ids = [
+		...state.turns.map(turn => readJournalEventId(turn.message._meta)),
+		readJournalEventId(state.activeTurn?.message._meta),
+		readJournalEventId(state.steeringMessage?.message._meta),
+		...(state.queuedMessages ?? []).map(message => readJournalEventId(message.message._meta)),
+	];
+	return ids.filter((id): id is string => id !== undefined);
 }

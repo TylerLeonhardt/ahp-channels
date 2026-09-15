@@ -57,7 +57,7 @@ export function selectAgentHost(endpoints: readonly AgentHostEndpoint[], selecto
 		throw new Error('No running local Agent Host endpoints were discovered');
 	}
 	if (!selector) {
-		return endpoints.find(endpoint => endpoint.endpoint.type === 'tcp') ?? endpoints[0];
+		return endpoints[0];
 	}
 	const index = Number(selector);
 	if (Number.isSafeInteger(index) && index >= 0 && index < endpoints.length) {

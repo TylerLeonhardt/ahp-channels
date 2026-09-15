@@ -15,15 +15,29 @@ npm run build
 node .\dist\cli.js plugin install telegram@claude-plugins-official
 node .\dist\cli.js host discover
 node .\dist\cli.js session list
-node .\dist\cli.js channel create telegram --plugin telegram --session <session-uri> --start
+node .\dist\cli.js channel create telegram --plugin telegram --session <session-uri>
+node .\dist\cli.js channel secret set telegram TELEGRAM_BOT_TOKEN
+node .\dist\cli.js channel start telegram
 ```
 
 The CLI stores configuration under `~/.ahp-channels` by default. Override this
 with `AHP_CHANNELS_HOME`.
 
 Telegram currently requires Bun, matching the upstream plugin. The adapter
-currently connects to discoverable TCP Agent Host endpoints; local socket
-transports are on the roadmap.
+supports standalone TCP hosts and normal editor Agent Hosts over Windows named
+pipes or Unix domain sockets.
+
+DM the bot once it starts, then approve and lock down the sender locally:
+
+```powershell
+ahp-channels channel access status telegram
+ahp-channels channel access pair telegram <code>
+ahp-channels channel access policy telegram allowlist
+```
+
+Secrets are stored in Windows Credential Manager, macOS Keychain, or a
+persistent Linux Secret Service. Named instances receive isolated plugin state under
+`~/.ahp-channels/instances/<name>`.
 
 ## Status
 
@@ -44,6 +58,11 @@ ahp-channels channel delete telegram
 The daemon starts on demand, remembers desired running channels, and restarts
 them after a daemon or channel-process restart. A switch is rejected while the
 channel is processing a turn, so an in-flight reply is never silently orphaned.
+Inbound events with stable platform IDs are journaled before AHP dispatch and
+deduplicated across process restarts.
+
+Deleting a channel also removes its keyring entries and isolated state,
+including allowlists, downloaded attachments, and pending event data.
 
 ```powershell
 ahp-channels daemon status
@@ -68,6 +87,9 @@ ahp-channels channel run telegram --session <session-uri>
 npm test
 npm run typecheck
 npm run build
+npm run test:package
 npm run e2e:local
 npm run e2e:daemon
 ```
+
+See [SHIPPING.md](./SHIPPING.md) for the npm prerelease gates.

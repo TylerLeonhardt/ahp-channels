@@ -242,14 +242,14 @@ describe('ChannelBridge', () => {
 
 		await bridge.start();
 		assert.equal(bridge.busy, true);
-		assert.equal(bridge.tryQuiesce(), false);
+		assert.equal(await bridge.quiesce(), false);
 		subscription.push(actionEvent({
 			type: ActionType.ChatPendingMessageRemoved,
 			kind: PendingMessageKind.Queued,
 			id: 'queued',
 		}));
 		await waitFor(() => !bridge.busy);
-		assert.equal(bridge.tryQuiesce(), true);
+		assert.equal(await bridge.quiesce(), true);
 		await channelHandler?.({ content: 'ignored' });
 		assert.equal(dispatchCount, 1);
 		await bridge.close();

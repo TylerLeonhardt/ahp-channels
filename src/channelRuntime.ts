@@ -1,11 +1,15 @@
-import type { ChatState, SessionState, StateAction, SubscribeResult } from '@microsoft/agent-host-protocol';
+import type { ChatState, ListSessionsResult, SessionState, StateAction, SubscribeResult } from '@microsoft/agent-host-protocol';
 import type { DispatchHandle, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { connectAgentHost, createChannelClientId, resolveChat } from './ahp.js';
 import { ChannelBridge } from './bridge.js';
 import type { ChannelInstanceConfig } from './config.js';
 import { discoverLocalAgentHosts, selectAgentHost, type AgentHostEndpoint } from './endpoints.js';
+import { FileChannelEventJournal, type ChannelEventJournal } from './eventJournal.js';
+import { getClaudeConfigDirectory } from './instancePaths.js';
 import { McpChannelProcess, type McpChannelClient, type StartedMcpChannel } from './mcpChannel.js';
 import { PluginManager, resolveServerConfig, type ClaudePlugin, type StdioMcpServerConfig } from './plugins.js';
+import type { SecretStore } from './secrets.js';
+import { validateSecretKey } from './secrets.js';
 
 export interface ChannelRuntimeSnapshot {
 	readonly name: string;
@@ -24,6 +28,8 @@ export interface ChannelRuntimeServices {
 	discoverAgentHosts(): Promise<readonly AgentHostEndpoint[]>;
 	connectAgentHost(endpoint: AgentHostEndpoint, clientId: string): Promise<ChannelHostConnection>;
 	createMcpChannel(config: StdioMcpServerConfig): McpChannelClient;
+	createEventJournal?(name: string): ChannelEventJournal;
+	resolveEnvironment?(name: string, definition: ChannelInstanceConfig): Promise<Readonly<Record<string, string>>>;
 }
 
 export interface ChannelSubscription extends AsyncIterable<SubscriptionEvent> {
@@ -32,6 +38,11 @@ export interface ChannelSubscription extends AsyncIterable<SubscriptionEvent> {
 
 export interface ChannelHostClient {
 	dispatch(channel: string, action: StateAction, clientSeq?: number): DispatchHandle;
+	request(method: 'listSessions', params: {
+		readonly channel: 'ahp-root://';
+		readonly cursor?: string;
+		readonly limit?: number;
+	}): Promise<ListSessionsResult>;
 	subscribe(uri: string): Promise<{ result: SubscribeResult; subscription: ChannelSubscription }>;
 	unsubscribe(uri: string): Promise<void>;
 	shutdown(): Promise<void>;
@@ -42,18 +53,57 @@ export interface ChannelHostConnection {
 	readonly clientId: string;
 }
 
-export function createChannelRuntimeServices(plugins: PluginManager): ChannelRuntimeServices {
+export interface ChannelRuntimeServiceOptions {
+	readonly home?: string;
+	readonly secretStore?: SecretStore;
+	readonly environment?: NodeJS.ProcessEnv;
+}
+
+export function createChannelRuntimeServices(
+	plugins: PluginManager,
+	options: ChannelRuntimeServiceOptions = {},
+): ChannelRuntimeServices {
+	const { home, secretStore } = options;
 	return {
 		resolvePlugin: nameOrPath => plugins.resolvePlugin(nameOrPath),
 		discoverAgentHosts: () => discoverLocalAgentHosts(),
 		connectAgentHost: async (endpoint, clientId) => connectAgentHost(endpoint, clientId),
 		createMcpChannel: config => new McpChannelProcess(config),
+		...(home ? { createEventJournal: (name: string) => new FileChannelEventJournal(home, name) } : {}),
+		...(home && secretStore ? {
+			resolveEnvironment: (name: string, definition: ChannelInstanceConfig) =>
+				resolveChannelEnvironment(home, secretStore, name, definition, options.environment),
+		} : {}),
 	};
 }
 
 export async function validateChannelDefinition(plugins: PluginManager, definition: ChannelInstanceConfig): Promise<void> {
 	const plugin = await plugins.resolvePlugin(definition.plugin);
 	resolveServerConfig(plugin, definition.server);
+	for (const key of definition.secretEnvironment ?? []) {
+		validateSecretKey(key);
+	}
+}
+
+export async function resolveChannelEnvironment(
+	home: string,
+	secretStore: SecretStore,
+	name: string,
+	definition: ChannelInstanceConfig,
+	environment: NodeJS.ProcessEnv = process.env,
+): Promise<Readonly<Record<string, string>>> {
+	const result: Record<string, string> = {
+		CLAUDE_CONFIG_DIR: getClaudeConfigDirectory(home, name),
+	};
+	for (const key of definition.secretEnvironment ?? []) {
+		validateSecretKey(key);
+		const value = environment[key] ?? await secretStore.get(name, key);
+		if (!value) {
+			throw new Error(`Secret '${key}' is not configured for channel '${name}'`);
+		}
+		result[key] = value;
+	}
+	return result;
 }
 
 export class ChannelRuntime {
@@ -86,21 +136,27 @@ export class ChannelRuntime {
 		try {
 			const plugin = await services.resolvePlugin(definition.plugin);
 			const server = resolveServerConfig(plugin, definition.server);
-			const endpoint = selectAgentHost(await services.discoverAgentHosts(), definition.host);
+			const runtimeEnvironment = await services.resolveEnvironment?.(name, definition);
+			const runtimeServer: StdioMcpServerConfig = runtimeEnvironment
+				? { ...server, env: { ...server.env, ...runtimeEnvironment } }
+				: server;
 			const clientId = definition.clientId ?? createChannelClientId(name, definition.session);
-			connection = await services.connectAgentHost(endpoint, clientId);
-			const subscribedSession = await connection.client.subscribe(definition.session);
-			sessionSubscription = subscribedSession.subscription;
-			if (!subscribedSession.result.snapshot) {
-				throw new Error(`Agent Host returned no state snapshot for session ${definition.session}`);
-			}
-			const chat = resolveChat(subscribedSession.result.snapshot.state as SessionState, definition.chat, definition.session);
+			const connected = await connectOwningHost(
+				services,
+				await services.discoverAgentHosts(),
+				definition,
+				clientId,
+			);
+			connection = connected.connection;
+			sessionSubscription = connected.subscription;
+			const endpoint = connected.endpoint;
+			const chat = resolveChat(connected.state, definition.chat, definition.session);
 			chatSubscription = await connection.client.subscribe(chat);
 			if (!chatSubscription.result.snapshot) {
 				throw new Error(`Agent Host returned no state snapshot for chat ${chat}`);
 			}
 
-			mcp = services.createMcpChannel(server);
+			mcp = services.createMcpChannel(runtimeServer);
 			const channelInfo = await mcp.start();
 			bridge = new ChannelBridge({
 				client: connection.client,
@@ -111,6 +167,7 @@ export class ChannelRuntime {
 				chatSubscription: chatSubscription.subscription,
 				channel: mcp,
 				channelInfo,
+				eventJournal: services.createEventJournal?.(name),
 				onStatus,
 			});
 			await bridge.start();
@@ -160,8 +217,8 @@ export class ChannelRuntime {
 		return Promise.race([this.bridge.whenStopped, this.mcpWhenStopped]);
 	}
 
-	tryQuiesce(): boolean {
-		return this.bridge.tryQuiesce();
+	quiesce(): Promise<boolean> {
+		return this.bridge.quiesce();
 	}
 
 	async close(): Promise<void> {
@@ -178,6 +235,76 @@ export class ChannelRuntime {
 			throw new AggregateError(errors, `Failed to stop channel '${this.name}'`);
 		}
 	}
+}
+
+async function connectOwningHost(
+	services: ChannelRuntimeServices,
+	endpoints: readonly AgentHostEndpoint[],
+	definition: ChannelInstanceConfig,
+	clientId: string,
+): Promise<{
+	readonly endpoint: AgentHostEndpoint;
+	readonly connection: ChannelHostConnection;
+	readonly subscription: ChannelSubscription;
+	readonly state: SessionState;
+}> {
+	const candidates = definition.host
+		? [selectAgentHost(endpoints, definition.host)]
+		: endpoints;
+	if (candidates.length === 0) {
+		throw new Error('No running local Agent Host endpoints were discovered');
+	}
+	const errors: Error[] = [];
+	for (const endpoint of candidates) {
+		let connection: ChannelHostConnection | undefined;
+		let subscription: ChannelSubscription | undefined;
+		try {
+			connection = await services.connectAgentHost(endpoint, clientId);
+			if (!definition.host && !await hostHasSession(connection.client, definition.session)) {
+				throw new Error('Session is not present in this Agent Host catalog');
+			}
+
+			async function hostHasSession(client: ChannelHostClient, session: string): Promise<boolean> {
+				const seenCursors = new Set<string>();
+				let cursor: string | undefined;
+				for (let page = 0; page < 100; page++) {
+					const result = await client.request('listSessions', {
+						channel: 'ahp-root://',
+						limit: 100,
+						...(cursor ? { cursor } : {}),
+					});
+					if (result.items.some(candidate => candidate.resource === session)) {
+						return true;
+					}
+					if (!result.nextCursor) {
+						return false;
+					}
+					if (seenCursors.has(result.nextCursor)) {
+						throw new Error('Agent Host returned a repeated session cursor');
+					}
+					seenCursors.add(result.nextCursor);
+					cursor = result.nextCursor;
+				}
+				throw new Error('Agent Host session catalog exceeded 100 pages');
+			}
+			const subscribed = await connection.client.subscribe(definition.session);
+			subscription = subscribed.subscription;
+			if (!subscribed.result.snapshot) {
+				throw new Error('Agent Host returned no session state snapshot');
+			}
+			return {
+				endpoint,
+				connection,
+				subscription,
+				state: subscribed.result.snapshot.state as SessionState,
+			};
+		} catch (error) {
+			errors.push(toError(endpoint.id, error));
+			await cleanup(endpoint.id, () => subscription?.close(), errors);
+			await cleanup(endpoint.id, () => connection?.client.shutdown(), errors);
+		}
+	}
+	throw new AggregateError(errors, `No discovered Agent Host owns session ${definition.session}`);
 }
 
 async function cleanup(label: string, operation: () => Promise<unknown> | undefined, errors: Error[]): Promise<void> {

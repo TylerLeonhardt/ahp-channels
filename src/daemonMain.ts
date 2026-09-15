@@ -5,16 +5,18 @@ import { createChannelRuntimeServices } from './channelRuntime.js';
 import { getOrCreateDaemonToken, getDaemonPaths } from './daemonPaths.js';
 import { createDaemonRuntimeFactory, DaemonServer } from './daemonServer.js';
 import { PluginManager } from './plugins.js';
+import { KeyringSecretStore } from './secrets.js';
 
 const home = readHomeArgument(process.argv.slice(2)) ?? getAppHome();
 const configStore = new ConfigStore(home);
 const plugins = new PluginManager(configStore);
+const secretStore = new KeyringSecretStore();
 const token = await getOrCreateDaemonToken(home);
 const daemon = new DaemonServer(
 	home,
 	token,
 	configStore,
-	createDaemonRuntimeFactory(createChannelRuntimeServices(plugins), plugins),
+	createDaemonRuntimeFactory(createChannelRuntimeServices(plugins, { home, secretStore }), plugins),
 );
 
 const shutdown = () => {

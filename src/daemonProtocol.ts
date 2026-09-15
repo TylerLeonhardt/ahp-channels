@@ -13,6 +13,7 @@ const ChannelInstanceSchema = z.strictObject({
 	server: z.string().min(1).optional(),
 	host: z.string().min(1).optional(),
 	clientId: z.string().min(1).optional(),
+	secretEnvironment: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/)).optional(),
 });
 
 const RequestBodySchema = z.discriminatedUnion('command', [
@@ -31,6 +32,18 @@ const RequestBodySchema = z.discriminatedUnion('command', [
 	}),
 	z.strictObject({
 		command: z.literal('channel.stop'),
+		name: z.string().min(1),
+	}),
+	z.strictObject({
+		command: z.literal('channel.restart'),
+		name: z.string().min(1),
+	}),
+	z.strictObject({
+		command: z.literal('channel.suspend'),
+		name: z.string().min(1),
+	}),
+	z.strictObject({
+		command: z.literal('channel.resume'),
 		name: z.string().min(1),
 	}),
 	z.strictObject({

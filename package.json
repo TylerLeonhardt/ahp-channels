@@ -1,7 +1,22 @@
 {
   "name": "ahp-channels",
-  "version": "0.1.0",
+  "version": "0.1.0-alpha.1",
   "description": "Run Claude Code channel plugins against Agent Host Protocol servers.",
+  "keywords": [
+    "agent-host-protocol",
+    "ahp",
+    "claude-code",
+    "mcp",
+    "telegram"
+  ],
+  "homepage": "https://github.com/TylerLeonhardt/ahp-channels#readme",
+  "bugs": {
+    "url": "https://github.com/TylerLeonhardt/ahp-channels/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TylerLeonhardt/ahp-channels.git"
+  },
   "type": "module",
   "bin": {
     "ahp-channels": "./dist/cli.js",
@@ -10,29 +25,39 @@
   "files": [
     "dist",
     "README.md",
-    "ROADMAP.md"
+    "ROADMAP.md",
+    "SHIPPING.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "node --test --import tsx test/*.test.ts",
+    "test:package": "tsx scripts/package-smoke.ts",
     "e2e:local": "tsx scripts/e2e-local.ts",
     "e2e:daemon": "npm run build && tsx scripts/e2e-daemon-local.ts",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "prepack": "npm run build"
   },
   "engines": {
     "node": ">=22"
   },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "dependencies": {
     "@microsoft/agent-host-protocol": "^0.9.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@napi-rs/keyring": "^2.1.0",
     "commander": "^14.0.0",
     "proper-lockfile": "^4.1.2",
+    "ws": "^8.21.3",
     "zod": "^4.1.11"
   },
   "devDependencies": {
     "@types/node": "^24.7.2",
     "@types/proper-lockfile": "^4.1.4",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }

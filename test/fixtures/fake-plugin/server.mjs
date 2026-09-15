@@ -1,4 +1,5 @@
 import { appendFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -48,7 +49,7 @@ setTimeout(() => {
 		method: 'notifications/claude/channel',
 		params: {
 			content: process.env.AHP_CHANNELS_FAKE_MESSAGE ?? 'hello',
-			meta: { chat_id: '42' },
+			meta: { chat_id: '42', message_id: randomUUID() },
 		},
 	});
 }, 20);

@@ -38,7 +38,7 @@ describe('local Agent Host discovery', () => {
 		const endpoints = await discoverLocalAgentHosts({
 			AHP_CHANNELS_ENDPOINT_REGISTRY: registry,
 		});
-		const selected = selectAgentHost(endpoints);
+		const selected = selectAgentHost(endpoints, 'standalone:');
 
 		assert.deepEqual({
 			count: endpoints.length,
@@ -58,5 +58,6 @@ describe('local Agent Host discovery', () => {
 			},
 			exposesToken: false,
 		});
+		assert.equal(selectAgentHost(endpoints), endpoints[0]);
 	});
 });

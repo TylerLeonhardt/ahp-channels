@@ -9,6 +9,7 @@ import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotoc
 import { z } from 'zod';
 import type { ChannelEvent } from './channelPrompt.js';
 import type { StdioMcpServerConfig } from './plugins.js';
+import { VERSION } from './version.js';
 
 const ChannelNotificationSchema = z.object({
 	method: z.literal('notifications/claude/channel'),
@@ -35,7 +36,7 @@ export interface McpChannelClient {
 export class McpChannelProcess implements McpChannelClient {
 	private readonly client = new Client({
 		name: 'ahp-channels',
-		version: '0.1.0',
+		version: VERSION,
 	});
 	private transport: StdioClientTransport | undefined;
 	private channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;

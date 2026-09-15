@@ -17,12 +17,19 @@
 - Busy-session switch protection and failed-switch rollback.
 - Atomic cross-process configuration updates.
 
-## Next: Setup and delivery reliability
+## Completed: Alpha reliability gates
 
-- Named instances with isolated state directories and secret references.
-- Deterministic event IDs, deduplication, and delivery tracking.
-- First-class configure and access commands for known channel plugins.
+- Normal editor endpoints over Windows named pipes and Unix sockets.
+- OS-keyring secrets with environment-only injection into channel processes.
+- Named instances with isolated state directories.
+- Durable event IDs, pending replay, and bounded deduplication history.
+- First-class secret and Telegram access commands.
+
+## Next: Operational polish
+
 - Log rotation and richer health diagnostics.
+- Stable aliases for explicitly selected remote Agent Hosts.
+- Additional channel-specific configuration profiles.
 
 ## Later: Broader compatibility
 

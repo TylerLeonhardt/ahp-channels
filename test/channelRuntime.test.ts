@@ -2,21 +2,25 @@ import {
 	ActionType,
 	SessionLifecycle,
 	SessionStatus,
+	type ListSessionsResult,
 	type SessionState,
 	type StateAction,
 	type SubscribeResult,
 } from '@microsoft/agent-host-protocol';
 import type { DispatchHandle, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import assert from 'node:assert/strict';
+import { resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import {
 	ChannelRuntime,
+	resolveChannelEnvironment,
 	type ChannelHostClient,
 	type ChannelRuntimeServices,
 	type ChannelSubscription,
 } from '../src/channelRuntime.js';
 import type { AgentHostEndpoint } from '../src/endpoints.js';
 import type { McpChannelClient, StartedMcpChannel } from '../src/mcpChannel.js';
+import { InMemorySecretStore } from '../src/secrets.js';
 
 const sessionUri = 'ahp-session:/session';
 const chatUri = 'ahp-chat:/chat';
@@ -89,6 +93,7 @@ class TestHostClient implements ChannelHostClient {
 				subscription,
 			};
 		}
+
 		if (uri === chatUri) {
 			return {
 				result: {
@@ -108,6 +113,19 @@ class TestHostClient implements ChannelHostClient {
 			};
 		}
 		return { result: {}, subscription };
+	}
+
+	async request(): Promise<ListSessionsResult> {
+		return {
+			items: [{
+				resource: sessionUri,
+				provider: 'test',
+				title: 'Test',
+				status: SessionStatus.Idle,
+				createdAt: new Date(0).toISOString(),
+				modifiedAt: new Date(0).toISOString(),
+			}],
+		};
 	}
 
 	dispatch(channel: string, action: StateAction): DispatchHandle {
@@ -154,6 +172,49 @@ class TestMcpChannel implements McpChannelClient {
 }
 
 describe('ChannelRuntime', () => {
+	it('isolates state and resolves keyring secrets with environment overrides', async () => {
+		const secrets = new InMemorySecretStore();
+		await secrets.set('personal', 'TOKEN', 'stored');
+		await secrets.set('personal', 'OVERRIDE', 'old');
+
+		const environment = await resolveChannelEnvironment(
+			'home',
+			secrets,
+			'personal',
+			{
+				plugin: 'fake',
+				session: sessionUri,
+				enabled: true,
+				secretEnvironment: ['TOKEN', 'OVERRIDE'],
+			},
+			{ OVERRIDE: 'new' },
+		);
+
+		assert.deepEqual(environment, {
+			CLAUDE_CONFIG_DIR: resolve('home', 'instances', 'personal'),
+			TOKEN: 'stored',
+			OVERRIDE: 'new',
+		});
+	});
+
+	it('fails explicitly when a configured secret is unavailable', async () => {
+		await assert.rejects(
+			resolveChannelEnvironment(
+				'home',
+				new InMemorySecretStore(),
+				'personal',
+				{
+					plugin: 'fake',
+					session: sessionUri,
+					enabled: true,
+					secretEnvironment: ['TOKEN'],
+				},
+				{},
+			),
+			/Secret 'TOKEN' is not configured/,
+		);
+	});
+
 	it('starts and closes every owned resource', async () => {
 		const client = new TestHostClient();
 		const mcp = new TestMcpChannel();
@@ -195,6 +256,50 @@ describe('ChannelRuntime', () => {
 			clientShutDown: true,
 			mcpClosed: true,
 		});
+	});
+
+	it('finds the session owner when the newest Agent Host does not have it', async () => {
+		const client = new TestHostClient();
+		const mcp = new TestMcpChannel();
+		const services = createServices(client, mcp);
+		const wrongEndpoint: AgentHostEndpoint = {
+			...endpoint,
+			id: 'editor:2:wrong',
+			type: 'editor',
+			endpoint: { type: 'socket', path: 'wrong' },
+		};
+		services.discoverAgentHosts = async () => [wrongEndpoint, endpoint];
+		const attempted: string[] = [];
+		services.connectAgentHost = async (candidate, clientId) => {
+			attempted.push(candidate.id);
+			return {
+				client: candidate === wrongEndpoint
+					? Object.assign(new TestHostClient(), {
+						async request() {
+							return { items: [] };
+						},
+					})
+					: client,
+				clientId,
+			};
+		};
+
+		const runtime = await ChannelRuntime.start('personal', {
+			plugin: 'fake',
+			session: sessionUri,
+			enabled: true,
+		}, services);
+		try {
+			assert.deepEqual({
+				attempted,
+				host: runtime.snapshot.host,
+			}, {
+				attempted: [wrongEndpoint.id, endpoint.id],
+				host: endpoint.id,
+			});
+		} finally {
+			await runtime.close();
+		}
 	});
 
 	it('cleans up when the chat snapshot is unavailable', async () => {

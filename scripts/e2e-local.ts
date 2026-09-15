@@ -21,7 +21,10 @@ import { inspectPlugin, resolveServerConfig } from '../src/plugins.js';
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const plugin = await inspectPlugin(join(repositoryRoot, 'test', 'fixtures', 'fake-plugin'));
 const outputFile = join(tmpdir(), `ahp-channels-e2e-${randomUUID()}.txt`);
-const endpoint = selectAgentHost(await discoverLocalAgentHosts());
+const endpoints = await discoverLocalAgentHosts();
+const endpoint = process.env['AHP_CHANNELS_E2E_HOST']
+	? selectAgentHost(endpoints, process.env['AHP_CHANNELS_E2E_HOST'])
+	: endpoints.find(candidate => candidate.type === 'standalone') ?? selectAgentHost(endpoints);
 const connection = await connectAgentHost(endpoint);
 const client = connection.client;
 const session = `ahp-session:/${randomUUID()}`;

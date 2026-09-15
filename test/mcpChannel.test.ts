@@ -16,10 +16,12 @@ describe('McpChannelProcess', () => {
 				void channel.setChannelHandler(resolve);
 			});
 			const reply = await channel.callTool('reply', { text: 'pong' });
+			const receivedEvent = await event;
+			assert.match(receivedEvent.meta?.['message_id'] ?? '', /^[0-9a-f-]{36}$/);
 
 			assert.deepEqual({
 				info,
-				event: await event,
+				event: receivedEvent,
 				reply,
 			}, {
 				info: {
@@ -37,7 +39,10 @@ describe('McpChannelProcess', () => {
 				},
 				event: {
 					content: 'hello',
-					meta: { chat_id: '42' },
+					meta: {
+						chat_id: '42',
+						message_id: receivedEvent.meta?.['message_id'],
+					},
 				},
 				reply: {
 					success: true,

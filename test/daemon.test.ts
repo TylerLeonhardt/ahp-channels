@@ -19,6 +19,7 @@ afterEach(async () => {
 class TestRuntime implements ManagedChannelRuntime {
 	closed = false;
 	busy = false;
+	failClose = false;
 	private resolveStopped!: () => void;
 	readonly whenStopped = new Promise<void>(resolve => {
 		this.resolveStopped = resolve;
@@ -43,13 +44,16 @@ class TestRuntime implements ManagedChannelRuntime {
 		};
 	}
 
-	tryQuiesce(): boolean {
+	async quiesce(): Promise<boolean> {
 		return !this.busy;
 	}
 
 	async close(): Promise<void> {
 		this.closed = true;
 		this.resolveStopped();
+		if (this.failClose) {
+			throw new Error('close failed');
+		}
 	}
 
 	stopUnexpectedly(): void {
@@ -140,6 +144,27 @@ describe('DaemonServer', () => {
 			});
 			assert.equal(status.channels[0]?.runtime?.session, 'ahp-session:/two');
 			assert.equal(factory.runtimes[0].closed, true);
+
+			const beforeRestartCommand = factory.runtimes.length;
+			status = await requestDaemon(home, { command: 'channel.restart', name: 'personal' });
+			assert.equal(status.channels[0]?.state, 'running');
+			assert.equal(factory.runtimes.length, beforeRestartCommand + 1);
+
+			status = await requestDaemon(home, { command: 'channel.suspend', name: 'personal' });
+			assert.equal(status.channels[0]?.state, 'stopped');
+			assert.equal(status.channels[0]?.desired, 'running');
+			status = await requestDaemon(home, { command: 'channel.resume', name: 'personal' });
+			assert.equal(status.channels[0]?.state, 'running');
+
+			const beforeFailedRestart = factory.runtimes.length;
+			const failingRuntime = factory.runtimes.at(-1);
+			assert.ok(failingRuntime);
+			failingRuntime.failClose = true;
+			await assert.rejects(
+				requestDaemon(home, { command: 'channel.restart', name: 'personal' }),
+				/close failed/,
+			);
+			await waitFor(async () => factory.runtimes.length > beforeFailedRestart, 3000);
 
 			factory.failSession = 'ahp-session:/broken';
 			await assert.rejects(

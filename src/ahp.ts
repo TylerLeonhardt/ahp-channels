@@ -8,6 +8,7 @@ import { AhpClient, type Subscription } from '@microsoft/agent-host-protocol/cli
 import { WebSocketTransport } from '@microsoft/agent-host-protocol/ws';
 import { createHash, randomUUID } from 'node:crypto';
 import type { AgentHostEndpoint } from './endpoints.js';
+import { SocketWebSocketTransport } from './socketWebSocketTransport.js';
 
 export interface ConnectedAgentHost {
 	readonly client: AhpClient;
@@ -31,12 +32,9 @@ export function createChannelClientId(plugin: string, session: string): string {
 }
 
 export async function connectAgentHost(endpoint: AgentHostEndpoint, clientId: string = randomUUID()): Promise<ConnectedAgentHost> {
-	if (endpoint.endpoint.type !== 'tcp') {
-		throw new Error('Socket-based local Agent Host connections are planned but not implemented in Phase 1');
-	}
-	const url = new URL(`ws://${endpoint.endpoint.host}:${endpoint.endpoint.port}/`);
-	url.searchParams.set('tkn', endpoint.connectionToken);
-	const transport = await WebSocketTransport.connect(url);
+	const transport = endpoint.endpoint.type === 'tcp'
+		? await connectTcp(endpoint)
+		: await SocketWebSocketTransport.connect(endpoint.endpoint.path, endpoint.connectionToken);
 	const client = new AhpClient(transport);
 	client.connect();
 	try {
@@ -49,6 +47,15 @@ export async function connectAgentHost(endpoint: AgentHostEndpoint, clientId: st
 	} catch (error) {
 		await client.shutdown();
 		throw error;
+	}
+
+	async function connectTcp(endpoint: AgentHostEndpoint): Promise<WebSocketTransport> {
+		if (endpoint.endpoint.type !== 'tcp') {
+			throw new Error('Expected a TCP Agent Host endpoint');
+		}
+		const url = new URL(`ws://${endpoint.endpoint.host}:${endpoint.endpoint.port}/`);
+		url.searchParams.set('tkn', endpoint.connectionToken);
+		return WebSocketTransport.connect(url);
 	}
 }
 

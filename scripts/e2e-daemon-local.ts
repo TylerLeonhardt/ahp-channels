@@ -26,7 +26,10 @@ const pluginRoot = join(testRoot, 'plugin');
 const outputFile = join(testRoot, 'replies.txt');
 const fixtureServer = join(repositoryRoot, 'test', 'fixtures', 'fake-plugin', 'server.mjs');
 const marker = `DAEMON_SWITCH_${randomUUID()}`;
-const endpoint = selectAgentHost(await discoverLocalAgentHosts());
+const endpoints = await discoverLocalAgentHosts();
+const endpoint = process.env['AHP_CHANNELS_E2E_HOST']
+	? selectAgentHost(endpoints, process.env['AHP_CHANNELS_E2E_HOST'])
+	: endpoints.find(candidate => candidate.type === 'standalone') ?? selectAgentHost(endpoints);
 const connection = await connectAgentHost(endpoint);
 const client = connection.client;
 const sessions = [`ahp-session:/${randomUUID()}`, `ahp-session:/${randomUUID()}`] as const;
@@ -78,6 +81,7 @@ try {
 			plugin: pluginRoot,
 			session: sessions[0],
 			enabled: false,
+			host: endpoint.id,
 		},
 		start: true,
 	});
@@ -104,6 +108,13 @@ try {
 	const replies = (await readFile(outputFile, 'utf8')).trim().split(/\r?\n/);
 	if (replies.length !== 2 || replies.some(reply => reply !== 'PONG')) {
 		throw new Error(`Expected two PONG replies, received ${JSON.stringify(replies)}`);
+	}
+	const journal = JSON.parse(await readFile(join(testRoot, 'instances', 'switch-test', 'events.json'), 'utf8')) as {
+		readonly pending?: unknown[];
+		readonly delivered?: unknown[];
+	};
+	if (journal.pending?.length !== 0 || journal.delivered?.length !== 2) {
+		throw new Error(`Expected two durably delivered events, received ${JSON.stringify(journal)}`);
 	}
 	console.log(`Daemon E2E passed: routed ${marker} through ${sessions[0]} and then ${sessions[1]}`);
 

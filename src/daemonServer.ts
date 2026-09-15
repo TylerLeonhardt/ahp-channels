@@ -20,7 +20,7 @@ import type { PluginManager } from './plugins.js';
 export interface ManagedChannelRuntime {
 	readonly snapshot: ChannelRuntimeSnapshot;
 	readonly whenStopped: Promise<void>;
-	tryQuiesce(): boolean;
+	quiesce(): Promise<boolean>;
 	close(): Promise<void>;
 }
 
@@ -38,6 +38,7 @@ export class DaemonServer {
 	private readonly restartAttempts = new Map<string, number>();
 	private readonly restartTimers = new Map<string, NodeJS.Timeout>();
 	private readonly stabilityTimers = new Map<string, NodeJS.Timeout>();
+	private readonly suspensionTimers = new Map<string, NodeJS.Timeout>();
 	private operationQueue: Promise<void> = Promise.resolve();
 	private closing = false;
 	private endpointOwned = false;
@@ -120,6 +121,10 @@ export class DaemonServer {
 			clearTimeout(timer);
 		}
 		this.stabilityTimers.clear();
+		for (const timer of this.suspensionTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.suspensionTimers.clear();
 		await this.operationQueue.catch(error => {
 			console.error(`[daemon] In-flight operation failed during shutdown: ${formatError(error)}`);
 		});
@@ -229,7 +234,7 @@ export class DaemonServer {
 				return this.enqueue(async () => {
 					assertChannelName(request.name);
 					const config = await this.configStore.read();
-					if (config.channels[request.name]) {
+					if (findChannelName(config, request.name)) {
 						throw new DaemonProtocolError('ALREADY_EXISTS', `Channel '${request.name}' already exists`);
 					}
 					const definition = { ...request.definition, enabled: request.start };
@@ -256,6 +261,53 @@ export class DaemonServer {
 					} catch (error) {
 						this.failures.set(request.name, formatError(error));
 						throw error;
+					}
+				});
+			case 'channel.restart':
+				return this.enqueue(async () => {
+					const definition = await this.getDefinition(request.name);
+					await this.runtimeFactory.validate(definition);
+					const runtime = this.runtimes.get(request.name);
+					if (runtime && !await runtime.quiesce()) {
+						throw new DaemonProtocolError('CHANNEL_BUSY', `Channel '${request.name}' is processing a turn`);
+					}
+					try {
+						await this.stopOne(request.name);
+					} catch (error) {
+						if (definition.enabled) {
+							this.scheduleRestart(request.name);
+						}
+						throw error;
+					}
+					if (definition.enabled) {
+						await this.startDesired(request.name, definition);
+					}
+				});
+			case 'channel.suspend':
+				return this.enqueue(async () => {
+					const definition = await this.getDefinition(request.name);
+					const runtime = this.runtimes.get(request.name);
+					if (runtime && !await runtime.quiesce()) {
+						throw new DaemonProtocolError('CHANNEL_BUSY', `Channel '${request.name}' is processing a turn`);
+					}
+					try {
+						await this.stopOne(request.name);
+					} catch (error) {
+						if (definition.enabled) {
+							this.scheduleRestart(request.name);
+						}
+						throw error;
+					}
+					if (definition.enabled) {
+						this.scheduleSuspensionRecovery(request.name);
+					}
+				});
+			case 'channel.resume':
+				return this.enqueue(async () => {
+					this.clearSuspension(request.name);
+					const definition = await this.getDefinition(request.name);
+					if (definition.enabled) {
+						await this.startDesired(request.name, definition);
 					}
 				});
 			case 'channel.switch':
@@ -331,6 +383,7 @@ export class DaemonServer {
 		if (existing) {
 			return;
 		}
+		this.clearSuspension(name);
 		this.clearRestart(name);
 		this.transitions.set(name, 'starting');
 		try {
@@ -379,12 +432,37 @@ export class DaemonServer {
 		}
 	}
 
+	private scheduleSuspensionRecovery(name: string): void {
+		this.clearSuspension(name);
+		const timer = setTimeout(() => {
+			this.suspensionTimers.delete(name);
+			void this.enqueue(async () => {
+				const definition = (await this.configStore.read()).channels[name];
+				if (definition?.enabled && !this.runtimes.has(name)) {
+					await this.startDesired(name, definition);
+				}
+			}).catch(error => {
+				console.error(`[channel:${name}] Failed to recover suspended channel: ${formatError(error)}`);
+			});
+		}, 30_000);
+		timer.unref();
+		this.suspensionTimers.set(name, timer);
+	}
+
+	private clearSuspension(name: string): void {
+		const timer = this.suspensionTimers.get(name);
+		if (timer) {
+			clearTimeout(timer);
+			this.suspensionTimers.delete(name);
+		}
+	}
+
 	private async switchOne(name: string, session: string, chat?: string): Promise<void> {
 		const previous = await this.getDefinition(name);
 		const runtime = this.runtimes.get(name);
 		const next = retargetChannelInstance(previous, session, chat);
 		await this.runtimeFactory.validate(next);
-		if (runtime && !runtime.tryQuiesce()) {
+		if (runtime && !await runtime.quiesce()) {
 			throw new DaemonProtocolError('CHANNEL_BUSY', `Channel '${name}' is processing a turn`);
 		}
 		const wasRunning = runtime !== undefined;
@@ -467,7 +545,8 @@ export class DaemonServer {
 				}
 				try {
 					await this.startOne(name, definition);
-				} catch {
+				} catch (error) {
+					console.error(`[channel:${name}] Restart attempt failed: ${formatError(error)}`);
 					this.scheduleRestart(name);
 				}
 			}).catch(error => {
@@ -531,6 +610,10 @@ function withChannel(config: AppConfig, name: string, definition: ChannelInstanc
 			[name]: definition,
 		},
 	};
+}
+
+function findChannelName(config: AppConfig, name: string): string | undefined {
+	return Object.keys(config.channels).find(candidate => candidate.toLowerCase() === name.toLowerCase());
 }
 
 function withoutChannel(config: AppConfig, name: string): AppConfig {
