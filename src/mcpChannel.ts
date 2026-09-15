@@ -5,10 +5,10 @@ import {
 	type ToolResultContent,
 } from '@microsoft/agent-host-protocol';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
 import type { ChannelEvent } from './channelPrompt.js';
 import type { StdioMcpServerConfig } from './plugins.js';
+import { ProcessTreeStdioClientTransport } from './processTreeStdioTransport.js';
 import { VERSION } from './version.js';
 
 const ChannelNotificationSchema = z.object({
@@ -38,7 +38,7 @@ export class McpChannelProcess implements McpChannelClient {
 		name: 'ahp-channels',
 		version: VERSION,
 	});
-	private transport: StdioClientTransport | undefined;
+	private transport: ProcessTreeStdioClientTransport | undefined;
 	private channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
 	private readonly pendingEvents: ChannelEvent[] = [];
 	private resolveStopped!: () => void;
@@ -69,7 +69,7 @@ export class McpChannelProcess implements McpChannelClient {
 	}
 
 	async start(): Promise<StartedMcpChannel> {
-		this.transport = new StdioClientTransport({
+		this.transport = new ProcessTreeStdioClientTransport({
 			command: this.config.command,
 			args: [...this.config.args],
 			...(this.config.cwd ? { cwd: this.config.cwd } : {}),

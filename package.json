@@ -40,6 +40,7 @@
     "test:package": "tsx scripts/package-smoke.ts",
     "e2e:local": "tsx scripts/e2e-local.ts",
     "e2e:daemon": "npm run build && tsx scripts/e2e-daemon-local.ts",
+    "e2e:fakechat": "npm run build && tsx scripts/e2e-fakechat.ts",
     "check": "npm run typecheck && npm test && npm run build",
     "prepack": "npm run build",
     "version": "node scripts/sync-version.mjs"

@@ -24,6 +24,7 @@
 
 - [x] Contribute installed Open Plugins and their skills through AHP.
 - [x] Remove bridge-owned plugin secret, state, and access management.
+- [x] Exercise the official fakechat plugin through its external UI across a daemon restart.
 - [ ] Soak the alpha with Telegram and fakechat.
 - [ ] Add log rotation and actionable health diagnostics.
 - [ ] Resolve alpha feedback and document compatibility limits.

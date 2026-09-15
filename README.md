@@ -147,7 +147,30 @@ npm run build
 npm run test:package
 npm run e2e:local
 npm run e2e:daemon
+npm run e2e:fakechat
 ```
+
+### Official fakechat E2E
+
+`npm run e2e:fakechat` requires Bun and Git/network access to
+`anthropics/claude-plugins-official`. By default it also requires a running
+local Agent Host with an available agent provider; set `AHP_CHANNELS_E2E_HOST`
+to a discovered host index or ID prefix to choose a specific host.
+
+CI sets `AHP_CHANNELS_E2E_USE_FIXTURE_HOST=1` to start an isolated,
+deterministic AHP host. That host drives the same session, reverse resource,
+customization, and client-tool protocol used by a full agent provider, but
+needs no model credentials. The default local mode remains available for
+validating against a real installed Agent Host.
+
+The test installs the real `fakechat@claude-plugins-official` plugin through the
+built CLI, creates a temporary AHP session and named channel, and exchanges an
+exact message and reply through fakechat's browser-facing WebSocket. It then
+restarts the isolated daemon and repeats the round trip. The test chooses an
+available loopback port instead of assuming fakechat's default, requires no
+credentials or external messaging service, and removes its temporary
+`AHP_CHANNELS_HOME`, plugin home, Bun cache, channel, daemon, and AHP session on
+both success and failure.
 
 See [SHIPPING.md](./SHIPPING.md) for the npm prerelease gates and
 [PUBLISHING.md](./PUBLISHING.md) for the tag-driven release process.

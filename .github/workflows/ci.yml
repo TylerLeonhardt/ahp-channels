@@ -27,3 +27,20 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run test:package
+
+  e2e-fakechat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: npm ci
+      - run: npm run e2e:fakechat
+        env:
+          AHP_CHANNELS_E2E_USE_FIXTURE_HOST: "1"
