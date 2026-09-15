@@ -36,6 +36,18 @@ describe('daemon control protocol', () => {
 			}),
 			(error: unknown) => error instanceof DaemonProtocolError && error.code === 'INVALID_RESPONSE',
 		);
+		assert.throws(
+			() => parseDaemonRequest({
+				version: DAEMON_PROTOCOL_VERSION,
+				token: 'x'.repeat(32),
+				body: {
+					command: 'channel.repin',
+					name: 'personal',
+					installation: '../outside',
+				},
+			}),
+			(error: unknown) => error instanceof DaemonProtocolError && error.code === 'INVALID_REQUEST',
+		);
 	});
 
 	it('creates one stable token under concurrent access', async () => {

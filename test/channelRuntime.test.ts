@@ -188,9 +188,11 @@ describe('ChannelRuntime', () => {
 		const client = new TestHostClient();
 		const mcp = new TestMcpChannel();
 		const services = createServices(client, mcp);
+		const installation = 'a'.repeat(64);
 
 		const runtime = await ChannelRuntime.start('personal', {
 			plugin: 'fake',
+			installation,
 			session: sessionUri,
 			enabled: true,
 		}, services);
@@ -205,6 +207,11 @@ describe('ChannelRuntime', () => {
 			clientShutDown: client.shutDown,
 			mcpClosed: mcp.closed,
 			resourceHandlersSetBeforeActiveClient: client.resourceHandlersSetBeforeActiveClient,
+			customizationNonces: client.dispatched.flatMap(item =>
+				item.action.type === ActionType.SessionActiveClientSet
+					? item.action.activeClient.customizations?.map(customization => customization.nonce) ?? []
+					: []
+			),
 		}, {
 			snapshot: {
 				name: 'personal',
@@ -227,6 +234,7 @@ describe('ChannelRuntime', () => {
 			clientShutDown: true,
 			mcpClosed: true,
 			resourceHandlersSetBeforeActiveClient: true,
+			customizationNonces: [installation, installation],
 		});
 	});
 

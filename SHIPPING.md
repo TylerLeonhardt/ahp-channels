@@ -5,9 +5,6 @@
 - [x] Claude-style MCP channel compatibility.
 - [x] TCP, Windows named-pipe, and Unix-socket Agent Host connections.
 - [x] Named instances with daemon start, stop, restart, status, and switch.
-- [x] Validate an initial OS-keyring and isolated plugin-state approach.
-      This was removed before `0.1.0` after the ownership boundary was
-      narrowed to bridge infrastructure.
 - [x] Durable event replay and deduplication.
 - [x] Windows, macOS, and Linux CI.
 - [x] Installed-package smoke test.
@@ -28,10 +25,18 @@
 - [x] Serve contributed plugins through read-only AHP resource requests.
 - [x] Keep setup skills available when the channel MCP server cannot start.
 - [x] Remove bridge-owned plugin secret, state, and access management.
-- [ ] Install plugins into immutable, versioned directories
+- [x] Install plugins into immutable, versioned directories
       ([#1](https://github.com/TylerLeonhardt/ahp-channels/issues/1)).
-- [ ] Run a fresh-machine setup from the published prerelease using
+- [x] Verify installed content and record source and Git provenance.
+- [x] Pin channels across explicit upgrade, rollback, and prune operations.
+- [x] Exercise the official fakechat plugin through its external UI across a
+      daemon restart in CI.
+- [ ] Run a fresh-machine Telegram setup from the published prerelease using
       plugin-owned configuration.
 - [ ] Soak the alpha with fakechat, Telegram, and Discord.
 - [ ] Add log rotation and actionable health diagnostics.
-- [ ] Resolve alpha feedback and document compatibility limits.
+- [ ] Document credential injection and restart requirements for plugins that
+      accept credentials only through their environment.
+- [ ] Resolve alpha feedback and document host, protocol, and plugin
+      compatibility limits.
+- [ ] Publish `0.1.0` through OIDC and verify its registry provenance.

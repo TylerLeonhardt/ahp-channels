@@ -50,23 +50,38 @@ files.
 - Durable event IDs, pending replay, and bounded deduplication history.
 - Plugin-owned setup, credentials, state, and access management.
 
-## Next: Reproducible plugin lifecycle
+## Completed: Reproducible plugin lifecycle
 
-- Install selected plugins into immutable, versioned directories instead of
-  executing them from marketplace checkouts
+- Content-addressed plugin snapshots outside marketplace checkouts
   ([#1](https://github.com/TylerLeonhardt/ahp-channels/issues/1)).
-- Record marketplace revision, plugin version, and source provenance.
-- Make plugin upgrades explicit and atomic.
-- Support rollback and remove unreferenced installations safely.
+- Git-tracked snapshots with marketplace revision, plugin version, source
+  provenance, and installed-content verification.
+- Explicit marketplace updates and plugin upgrades with stable channel pins.
+- Rollback and safe pruning of inactive, unreferenced installations.
+- Cross-process installation locking and reliable termination of entire plugin
+  process trees.
+- Official fakechat external-UI coverage across a daemon restart in CI.
 
 ## Next: Operational reliability
 
-- Rotate and bound daemon logs.
-- Report actionable health for host discovery, plugin loading, MCP startup,
-  retries, and customization-only runtimes.
+- Rotate and bound daemon logs while retaining recent failure context.
+- Report structured, actionable health for host discovery, session resolution,
+  plugin integrity and loading, MCP startup and exits, retries, and
+  customization-only runtimes.
+- Preserve the latest root cause, recovery guidance, and retry state across
+  daemon restarts.
+
+## Next: Host selection and release validation
+
 - Add stable aliases for explicitly selected remote Agent Hosts.
 - Improve host, session, and chat selection without replacing URI-based
   bindings.
+- Run a fresh macOS or Linux Telegram setup from the published prerelease
+  using plugin-owned configuration.
+- Soak fakechat, Telegram, and Discord through daemon restarts and plugin
+  upgrades.
+- Resolve alpha feedback and document protocol, host, and plugin compatibility
+  limits.
 
 ## Later: Protocol coverage
 
@@ -77,5 +92,5 @@ files.
 
 - Git subdirectory, URL, npm, and pip marketplace sources.
 - Signed or pinned marketplace policy.
-- Runtime-enforced channel and permission-relay allowlists.
+- Administrative policy for which marketplaces and plugins may be activated.
 - Packaged binaries and service installation.

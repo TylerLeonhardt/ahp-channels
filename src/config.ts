@@ -1,22 +1,29 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { withFileLock, writeFileAtomic } from './lockedFile.js';
 
-export const CONFIG_VERSION = 2;
+export const CONFIG_VERSION = 3;
 export const OFFICIAL_MARKETPLACE_NAME = 'claude-plugins-official';
 export const OFFICIAL_MARKETPLACE_SOURCE = 'anthropics/claude-plugins-official';
 const CHANNEL_INSTANCE_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+const PLUGIN_INSTALLATION_ID = /^[a-f0-9]{64}$/;
 
 export interface MarketplaceConfig {
 	readonly source: string;
 }
 
+export interface PluginInstallationConfig {
+	readonly source: string;
+	readonly version?: string;
+	readonly marketplaceRevision?: string;
+}
+
 export interface InstalledPluginConfig {
 	readonly marketplace: string;
-	readonly path: string;
-	readonly version?: string;
+	readonly activeInstallation: string;
+	readonly installations: Readonly<Record<string, PluginInstallationConfig>>;
 }
 
 export interface ChannelInstanceConfig {
@@ -27,6 +34,7 @@ export interface ChannelInstanceConfig {
 	readonly server?: string;
 	readonly host?: string;
 	readonly clientId?: string;
+	readonly installation?: string;
 }
 
 export interface AppConfig {
@@ -44,6 +52,10 @@ export function isValidChannelInstanceName(name: string): boolean {
 	return CHANNEL_INSTANCE_NAME.test(name) && !WINDOWS_RESERVED_NAME.test(name);
 }
 
+export function isValidPluginInstallationId(id: string): boolean {
+	return PLUGIN_INSTALLATION_ID.test(id);
+}
+
 export function retargetChannelInstance(
 	definition: ChannelInstanceConfig,
 	session: string,
@@ -57,6 +69,7 @@ export function retargetChannelInstance(
 		...(definition.server ? { server: definition.server } : {}),
 		...(definition.host ? { host: definition.host } : {}),
 		...(definition.clientId ? { clientId: definition.clientId } : {}),
+		...(definition.installation ? { installation: definition.installation } : {}),
 	};
 }
 
@@ -92,7 +105,9 @@ export class ConfigStore {
 		}
 
 		const value: unknown = JSON.parse(raw);
-		return parseConfig(value);
+		const config = parseConfig(value);
+		validateReferences(config);
+		return config;
 	}
 
 	async update(change: (config: AppConfig) => AppConfig): Promise<AppConfig> {
@@ -104,6 +119,7 @@ export class ConfigStore {
 	}
 
 	async write(config: AppConfig): Promise<void> {
+		validateReferences(config);
 		await writeFileAtomic(this.configPath, `${JSON.stringify(config, undefined, 2)}\n`);
 	}
 
@@ -113,12 +129,33 @@ function parseConfig(value: unknown): AppConfig {
 	if (!isRecord(value) || value['version'] !== CONFIG_VERSION) {
 		throw new Error(`Unsupported ahp-channels config version in ${JSON.stringify(value)}`);
 	}
+	const marketplaces = parseNamedRecord(value['marketplaces'], 'marketplace', parseMarketplace);
+	const plugins = parseNamedRecord(value['plugins'], 'plugin', parseInstalledPlugin);
 	return {
 		version: CONFIG_VERSION,
-		marketplaces: parseRecord(value['marketplaces'], parseMarketplace),
-		plugins: parseRecord(value['plugins'], parseInstalledPlugin),
+		marketplaces,
+		plugins,
 		channels: parseChannelRecord(value['channels']),
 	};
+}
+
+function validateReferences(config: AppConfig): void {
+	for (const [name, plugin] of Object.entries(config.plugins)) {
+		if (!config.marketplaces[plugin.marketplace]) {
+			throw new Error(`Plugin '${name}' references unknown marketplace '${plugin.marketplace}'`);
+		}
+	}
+	for (const [name, channel] of Object.entries(config.channels)) {
+		if (!channel.installation) {
+			continue;
+		}
+		const plugin = config.plugins[channel.plugin];
+		if (!plugin?.installations[channel.installation]) {
+			throw new Error(
+				`Channel '${name}' references missing ${channel.plugin} installation '${channel.installation}'`,
+			);
+		}
+	}
 }
 
 function parseMarketplace(value: unknown): MarketplaceConfig {
@@ -131,26 +168,58 @@ function parseMarketplace(value: unknown): MarketplaceConfig {
 function parseInstalledPlugin(value: unknown): InstalledPluginConfig {
 	if (!isRecord(value)
 		|| typeof value['marketplace'] !== 'string'
-		|| typeof value['path'] !== 'string'
-		|| (value['version'] !== undefined && typeof value['version'] !== 'string')) {
+		|| !isValidChannelInstanceName(value['marketplace'])
+		|| typeof value['activeInstallation'] !== 'string'
+		|| !isValidPluginInstallationId(value['activeInstallation'])
+		|| !isRecord(value['installations'])) {
 		throw new Error('Invalid installed plugin configuration');
+	}
+	const installations: Record<string, PluginInstallationConfig> = {};
+	for (const [id, installation] of Object.entries(value['installations'])) {
+		if (!isValidPluginInstallationId(id)) {
+			throw new Error(`Invalid plugin installation ID '${id}'`);
+		}
+		installations[id] = parsePluginInstallation(installation);
+	}
+	if (!installations[value['activeInstallation']]) {
+		throw new Error(`Active plugin installation '${value['activeInstallation']}' does not exist`);
 	}
 	return {
 		marketplace: value['marketplace'],
-		path: value['path'],
+		activeInstallation: value['activeInstallation'],
+		installations,
+	};
+}
+
+function parsePluginInstallation(value: unknown): PluginInstallationConfig {
+	if (!isRecord(value)
+		|| typeof value['source'] !== 'string'
+		|| value['source'].length === 0
+		|| (value['version'] !== undefined && typeof value['version'] !== 'string')
+		|| (value['marketplaceRevision'] !== undefined
+			&& (typeof value['marketplaceRevision'] !== 'string'
+				|| !/^[a-f0-9]{40,64}$/i.test(value['marketplaceRevision'])))) {
+		throw new Error('Invalid plugin installation');
+	}
+	return {
+		source: value['source'],
 		...(value['version'] ? { version: value['version'] } : {}),
+		...(value['marketplaceRevision'] ? { marketplaceRevision: value['marketplaceRevision'] } : {}),
 	};
 }
 
 function parseChannelInstance(value: unknown): ChannelInstanceConfig {
 	if (!isRecord(value)
 		|| typeof value['plugin'] !== 'string'
+		|| (!isAbsolute(value['plugin']) && !isValidChannelInstanceName(value['plugin']))
 		|| typeof value['session'] !== 'string'
 		|| typeof value['enabled'] !== 'boolean'
 		|| !isOptionalString(value['chat'])
 		|| !isOptionalString(value['server'])
 		|| !isOptionalString(value['host'])
-		|| !isOptionalString(value['clientId'])) {
+		|| !isOptionalString(value['clientId'])
+		|| !isOptionalInstallation(value['installation'])
+		|| (isAbsolute(value['plugin']) && value['installation'] !== undefined)) {
 		throw new Error('Invalid channel instance configuration');
 	}
 	return {
@@ -161,15 +230,23 @@ function parseChannelInstance(value: unknown): ChannelInstanceConfig {
 		...(value['server'] ? { server: value['server'] } : {}),
 		...(value['host'] ? { host: value['host'] } : {}),
 		...(value['clientId'] ? { clientId: value['clientId'] } : {}),
+		...(value['installation'] ? { installation: value['installation'] } : {}),
 	};
 }
 
-function parseRecord<T>(value: unknown, parse: (entry: unknown) => T): Record<string, T> {
+function parseNamedRecord<T>(
+	value: unknown,
+	label: string,
+	parse: (entry: unknown) => T,
+): Record<string, T> {
 	if (!isRecord(value)) {
 		return {};
 	}
 	const result: Record<string, T> = {};
 	for (const [key, entry] of Object.entries(value)) {
+		if (!isValidChannelInstanceName(key)) {
+			throw new Error(`Invalid ${label} name '${key}' in configuration`);
+		}
 		result[key] = parse(entry);
 	}
 	return result;
@@ -197,6 +274,10 @@ function parseChannelRecord(value: unknown): Record<string, ChannelInstanceConfi
 
 function isOptionalString(value: unknown): value is string | undefined {
 	return value === undefined || typeof value === 'string';
+}
+
+function isOptionalInstallation(value: unknown): value is string | undefined {
+	return value === undefined || (typeof value === 'string' && isValidPluginInstallationId(value));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

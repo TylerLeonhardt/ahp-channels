@@ -53,6 +53,64 @@ describe('ConfigStore', () => {
 		);
 	});
 
+	it('loads installed versions and channel pins', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
+		temporaryDirectories.push(home);
+		const installation = 'a'.repeat(64);
+		const marketplaceRevision = 'b'.repeat(40);
+		await writeFile(join(home, 'config.json'), JSON.stringify({
+			version: CONFIG_VERSION,
+			marketplaces: { test: { source: './marketplace' } },
+			plugins: {
+				fake: {
+					marketplace: 'test',
+					activeInstallation: installation,
+					installations: {
+						[installation]: {
+							source: './plugins/fake',
+							version: '1.0.0',
+							marketplaceRevision,
+						},
+					},
+				},
+			},
+			channels: {
+				personal: {
+					plugin: 'fake',
+					installation,
+					session: 'ahp-session:/one',
+					enabled: false,
+				},
+			},
+		}));
+
+		assert.deepEqual(await new ConfigStore(home).read(), {
+			version: CONFIG_VERSION,
+			marketplaces: { test: { source: './marketplace' } },
+			plugins: {
+				fake: {
+					marketplace: 'test',
+					activeInstallation: installation,
+					installations: {
+						[installation]: {
+							source: './plugins/fake',
+							version: '1.0.0',
+							marketplaceRevision,
+						},
+					},
+				},
+			},
+			channels: {
+				personal: {
+					plugin: 'fake',
+					installation,
+					session: 'ahp-session:/one',
+					enabled: false,
+				},
+			},
+		});
+	});
+
 	it('rejects channel names that could escape the instance directory', async () => {
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
 		temporaryDirectories.push(home);
@@ -81,6 +139,65 @@ describe('ConfigStore', () => {
 			reserved: false,
 			normal: true,
 		});
+	});
+
+	it('rejects managed names and installation references that can escape storage', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
+		temporaryDirectories.push(home);
+		const installation = 'a'.repeat(64);
+		await writeFile(join(home, 'config.json'), JSON.stringify({
+			version: CONFIG_VERSION,
+			marketplaces: {
+				'..': { source: './marketplace' },
+			},
+			plugins: {},
+			channels: {},
+		}));
+		await assert.rejects(new ConfigStore(home).read(), /Invalid marketplace name/);
+
+		await writeFile(join(home, 'config.json'), JSON.stringify({
+			version: CONFIG_VERSION,
+			marketplaces: {},
+			plugins: {},
+			channels: {
+				personal: {
+					plugin: join(home, 'plugin'),
+					installation,
+					session: 'ahp-session:/one',
+					enabled: false,
+				},
+			},
+		}));
+		await assert.rejects(new ConfigStore(home).read(), /Invalid channel instance configuration/);
+
+	});
+
+	it('rejects invalid references before writing an update', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await store.write({
+			version: CONFIG_VERSION,
+			marketplaces: {},
+			plugins: {},
+			channels: {},
+		});
+
+		await assert.rejects(
+			store.update(config => ({
+				...config,
+				channels: {
+					personal: {
+						plugin: 'fake',
+						installation: 'a'.repeat(64),
+						session: 'ahp-session:/one',
+						enabled: false,
+					},
+				},
+			})),
+			/references missing fake installation/,
+		);
+		assert.deepEqual((await store.read()).channels, {});
 	});
 
 	it('rejects channel names that alias on case-insensitive filesystems', async () => {
