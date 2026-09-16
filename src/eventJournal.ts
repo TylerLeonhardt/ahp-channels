@@ -69,10 +69,11 @@ export class FileChannelEventJournal implements ChannelEventJournal {
 	}
 
 	async pending(): Promise<readonly JournaledChannelEvent[]> {
-		return (await this.read()).pending.map(event => ({
+		// Keep readers from overlapping atomic file replacement on Windows.
+		return withFileLock(this.path, async () => (await this.read()).pending.map(event => ({
 			...event,
 			event: cloneEvent(event.event),
-		}));
+		})));
 	}
 
 	async markDelivered(ids: readonly string[]): Promise<void> {

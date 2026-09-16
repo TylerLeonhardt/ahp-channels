@@ -306,6 +306,8 @@ them after a daemon or channel-process restart. A switch is rejected while the
 channel is processing a turn, so an in-flight reply is never silently orphaned.
 Inbound events with stable platform IDs are journaled before AHP dispatch and
 deduplicated across process restarts.
+Journal reads and updates share a cross-process lock to avoid read/replace
+races on Windows.
 
 Daemon and channel-process output is written to `daemon.log`. The active log is
 limited to 1 MiB, with the three most recent 1 MiB rotations retained as
