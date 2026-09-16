@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { McpChannelProcess, convertToolResult, createChannelEnvironment } from '../src/mcpChannel.js';
 
+const silentLogWriter = {
+	write(_chunk: string): void { },
+};
+
 describe('McpChannelProcess', () => {
 	it('inherits the parent environment with server overrides', () => {
 		const key = 'AHP_CHANNELS_ENVIRONMENT_TEST';
@@ -30,7 +34,7 @@ describe('McpChannelProcess', () => {
 		const channel = new McpChannelProcess({
 			command: process.execPath,
 			args: [server],
-		}, () => undefined);
+		}, silentLogWriter);
 		try {
 			const info = await channel.start();
 			const event = new Promise<{ content: string; meta?: Readonly<Record<string, string>> }>(resolve => {
@@ -94,7 +98,7 @@ describe('McpChannelProcess', () => {
 			command: process.execPath,
 			args: [server],
 			env: { AHP_CHANNELS_FAKE_EXIT_MS: '500' },
-		}, () => undefined);
+		}, silentLogWriter);
 		await channel.start();
 
 		await Promise.race([

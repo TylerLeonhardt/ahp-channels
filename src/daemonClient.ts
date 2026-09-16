@@ -1,10 +1,11 @@
-import { closeSync, existsSync, openSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import type { Socket } from 'node:net';
+import { check } from 'proper-lockfile';
 import { getOrCreateDaemonToken, getDaemonPaths, readDaemonToken } from './daemonPaths.js';
+import { parseDaemonStartupMessage, type DaemonStartupMessage } from './daemonStartup.js';
+import { FILE_LOCK_OPTIONS } from './lockedFile.js';
 import {
 	DAEMON_PROTOCOL_VERSION,
 	DaemonProtocolError,
@@ -57,41 +58,85 @@ export async function probeDaemon(home: string, timeoutMs = 500): Promise<Daemon
 }
 
 export async function ensureDaemonStarted(home: string): Promise<DaemonStatus> {
-	const running = await probeDaemon(home);
+	const deadline = Date.now() + 60_000;
+	const running = await probeDaemon(home, 60_000);
 	if (running) {
 		return running;
 	}
 
-	await removeStaleSocket(home);
 	await getOrCreateDaemonToken(home);
 	const paths = getDaemonPaths(home);
-	const logDescriptor = openSync(paths.logFile, 'a', 0o600);
-	try {
-		const daemonEntry = resolveDaemonEntry();
-		const child = spawn(process.execPath, [daemonEntry, '--home', home], {
-			detached: true,
-			stdio: ['ignore', logDescriptor, logDescriptor],
-			windowsHide: true,
-		});
-		child.unref();
-	} finally {
-		closeSync(logDescriptor);
-	}
-
-	const deadline = Date.now() + 60_000;
 	let lastError: unknown;
 	while (Date.now() < deadline) {
-		try {
-			const status = await probeDaemon(home);
-			if (status) {
-				return status;
-			}
-		} catch (error) {
-			lastError = error;
+		const startup = await launchDaemon(home, deadline - Date.now());
+		if (startup.type === 'error') {
+			throw new Error(`Daemon startup failed: ${startup.message}`);
 		}
-		await new Promise(resolve => setTimeout(resolve, 100));
+		if (startup.type === 'ready') {
+			return requestDaemon(home, { command: 'status' });
+		}
+		while (Date.now() < deadline) {
+			try {
+				const status = await probeDaemon(home, Math.max(1, deadline - Date.now()));
+				if (status) {
+					return status;
+				}
+			} catch (error) {
+				lastError = error;
+			}
+			if (!await check(paths.logFile, FILE_LOCK_OPTIONS)) {
+				break;
+			}
+			await new Promise(resolve => setTimeout(resolve, 100));
+		}
 	}
 	throw new Error(`Daemon did not start within 60 seconds; see ${paths.logFile}`, { cause: lastError });
+}
+
+function launchDaemon(home: string, timeoutMs: number): Promise<DaemonStartupMessage> {
+	const daemonEntry = resolveDaemonEntry();
+	return new Promise((resolve, reject) => {
+		const child = spawn(process.execPath, [daemonEntry, '--home', home], {
+			detached: true,
+			stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+			windowsHide: true,
+		});
+		const cleanup = () => {
+			clearTimeout(timer);
+			child.off('message', onMessage);
+			child.off('error', onError);
+			child.off('exit', onExit);
+			if (child.connected) {
+				child.disconnect();
+			}
+		};
+		const onError = (error: unknown) => {
+			cleanup();
+			reject(error);
+		};
+		const onMessage = (value: unknown) => {
+			let message: DaemonStartupMessage;
+			try {
+				message = parseDaemonStartupMessage(value);
+			} catch (error) {
+				onError(error);
+				return;
+			}
+			cleanup();
+			resolve(message);
+		};
+		const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+			const reason = signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`;
+			onError(new Error(`Daemon exited before startup with ${reason}; see ${getDaemonPaths(home).logFile}`));
+		};
+		const timer = setTimeout(() => {
+			onError(new Error(`Daemon did not start within 60 seconds; see ${getDaemonPaths(home).logFile}`));
+		}, timeoutMs);
+		child.once('message', onMessage);
+		child.once('error', onError);
+		child.once('exit', onExit);
+		child.unref();
+	});
 }
 
 export async function stopDaemon(home: string): Promise<void> {
@@ -197,36 +242,6 @@ function resolveDaemonEntry(): string {
 		return built;
 	}
 	throw new Error('Daemon entry point was not found; run npm run build first');
-}
-
-async function removeStaleSocket(home: string): Promise<void> {
-	if (process.platform === 'win32') {
-		return;
-	}
-	const endpoint = getDaemonPaths(home).endpoint;
-	try {
-		await new Promise<void>((resolve, reject) => {
-			const socket: Socket = createConnection(endpoint);
-			socket.once('connect', () => {
-				socket.destroy();
-				reject(new Error('Daemon became available while starting'));
-			});
-			socket.once('error', error => {
-				socket.destroy();
-				if (isNodeError(error) && (error.code === 'ECONNREFUSED' || error.code === 'ENOENT')) {
-					resolve();
-				} else {
-					reject(error);
-				}
-			});
-		});
-		await rm(endpoint, { force: true });
-	} catch (error) {
-		if (isNodeError(error) && error.code === 'ENOENT') {
-			return;
-		}
-		throw error;
-	}
 }
 
 function isUnavailableError(error: unknown): boolean {

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { VERSION } from '../src/version.js';
@@ -35,11 +36,29 @@ try {
 	if (version.stdout.trim() !== VERSION) {
 		throw new Error(`Expected CLI version ${VERSION}, received ${version.stdout.trim()}`);
 	}
-	await run(process.execPath, [cliEntry, 'daemon', 'start'], root, environment);
 	daemonStarted = true;
+	const starts = await Promise.all([
+		run(process.execPath, [cliEntry, 'daemon', 'start'], root, environment),
+		run(process.execPath, [cliEntry, 'daemon', 'start'], root, environment),
+		run(process.execPath, [cliEntry, 'daemon', 'start'], root, environment),
+	]);
+	const pids = starts.map(result => {
+		const match = /Daemon running \(pid (\d+)\)/.exec(result.stdout);
+		assert.ok(match, result.stdout);
+		return match[1];
+	});
+	assert.equal(new Set(pids).size, 1, 'Concurrent starts must return the same daemon');
 	await run(process.execPath, [cliEntry, 'daemon', 'status', '--json'], root, environment);
 	await run(process.execPath, [cliEntry, 'daemon', 'stop'], root, environment);
 	daemonStarted = false;
+	const invalidHome = join(temporary, 'invalid-state');
+	await mkdir(join(invalidHome, 'daemon.log'), { recursive: true });
+	const failedStart = Date.now();
+	await assert.rejects(
+		run(process.execPath, [cliEntry, 'daemon', 'start'], root, { ...environment, AHP_CHANNELS_HOME: invalidHome }),
+		/Daemon startup failed:.*daemon\.log/,
+	);
+	assert.ok(Date.now() - failedStart < 10_000, 'Log failures must not wait for the 60-second startup timeout');
 	console.log(`Package smoke test passed: ${basename(tarball)}`);
 } finally {
 	if (daemonStarted && cliEntry) {

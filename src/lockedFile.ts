@@ -2,10 +2,14 @@ import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { lock } from 'proper-lockfile';
 
-const LOCK_OPTIONS = {
+export const FILE_LOCK_OPTIONS = {
 	realpath: false,
 	stale: 30_000,
 	update: 10_000,
+} as const;
+
+const LOCK_OPTIONS = {
+	...FILE_LOCK_OPTIONS,
 	retries: {
 		retries: 100,
 		factor: 1.2,

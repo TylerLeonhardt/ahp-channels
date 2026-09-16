@@ -7,6 +7,7 @@ import {
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { z } from 'zod';
 import type { ChannelEvent } from './channelPrompt.js';
+import type { LogWriter } from './daemonLog.js';
 import type { StdioMcpServerConfig } from './plugins.js';
 import { ProcessTreeStdioClientTransport } from './processTreeStdioTransport.js';
 import { VERSION } from './version.js';
@@ -33,6 +34,12 @@ export interface McpChannelClient {
 	close(): Promise<void>;
 }
 
+const standardErrorWriter: LogWriter = {
+	write(chunk: string): void {
+		process.stderr.write(chunk);
+	},
+};
+
 export class McpChannelProcess implements McpChannelClient {
 	private readonly client = new Client({
 		name: 'ahp-channels',
@@ -49,7 +56,7 @@ export class McpChannelProcess implements McpChannelClient {
 
 	constructor(
 		private readonly config: StdioMcpServerConfig,
-		private readonly onStderr: (chunk: string) => void = chunk => process.stderr.write(chunk),
+		private readonly stderr: LogWriter = standardErrorWriter,
 	) {
 		this.client.onclose = () => {
 			this.stopped = true;
@@ -76,7 +83,7 @@ export class McpChannelProcess implements McpChannelClient {
 			env: createChannelEnvironment(this.config.env),
 			stderr: 'pipe',
 		});
-		this.transport.stderr?.on('data', chunk => this.onStderr(String(chunk)));
+		this.transport.stderr?.on('data', chunk => this.stderr.write(String(chunk)));
 		await this.client.connect(this.transport);
 
 		const capabilities = this.client.getServerCapabilities();

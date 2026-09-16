@@ -1,5 +1,6 @@
 import { randomBytes, createHash } from 'node:crypto';
 import { mkdir, open, readFile, rm } from 'node:fs/promises';
+import { createConnection } from 'node:net';
 import { join } from 'node:path';
 
 export interface DaemonPaths {
@@ -17,6 +18,29 @@ export function getDaemonPaths(home: string, platform: NodeJS.Platform = process
 		tokenFile: join(home, 'daemon-token'),
 		logFile: join(home, 'daemon.log'),
 	};
+}
+
+export async function removeStaleDaemonSocket(home: string): Promise<void> {
+	if (process.platform === 'win32') {
+		return;
+	}
+	const endpoint = getDaemonPaths(home).endpoint;
+	await new Promise<void>((resolve, reject) => {
+		const socket = createConnection(endpoint);
+		socket.once('connect', () => {
+			socket.destroy();
+			reject(new Error(`A daemon is already listening on ${endpoint}`));
+		});
+		socket.once('error', error => {
+			socket.destroy();
+			if (isNodeError(error) && (error.code === 'ECONNREFUSED' || error.code === 'ENOENT')) {
+				resolve();
+			} else {
+				reject(error);
+			}
+		});
+	});
+	await rm(endpoint, { force: true });
 }
 
 export async function getOrCreateDaemonToken(home: string): Promise<string> {
