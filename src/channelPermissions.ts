@@ -104,6 +104,7 @@ export class ChannelPermissionRelay {
 		private readonly transport: ChannelPermissionTransport | undefined,
 		private state: ChatState,
 		private readonly channelTools: readonly ToolDefinition[],
+		private readonly managementTools: readonly ToolDefinition[] = [],
 	) {
 		if (state.resource !== chat) {
 			throw new Error('Permission relay snapshot does not match its bound chat');
@@ -188,6 +189,10 @@ export class ChannelPermissionRelay {
 			}
 			if (isChannelToolContributor(tool, this.clientId)) {
 				this.offered.add(tool);
+				if (this.managementTools.some(definition => definition.name === tool.toolName)) {
+					this.events.emit('status', `left bridge management tool ${sanitizePermissionText(tool.toolName)} for Agent Host approval`);
+					continue;
+				}
 				const available = isChannelToolCall(tool, this.clientId, this.channelTools);
 				const reasonMessage = `Channel tool '${sanitizePermissionText(tool.toolName)}' is no longer available`;
 				this.host.dispatch(this.chat, available ? {

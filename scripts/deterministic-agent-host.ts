@@ -55,6 +55,15 @@ const PROVIDER = 'deterministic-e2e';
 const MODEL = 'deterministic-e2e';
 const EXPECTED_REPLY = /\bFAKECHAT_(?:FIRST|RESTART)_[0-9a-f-]+\b/i;
 const PERMISSION_MARKER = /\bFAKECHAT_PERMISSION_[A-Z]+_[0-9a-f-]+\b/i;
+const HANDOFF_MARKER = /\bAHP_CHANNEL_HANDOFF_[0-9a-f-]+\b/i;
+const HANDOFF_TOOL = 'ahp_channels_handoff';
+
+export interface DeterministicHandoffTarget {
+	readonly host: string;
+	readonly session: string;
+	readonly chat: string;
+	readonly sourceReply: string;
+}
 
 interface PendingRequest {
 	readonly resolve: (value: unknown) => void;
@@ -78,6 +87,7 @@ interface HostedSession {
 		readonly turnId: string;
 		readonly permission?: { readonly marker: string; readonly path: string };
 		readonly attachment?: { readonly scenario: AttachmentScenario; readonly phase: AttachmentPhase };
+		readonly handoffReply?: string;
 	}>;
 }
 
@@ -97,6 +107,7 @@ export class DeterministicAgentHost {
 	});
 	private readonly peers = new Set<HostPeer>();
 	private readonly sessions = new Map<string, HostedSession>();
+	private readonly handoffTargets = new Map<string, DeterministicHandoffTarget>();
 	private readonly customizationLoads = new Map<string, Promise<void>>();
 	private serverSeq = 0;
 	private registryFile: string | undefined;
@@ -148,6 +159,13 @@ export class DeterministicAgentHost {
 		if (this.registryFile) {
 			await rm(this.registryFile, { force: true });
 		}
+	}
+
+	configureHandoff(marker: string, target: DeterministicHandoffTarget): void {
+		if (!HANDOFF_MARKER.test(marker)) {
+			throw new Error(`Invalid deterministic handoff marker: ${marker}`);
+		}
+		this.handoffTargets.set(marker, target);
 	}
 
 	private accept(socket: WebSocket): void {
@@ -425,10 +443,13 @@ export class DeterministicAgentHost {
 		if (action.type === ActionType.ChatTurnStarted) {
 			const marker = PERMISSION_MARKER.exec(action.message.text)?.[0];
 			const attachment = attachmentScenarioFromMessage(action.message.text);
+			const handoffMarker = HANDOFF_MARKER.exec(action.message.text)?.[0];
 			if (attachment) {
 				await this.startAttachmentScenario(hosted, channel, action.turnId, attachment);
 			} else if (marker) {
 				this.startPermissionTool(hosted, channel, action.turnId, marker);
+			} else if (handoffMarker) {
+				this.startHandoffTool(hosted, channel, action.turnId, handoffMarker);
 			} else {
 				const expected = EXPECTED_REPLY.exec(action.message.text)?.[0];
 				if (expected) {
@@ -457,7 +478,13 @@ export class DeterministicAgentHost {
 			}
 		} else if (action.type === ActionType.ChatToolCallComplete) {
 			const pending = hosted.pendingToolCalls.get(action.toolCallId);
-			if (pending && !pending.permission) {
+			if (pending?.handoffReply) {
+				hosted.pendingToolCalls.delete(action.toolCallId);
+				if (!action.result.success || action.result.structuredContent?.['state'] !== 'pending') {
+					throw new Error(`Bridge handoff tool did not return an accurate pending result: ${JSON.stringify(action.result)}`);
+				}
+				await this.startReplyTool(hosted, channel, pending.turnId, pending.handoffReply);
+			} else if (pending && !pending.permission) {
 				hosted.pendingToolCalls.delete(action.toolCallId);
 				if (pending.attachment) {
 					// Mirror the host-owned follow-up completion seen after real
@@ -712,6 +739,55 @@ export class DeterministicAgentHost {
 			contributor,
 			invocationMessage: `Send ${expected} to fakechat`,
 			toolInput: JSON.stringify({ text: expected }),
+		});
+	}
+
+	private startHandoffTool(
+		hosted: HostedSession,
+		chat: string,
+		turnId: string,
+		marker: string,
+	): void {
+		const target = this.handoffTargets.get(marker);
+		if (!target) {
+			throw new Error(`No deterministic handoff target was configured for ${marker}`);
+		}
+		const client = hosted.state.activeClients.find(candidate =>
+			candidate.tools.some(tool => tool.name === HANDOFF_TOOL)
+		);
+		if (!client) {
+			throw new Error('Bridge handoff management tool was not contributed to the deterministic Agent Host');
+		}
+		const toolCallId = randomUUID();
+		hosted.pendingToolCalls.set(toolCallId, {
+			turnId,
+			handoffReply: target.sourceReply,
+		});
+		const contributor = {
+			kind: ToolCallContributorKind.Client,
+			clientId: client.clientId,
+		} as const;
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallStart,
+			turnId,
+			toolCallId,
+			toolName: HANDOFF_TOOL,
+			displayName: 'Redirect this channel',
+			intention: `Redirect this channel to ${target.session}`,
+			contributor,
+		});
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallReady,
+			turnId,
+			toolCallId,
+			contributor,
+			invocationMessage: `Redirect this channel to ${target.session}`,
+			toolInput: JSON.stringify({
+				host: target.host,
+				session: target.session,
+				chat: target.chat,
+			}),
+			confirmed: ToolCallConfirmationReason.Setting,
 		});
 	}
 

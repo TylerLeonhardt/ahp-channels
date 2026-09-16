@@ -107,6 +107,59 @@ describe('AgentHostService', () => {
 		assert.equal((await service.inspect('work')).state, 'unavailable');
 	});
 
+	it('returns explicit fallback candidates only for an unavailable alias', async () => {
+		const { home } = await createTestState();
+		const aliasRegistry = join(home, 'alias-registry');
+		const fallbackRegistry = join(home, 'fallback-registry');
+		await Promise.all([
+			mkdir(aliasRegistry, { recursive: true }),
+			mkdir(fallbackRegistry, { recursive: true }),
+		]);
+		await writeEndpoint(fallbackRegistry, 'fallback.json', {
+			instanceId: 'fallback-instance',
+			connectionToken: 'fallback-secret',
+			port: 42501,
+		});
+		const store = new ConfigStore(home);
+		await store.update(config => ({
+			...config,
+			hostAliases: {
+				work: {
+					kind: 'vscode-local',
+					registry: aliasRegistry,
+					hostType: 'standalone',
+					quality: 'insider',
+				},
+			},
+		}));
+		const service = new AgentHostService(store, {
+			AHP_CHANNELS_ENDPOINT_REGISTRY: fallbackRegistry,
+		});
+
+		assert.deepEqual(await service.configuredSelectors(), ['@work']);
+		const unavailable = await service.resolveCandidates('@work');
+		assert.equal(unavailable.preferredHost, '@work');
+		assert.equal(unavailable.candidates[0]?.target.id, `standalone:${process.pid}:fallback-instance`);
+		assert.equal(unavailable.candidates[0]?.fallback, true);
+		assert.equal(unavailable.candidates[0]?.verifySessionCatalog, true);
+		assert.match(unavailable.warnings[0] ?? '', /searching other local Agent Hosts/);
+
+		await writeEndpoint(aliasRegistry, 'first.json', {
+			instanceId: 'first',
+			connectionToken: 'first-secret',
+			port: 42502,
+		});
+		await writeEndpoint(aliasRegistry, 'second.json', {
+			instanceId: 'second',
+			connectionToken: 'second-secret',
+			port: 42503,
+		});
+		await assert.rejects(
+			service.resolveCandidates('@work'),
+			(error: unknown) => error instanceof HostAliasResolutionError && error.code === 'ambiguous',
+		);
+	});
+
 	it('refreshes generic local credentials and rejects remote or secret-bearing URLs', async () => {
 		const { home } = await createTestState();
 		const tokenFile = join(home, 'host.token');

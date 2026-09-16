@@ -12,18 +12,21 @@ import {
 	type SessionActiveClient,
 	type StateAction,
 	type ToolCallResult,
+	type ToolDefinition,
 } from '@microsoft/agent-host-protocol';
 import type { DispatchHandle, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { randomUUID } from 'node:crypto';
 import { raceAbort } from './async.js';
 import { formatChannelPrompt, type ChannelEvent } from './channelPrompt.js';
 import { ChannelPermissionRelay, isChannelToolContributor } from './channelPermissions.js';
+import type { BoundChannelManagement } from './channelManagement.js';
 import {
 	readJournalEventId,
 	withJournalEventId,
 	type ChannelEventJournal,
 } from './eventJournal.js';
 import type { McpChannelClient, StartedMcpChannel } from './mcpChannel.js';
+import type { StatusReporter } from './status.js';
 import { readToolInput, type ToolInputReader } from './toolInput.js';
 
 interface PendingClientTool {
@@ -31,9 +34,22 @@ interface PendingClientTool {
 	readonly toolCallId: string;
 	readonly toolName: string;
 	readonly abort: AbortController;
+	readonly restored: boolean;
 	toolInput?: ChatToolCallReadyAction['toolInput'];
 	executed: boolean;
 }
+
+interface PendingBridgeHandoff {
+	readonly id: string;
+	readonly heldEventIds: Set<string>;
+	readonly ready: Promise<void>;
+	readonly resolveReady: () => void;
+	readiness?: Promise<void>;
+}
+
+type ReplayCompletion =
+	| { readonly kind: 'activation' }
+	| { readonly kind: 'handoff-cancellation'; readonly handoff: PendingBridgeHandoff };
 
 export interface ChannelBridgeOptions {
 	readonly client: {
@@ -48,9 +64,10 @@ export interface ChannelBridgeOptions {
 	readonly chatSubscription: AsyncIterable<SubscriptionEvent> & { close(): Promise<void> };
 	readonly channel: Pick<McpChannelClient, 'setChannelHandler' | 'callTool' | 'close' | 'permissions'>;
 	readonly channelInfo: StartedMcpChannel;
+	readonly management?: BoundChannelManagement;
 	readonly customizations: readonly ClientPluginCustomization[];
 	readonly eventJournal?: ChannelEventJournal;
-	readonly onStatus?: (message: string) => void;
+	readonly status?: StatusReporter;
 }
 
 export class ChannelBridge {
@@ -60,7 +77,10 @@ export class ChannelBridge {
 	private readonly inFlightEventHandlers = new Set<Promise<void>>();
 	private readonly inFlightToolExecutions = new Set<Promise<void>>();
 	private actionLoop: Promise<void> | undefined;
-	private acceptingEvents = true;
+	private acceptingEvents = false;
+	private activationState: 'new' | 'paused' | 'active' | 'closed' = 'new';
+	private readonly activationHeldEventIds = new Set<string>();
+	private pendingHandoff: PendingBridgeHandoff | undefined;
 	private readonly lifetime = new AbortController();
 	private readonly permissionRelay: ChannelPermissionRelay;
 	private resolveEventFailure!: (error: Error) => void;
@@ -77,7 +97,7 @@ export class ChannelBridge {
 				&& (part.toolCall.status === ToolCallStatus.PendingConfirmation
 					|| part.toolCall.status === ToolCallStatus.Running
 					&& !options.channelInfo.tools.some(tool => tool.name === part.toolCall.toolName))) {
-				const pending = this.trackToolStart({ ...part.toolCall, turnId: turn.id });
+				const pending = this.trackToolStart({ ...part.toolCall, turnId: turn.id }, true);
 				if (pending) {
 					pending.toolInput = part.toolCall.toolInput;
 				}
@@ -90,8 +110,9 @@ export class ChannelBridge {
 			options.channel.permissions,
 			options.chatState,
 			options.channelInfo.tools,
+			options.management?.tools ?? [],
 		);
-		this.permissionRelay.events.on('status', message => options.onStatus?.(message));
+		this.permissionRelay.events.on('status', message => options.status?.report(message));
 		this.permissionRelay.events.on('failure', error => this.resolveEventFailure(error));
 	}
 
@@ -112,6 +133,9 @@ export class ChannelBridge {
 		if (this.lifetime.signal.aborted) {
 			return false;
 		}
+		if (this.pendingHandoff) {
+			return false;
+		}
 		this.acceptingEvents = false;
 		if (this.busy) {
 			this.acceptingEvents = true;
@@ -125,14 +149,107 @@ export class ChannelBridge {
 		return true;
 	}
 
-	async start(): Promise<void> {
-		const { client, clientId, session, channelInfo } = this.options;
-		publishActiveClient(client, session, {
-			clientId,
-			displayName: `ahp-channels (${channelInfo.name})`,
-			tools: [...channelInfo.tools],
-			customizations: [...this.options.customizations],
+	beginHandoff(id: string): void {
+		if (!this.options.eventJournal) {
+			throw new Error('Safe agent handoff requires the daemon event journal');
+		}
+		if (this.lifetime.signal.aborted) {
+			throw new Error('Cannot request a handoff from a stopped channel bridge');
+		}
+		if (this.pendingHandoff) {
+			throw new Error(`Handoff ${this.pendingHandoff.id} is already pending`);
+		}
+		let resolveReady!: () => void;
+		const ready = new Promise<void>(resolve => {
+			resolveReady = resolve;
 		});
+		this.pendingHandoff = {
+			id,
+			heldEventIds: new Set(),
+			ready,
+			resolveReady,
+		};
+		this.acceptingEvents = false;
+		this.checkHandoffReadiness();
+	}
+
+	waitForHandoffReady(id: string, signal: AbortSignal): Promise<void> {
+		const pending = this.pendingHandoff;
+		if (!pending || pending.id !== id) {
+			throw new Error(`Handoff ${id} is not pending in this channel bridge`);
+		}
+		return raceAbort(
+			pending.ready,
+			AbortSignal.any([signal, this.lifetime.signal]),
+		);
+	}
+
+	async cancelHandoff(id: string): Promise<void> {
+		const pending = this.pendingHandoff;
+		if (!pending || pending.id !== id) {
+			throw new Error(`Handoff ${id} is not pending in this channel bridge`);
+		}
+		if (!this.options.eventJournal || pending.heldEventIds.size === 0) {
+			this.pendingHandoff = undefined;
+			this.acceptingEvents = true;
+			return;
+		}
+		await this.replayHeldEvents(
+			pending.heldEventIds,
+			{ kind: 'handoff-cancellation', handoff: pending },
+		);
+	}
+
+	async quiesceHandoff(id: string): Promise<boolean> {
+		const pending = this.pendingHandoff;
+		if (!pending || pending.id !== id || this.lifetime.signal.aborted) {
+			return false;
+		}
+		await pending.ready;
+		return this.pendingHandoff === pending
+			&& !this.busy
+			&& this.inFlightEventHandlers.size === 0
+			&& this.inFlightToolExecutions.size === 0;
+	}
+
+	async start(): Promise<void> {
+		await this.startWithActivation(false);
+	}
+
+	async startPaused(): Promise<void> {
+		await this.startWithActivation(true);
+	}
+
+	async activate(): Promise<void> {
+		if (this.activationState === 'active') {
+			return;
+		}
+		if (this.activationState !== 'paused') {
+			throw new Error(`Cannot activate a channel bridge in state '${this.activationState}'`);
+		}
+		this.publishClient();
+		if (this.options.eventJournal) {
+			await this.replayHeldEvents(
+				this.activationHeldEventIds,
+				{ kind: 'activation' },
+				true,
+			);
+		} else {
+			this.activationState = 'active';
+			this.acceptingEvents = true;
+		}
+	}
+
+	private async startWithActivation(paused: boolean): Promise<void> {
+		if (this.activationState !== 'new') {
+			throw new Error(`Cannot start a channel bridge in state '${this.activationState}'`);
+		}
+		combinedTools(this.options.channelInfo.tools, this.options.management?.tools ?? []);
+		this.activationState = paused ? 'paused' : 'active';
+		this.acceptingEvents = !paused;
+		if (!paused) {
+			this.publishClient();
+		}
 		this.actionLoop = this.consumeChatActions();
 		this.permissionRelay.start();
 		for (const part of this.options.chatState.activeTurn?.responseParts ?? []) {
@@ -142,12 +259,14 @@ export class ChannelBridge {
 		}
 		if (this.options.eventJournal) {
 			await this.options.eventJournal.markDelivered(journalEventIds(this.options.chatState));
-			for (const pending of await this.options.eventJournal.pending()) {
-				this.dispatchChannelEvent(pending.event, pending.id);
+			if (!paused) {
+				for (const pending of await this.options.eventJournal.pending()) {
+					this.dispatchChannelEvent(pending.event, pending.id);
+				}
 			}
 		}
 		await this.options.channel.setChannelHandler(event => this.trackChannelEvent(event));
-		this.options.onStatus?.(`registered ${channelInfo.name} client for ${this.options.chat}`);
+		this.options.status?.report(`registered ${this.options.channelInfo.name} client for ${this.options.chat}`);
 	}
 
 	async close(): Promise<void> {
@@ -156,6 +275,8 @@ export class ChannelBridge {
 		}
 		this.lifetime.abort();
 		this.acceptingEvents = false;
+		this.activationState = 'closed';
+		this.pendingHandoff = undefined;
 		for (const pending of this.pendingTools.values()) {
 			this.cancelTool(pending);
 		}
@@ -174,7 +295,7 @@ export class ChannelBridge {
 				clientId: this.options.clientId,
 			});
 		} catch (error) {
-			this.options.onStatus?.(`failed to remove active client: ${error instanceof Error ? error.message : String(error)}`);
+			this.options.status?.report(`failed to remove active client: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		try {
 			if (this.options.client.unsubscribe) {
@@ -200,17 +321,25 @@ export class ChannelBridge {
 			if (this.acceptingEvents) {
 				this.dispatchChannelEvent(event);
 			} else {
-				this.options.onStatus?.('ignored channel event while the bridge was stopping');
+				this.options.status?.report('ignored channel event while the bridge was stopping');
 			}
 			return;
 		}
 		const journaled = await this.options.eventJournal.enqueue(this.options.channelInfo.name, event);
 		if (!journaled) {
-			this.options.onStatus?.('ignored duplicate channel event');
+			this.options.status?.report('ignored duplicate channel event');
 			return;
 		}
 		if (!this.acceptingEvents) {
-			this.options.onStatus?.('journaled channel event for replay after restart');
+			if (this.pendingHandoff) {
+				this.pendingHandoff.heldEventIds.add(journaled.id);
+				this.options.status?.report('held inbound channel message until the pending handoff finishes');
+			} else if (this.activationState === 'paused') {
+				this.activationHeldEventIds.add(journaled.id);
+				this.options.status?.report('held inbound channel message until the destination binding commits');
+			} else {
+				this.options.status?.report('journaled channel event for replay after restart');
+			}
 			return;
 		}
 		this.dispatchChannelEvent(journaled.event, journaled.id);
@@ -250,7 +379,7 @@ export class ChannelBridge {
 				id,
 				message,
 			});
-			this.options.onStatus?.('queued inbound channel message');
+			this.options.status?.report('queued inbound channel message');
 			return;
 		}
 		const turnId = randomUUID();
@@ -261,7 +390,7 @@ export class ChannelBridge {
 			startedAt: new Date().toISOString(),
 			message,
 		});
-		this.options.onStatus?.(`started turn ${turnId}`);
+		this.options.status?.report(`started turn ${turnId}`);
 	}
 
 	private async consumeChatActions(): Promise<void> {
@@ -282,13 +411,15 @@ export class ChannelBridge {
 					&& event.params.action.kind === PendingMessageKind.Queued) {
 					this.queuedMessageIds.delete(event.params.action.id);
 				}
-				this.options.onStatus?.(`action rejected: ${event.params.rejectionReason}`);
+				this.options.status?.report(`action rejected: ${event.params.rejectionReason}`);
 				if (rejectedEventId && this.options.eventJournal) {
 					throw new Error(`Journaled channel event ${rejectedEventId} was rejected: ${event.params.rejectionReason}`);
 				}
+				this.checkHandoffReadiness();
 				continue;
 			}
 			await this.handleAction(event.params);
+			this.checkHandoffReadiness();
 		}
 	}
 
@@ -367,6 +498,7 @@ export class ChannelBridge {
 
 	private trackToolStart(
 		action: Pick<ChatToolCallStartAction, 'turnId' | 'toolCallId' | 'toolName' | 'contributor'>,
+		restored = false,
 	): PendingClientTool | undefined {
 		if (!isChannelToolContributor(action, this.options.clientId)) {
 			return;
@@ -383,6 +515,7 @@ export class ChannelBridge {
 			toolCallId: action.toolCallId,
 			toolName: action.toolName,
 			abort: new AbortController(),
+			restored,
 			executed: false,
 		};
 		this.pendingTools.set(action.toolCallId, pending);
@@ -420,11 +553,21 @@ export class ChannelBridge {
 	}
 
 	private async runTool(pending: PendingClientTool): Promise<void> {
-		if (!this.options.channelInfo.tools.some(tool => tool.name === pending.toolName)) {
+		const isChannelTool = this.options.channelInfo.tools.some(tool => tool.name === pending.toolName);
+		const isManagementTool = this.options.management?.tools.some(tool => tool.name === pending.toolName) ?? false;
+		if (!isChannelTool && !isManagementTool) {
 			this.dispatchToolCompletion(pending, {
 				success: false,
 				pastTenseMessage: `Failed to call ${pending.toolName}`,
 				error: { message: `Channel tool '${pending.toolName}' is no longer available` },
+			});
+			return;
+		}
+		if (pending.restored && isManagementTool) {
+			this.dispatchToolCompletion(pending, {
+				success: false,
+				pastTenseMessage: `Interrupted ${pending.toolName}`,
+				error: { message: 'Channel management tool calls are not resumed across bridge restarts' },
 			});
 			return;
 		}
@@ -445,7 +588,9 @@ export class ChannelBridge {
 		if (!this.isCurrentTool(pending)) {
 			return;
 		}
-		const result = await raceAbort(this.options.channel.callTool(pending.toolName, args, signal), signal);
+		const result = isChannelTool
+			? await raceAbort(this.options.channel.callTool(pending.toolName, args, signal), signal)
+			: await this.options.management!.callTool(pending.toolName, args, signal);
 		if (this.isCurrentTool(pending)) {
 			this.dispatchToolCompletion(pending, result);
 		}
@@ -473,7 +618,76 @@ export class ChannelBridge {
 			result,
 		});
 		this.cancelTool(pending);
-		this.options.onStatus?.(`${result.success ? 'completed' : 'failed'} channel tool ${pending.toolName}`);
+		this.options.status?.report(`${result.success ? 'completed' : 'failed'} channel tool ${pending.toolName}`);
+	}
+
+	private checkHandoffReadiness(): void {
+		const pending = this.pendingHandoff;
+		if (!pending || pending.readiness || this.busy) {
+			return;
+		}
+		const readiness = this.resolveHandoffReadiness(pending);
+		pending.readiness = readiness;
+		void readiness.catch(error => this.resolveEventFailure(toError('handoff readiness', error)));
+	}
+
+	private async resolveHandoffReadiness(pending: PendingBridgeHandoff): Promise<void> {
+		await this.drainEventHandlers();
+		while (this.inFlightToolExecutions.size > 0) {
+			await Promise.allSettled([...this.inFlightToolExecutions]);
+		}
+		if (this.pendingHandoff === pending && !this.busy) {
+			pending.resolveReady();
+		} else if (this.pendingHandoff === pending) {
+			pending.readiness = undefined;
+		}
+	}
+
+	private async replayHeldEvents(
+		heldEventIds: Set<string>,
+		completion: ReplayCompletion,
+		includeExisting = false,
+	): Promise<void> {
+		const journal = this.options.eventJournal;
+		if (!journal) {
+			return;
+		}
+		const replayed = new Set<string>();
+		while (true) {
+			await this.drainEventHandlers();
+			const pendingEvents = await journal.pending();
+			for (const event of pendingEvents) {
+				if (replayed.has(event.id) || (!includeExisting && !heldEventIds.has(event.id))) {
+					continue;
+				}
+				replayed.add(event.id);
+				heldEventIds.delete(event.id);
+				this.dispatchChannelEvent(event.event, event.id);
+			}
+			if (this.inFlightEventHandlers.size === 0 && heldEventIds.size === 0) {
+				if (completion.kind === 'activation') {
+					this.activationState = 'active';
+				} else {
+					if (this.pendingHandoff !== completion.handoff) {
+						throw new Error(`Handoff ${completion.handoff.id} changed while held events were replaying`);
+					}
+					this.pendingHandoff = undefined;
+				}
+				this.acceptingEvents = true;
+				return;
+			}
+		}
+	}
+
+	private publishClient(): void {
+		const { client, clientId, session, channelInfo } = this.options;
+		const tools = combinedTools(channelInfo.tools, this.options.management?.tools ?? []);
+		publishActiveClient(client, session, {
+			clientId,
+			displayName: `ahp-channels (${channelInfo.name})`,
+			tools,
+			customizations: [...this.options.customizations],
+		});
 	}
 }
 
@@ -514,4 +728,16 @@ function journalEventIds(state: ChatState): string[] {
 		...(state.queuedMessages ?? []).map(message => readJournalEventId(message.message._meta)),
 	];
 	return ids.filter((id): id is string => id !== undefined);
+}
+
+function combinedTools(
+	channelTools: readonly ToolDefinition[],
+	managementTools: readonly ToolDefinition[],
+): ToolDefinition[] {
+	const names = new Set(channelTools.map(tool => tool.name));
+	const collisions = managementTools.filter(tool => names.has(tool.name)).map(tool => tool.name);
+	if (collisions.length > 0) {
+		throw new Error(`Channel plugin tool name conflicts with bridge management tool(s): ${collisions.join(', ')}`);
+	}
+	return [...channelTools, ...managementTools];
 }

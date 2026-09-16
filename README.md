@@ -17,9 +17,10 @@ npm run build
 node .\dist\cli.js plugin install fakechat@claude-plugins-official
 node .\dist\cli.js host discover
 node .\dist\cli.js host alias add local --host 0
-node .\dist\cli.js session list
+node .\dist\cli.js session list --host @local
 node .\dist\cli.js channel create fakechat --plugin fakechat --session <session-uri> --host @local
 node .\dist\cli.js channel start fakechat
+node .\dist\cli.js channel select fakechat
 ```
 
 The CLI stores configuration under `~/.ahp-channels` by default. Override this
@@ -264,10 +265,102 @@ ahp-channels channel status telegram
 ahp-channels channel upgrade telegram
 ahp-channels channel switch telegram --session <new-session-uri>
 ahp-channels channel select-host telegram --host @work
+ahp-channels channel handoff telegram --host @work --session <new-session-uri> --chat <new-chat-uri>
+ahp-channels channel select telegram
 ahp-channels channel stop telegram
 ahp-channels channel start telegram
 ahp-channels channel delete telegram
 ```
+
+### Discover and select existing sessions
+
+`session list` reads paginated AHP session catalogs. Without `--host`, it
+queries configured local host aliases; when no aliases exist, it retains the
+legacy automatic local-host behavior. Use `--host` for one explicit selector,
+`--limit` and the printed `--cursor` for pagination, and `--json` for the
+structured result:
+
+```powershell
+ahp-channels session list --limit 25
+ahp-channels session list --host @work --json
+ahp-channels session list --cursor <opaque-cursor>
+```
+
+Catalog entries include the exact session URI and only the title, provider,
+activity/status, project, and working-directory information supplied by AHP.
+Choices retain their configured preferred host and report the actual connected
+host separately. Duplicate titles remain distinct by host and URI. An empty
+catalog is reported differently from failed discovery; partial multi-host
+results include explicit per-host warnings.
+
+For a daemon-managed named channel, `channel select <name>` opens a searchable
+terminal picker. Enter `/text` to filter by title, provider, URI, host,
+activity, or workspace; choose a displayed number; select an exact chat or the
+session default; or enter `q` to cancel without changing the binding. The
+picker runs only when both stdin and stdout are terminals. Scripts and other
+noninteractive callers must use the explicit operation, which never prompts:
+
+```powershell
+ahp-channels channel handoff telegram `
+  --host @work `
+  --session ahp-session:/... `
+  --chat ahp-chat:/...
+```
+
+Omit `--chat` to preserve the destination session's default-chat semantics.
+Omit `--host` to preserve the channel's current preferred host. The handoff
+validates the destination host, exact existing session, and optional chat
+before stopping the source. Host, session, and chat are committed as one
+binding; the implementation never chains the older `switch` and `select-host`
+commands through an invalid intermediate combination. A failed destination
+start restores the previous persisted binding and runtime.
+
+Selection redirects future channel traffic. It does not create sessions,
+migrate or clone history, move agent work, or implicitly cancel a turn.
+Remote-host identity and credential management remain unsupported.
+
+### Ask the bound agent to redirect its channel
+
+Daemon-managed bridges contribute generic management tools alongside plugin
+tools:
+
+- `ahp_channels_list_sessions`
+- `ahp_channels_list_chats`
+- `ahp_channels_handoff`
+- `ahp_channels_handoff_status`
+- `ahp_channels_cancel_handoff`
+
+An agent can discover exact existing session/chat URIs and request a handoff
+in natural language. These are bridge management tools, not plugin tools.
+They do not receive the plugin-tool automatic approval. The Agent Host must
+authorize them through its normal tool permission policy; platform sender or
+admin metadata is not treated as authorization. A plugin tool with a
+management-tool name is rejected as an explicit collision.
+
+An agent-requested handoff returns `success: true` only after the daemon has
+validated and durably accepted a **pending** request. It does not claim the
+binding has already changed. The source bridge then:
+
+1. durably holds newly arriving external messages in its delivery journal;
+2. allows the source turn and any in-flight ordinary channel tools to finish;
+3. applies the host, session, and optional chat together at that safe boundary;
+4. replays held messages to the destination, or back to the restored source
+   after cancellation or rollback.
+
+The first accepted request owns the pending slot. Conflicting handoffs are
+rejected, and only that source binding can cancel it before commit. A stale
+tool call from a replaced runtime cannot mutate the channel. If the daemon
+restarts first, it fails the pending request, restores the last committed
+source binding, and replays held messages there. `channel status` and
+`ahp_channels_handoff_status` report `pending`, `applied`, `failed`, or
+`cancelled` with the request ID and any sanitized failure.
+
+The same typed catalog and handoff contracts back the terminal and agent
+adapters. A future editor extension can use the authenticated daemon client
+contract and supply only editor UI plus a client adapter; it does not need to
+import terminal code, parse stdout, run another plugin process, duplicate the
+configuration store, or reimplement handoff policy. No VS Code extension or
+private editor integration is included today.
 
 `channel status <name>` reports both the runtime state and bridge-owned health:
 
@@ -427,6 +520,11 @@ For one-off foreground use, `channel run` remains available:
 ahp-channels channel run telegram --session <session-uri>
 ```
 
+Foreground channels remain owned by that terminal process. They do not publish
+agent management tools and cannot be silently converted into daemon-managed
+instances; stop the foreground process and create a named channel when durable
+terminal or agent handoff control is required.
+
 ## Development
 
 ```powershell
@@ -437,9 +535,25 @@ npm run test:package
 npm run e2e:local
 npm run e2e:daemon
 npm run e2e:fakechat
+npm run e2e:handoff
 npm run e2e:permissions
 npm run e2e:attachments
 ```
+
+### Cross-host handoff E2E
+
+`npm run e2e:handoff` starts two isolated deterministic Agent Hosts with
+different existing session and chat URIs plus a disposable MCP channel
+process. An external WebSocket message reaches the source session, the fixture
+agent calls the bridge handoff tool and receives a pending result, the source
+reply finishes through the plugin, and the daemon safely moves the binding.
+A second external message then reaches the destination session and its reply
+returns through the restarted plugin. Assertions use distinct markers and
+verify preferred host, actual host, session, and chat identities.
+
+This is deterministic fixture evidence, not a real-model or browser run. The
+harness uses isolated daemon, host, plugin, and external-channel state and
+removes all of it on success or failure.
 
 ### Official fakechat E2E
 

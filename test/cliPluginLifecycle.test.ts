@@ -13,6 +13,15 @@ afterEach(async () => {
 });
 
 describe('plugin lifecycle CLI', () => {
+	it('never waits for an interactive picker when standard input is noninteractive', async () => {
+		const root = await mkdtemp(join(tmpdir(), 'ahp-channels-cli-'));
+		temporaryDirectories.push(root);
+		await assert.rejects(
+			runCli(join(root, 'home'), ['channel', 'select', 'personal']),
+			/Interactive channel selection requires a terminal/,
+		);
+	});
+
 	it('pins channels until they explicitly upgrade', async () => {
 		const root = await mkdtemp(join(tmpdir(), 'ahp-channels-cli-'));
 		temporaryDirectories.push(root);

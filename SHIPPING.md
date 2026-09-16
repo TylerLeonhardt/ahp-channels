@@ -42,4 +42,8 @@
       approval and denial with fakechat.
 - [x] Document plugin process environments and restart requirements for
       environment-only configuration.
+- [x] Add paginated local-host session/chat selection and one safe
+      host/session/chat handoff shared by terminal and agent controls.
+- [x] Verify a pending agent-requested handoff across two isolated hosts,
+      including source and destination external-channel replies.
 - [ ] Publish `0.1.0` through OIDC and verify its registry provenance.

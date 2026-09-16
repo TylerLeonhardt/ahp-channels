@@ -1,12 +1,12 @@
-import type { ChatState, ListSessionsResult, ResourceReadParams, ResourceReadResult, SessionState, StateAction, SubscribeResult } from '@microsoft/agent-host-protocol';
-import type { DispatchHandle, ResourceRequestHandlers, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
-import {
-	AgentHostService,
-	HostAliasResolutionError,
-	isHostAliasSelector,
-} from './agentHosts.js';
-import { connectAgentHost, createChannelClientId, resolveChat } from './ahp.js';
+import type { ChatState } from '@microsoft/agent-host-protocol';
+import { randomUUID } from 'node:crypto';
+import { AgentHostService } from './agentHosts.js';
+import { createChannelClientId, resolveChat } from './ahp.js';
 import { ChannelBridge, publishActiveClient } from './bridge.js';
+import {
+	DaemonChannelManagementService,
+	type ChannelManagementService,
+} from './channelManagement.js';
 import {
 	ChannelOperationError,
 	recoveryGuidance,
@@ -15,7 +15,6 @@ import {
 } from './channelHealth.js';
 import type { ChannelInstanceConfig } from './config.js';
 import type { LogWriter } from './daemonLog.js';
-import type { AgentHostConnectionTarget, AgentHostEndpoint } from './endpoints.js';
 import { FileChannelEventJournal, type ChannelEventJournal } from './eventJournal.js';
 import { McpChannelProcess, type McpChannelClient, type StartedMcpChannel } from './mcpChannel.js';
 import { createPluginResourceRequestHandlers } from './pluginResources.js';
@@ -28,6 +27,22 @@ import {
 	type ClaudePlugin,
 	type StdioMcpServerConfig,
 } from './plugins.js';
+import {
+	SessionCatalogService,
+	SessionHostResolutionError,
+	type ChannelBindingTarget,
+	type ChatDiscoveryRequest,
+	type ChatDiscoveryResult,
+	type OpenedSession,
+	type OpenSessionRequest,
+	type ResolvedChannelBinding,
+	type SessionDiscoveryRequest,
+	type SessionDiscoveryResult,
+	type SessionCatalogHostClient,
+	type SessionCatalogHostConnection,
+	type SessionCatalogSubscription,
+} from './sessionCatalog.js';
+import type { StatusReporter } from './status.js';
 
 export interface ChannelRuntimeSnapshot {
 	readonly name: string;
@@ -38,41 +53,29 @@ export interface ChannelRuntimeSnapshot {
 	readonly clientId: string;
 	readonly channelName: string;
 	readonly startedAt: string;
+	readonly bindingId: string;
 	readonly busy: boolean;
 	readonly mode: 'mcp' | 'customization-only';
 }
 
 export interface ChannelRuntimeServices {
 	resolvePlugin(nameOrPath: string, installation?: string): Promise<ClaudePlugin>;
-	discoverAgentHosts(): Promise<readonly AgentHostEndpoint[]>;
-	resolveAgentHost(selector: string): Promise<AgentHostConnectionTarget>;
-	connectAgentHost(target: AgentHostConnectionTarget, clientId: string): Promise<ChannelHostConnection>;
+	readonly sessionCatalog: ChannelSessionCatalog;
+	readonly management?: ChannelManagementService;
 	createMcpChannel(config: StdioMcpServerConfig): McpChannelClient;
 	createEventJournal?(name: string): ChannelEventJournal;
 }
 
-export interface ChannelSubscription extends AsyncIterable<SubscriptionEvent> {
-	close(): Promise<void>;
+export interface ChannelSessionCatalog {
+	discoverSessions(request: SessionDiscoveryRequest, signal?: AbortSignal): Promise<SessionDiscoveryResult>;
+	discoverChats(request: ChatDiscoveryRequest, signal?: AbortSignal): Promise<ChatDiscoveryResult>;
+	openSession(target: OpenSessionRequest, signal?: AbortSignal): Promise<OpenedSession>;
+	validateBinding(target: ChannelBindingTarget, signal?: AbortSignal): Promise<ResolvedChannelBinding>;
 }
 
-export interface ChannelHostClient {
-	dispatch(channel: string, action: StateAction, clientSeq?: number): DispatchHandle;
-	setResourceRequestHandlers(handlers: ResourceRequestHandlers | null): void;
-	request(method: 'listSessions', params: {
-		readonly channel: 'ahp-root://';
-		readonly cursor?: string;
-		readonly limit?: number;
-	}): Promise<ListSessionsResult>;
-	request(method: 'resourceRead', params: ResourceReadParams): Promise<ResourceReadResult>;
-	subscribe(uri: string): Promise<{ result: SubscribeResult; subscription: ChannelSubscription }>;
-	unsubscribe(uri: string): Promise<void>;
-	shutdown(): Promise<void>;
-}
-
-export interface ChannelHostConnection {
-	readonly client: ChannelHostClient;
-	readonly clientId: string;
-}
+export type ChannelSubscription = SessionCatalogSubscription;
+export type ChannelHostClient = SessionCatalogHostClient;
+export type ChannelHostConnection = SessionCatalogHostConnection;
 
 export interface ChannelRuntimeServiceOptions {
 	readonly home?: string;
@@ -85,11 +88,11 @@ export function createChannelRuntimeServices(
 	options: ChannelRuntimeServiceOptions = {},
 ): ChannelRuntimeServices {
 	const { home, stderr } = options;
+	const sessionCatalog = new SessionCatalogService(agentHosts);
 	return {
 		resolvePlugin: (nameOrPath, installation) => plugins.resolvePlugin(nameOrPath, installation),
-		discoverAgentHosts: () => agentHosts.discover(),
-		resolveAgentHost: selector => agentHosts.resolve(selector),
-		connectAgentHost: async (target, clientId) => connectAgentHost(target, clientId),
+		sessionCatalog,
+		...(home ? { management: new DaemonChannelManagementService(home) } : {}),
 		createMcpChannel: config => new McpChannelProcess(config, stderr),
 		...(home ? { createEventJournal: (name: string) => new FileChannelEventJournal(home, name) } : {}),
 	};
@@ -102,6 +105,7 @@ export async function validateChannelDefinition(plugins: PluginManager, definiti
 
 export class ChannelRuntime {
 	private closePromise: Promise<void> | undefined;
+	private lifecycle: 'prepared' | 'active' | 'closed';
 
 	private constructor(
 		readonly name: string,
@@ -110,19 +114,43 @@ export class ChannelRuntime {
 		private readonly sessionSubscription: ChannelSubscription,
 		private readonly bridge: ChannelBridge,
 		private readonly mcpWhenStopped: Promise<void>,
-		private readonly hostTarget: AgentHostConnectionTarget,
+		private readonly host: string,
 		private readonly channelInfo: StartedMcpChannel,
 		private readonly chat: string,
 		private readonly startedAt: string,
+		private readonly bindingId: string,
+		lifecycle: 'prepared' | 'active',
 		readonly startupFailure?: ChannelOperationError,
-	) { }
+	) {
+		this.lifecycle = lifecycle;
+	}
 
-	static async start(
+	static start(
 		name: string,
 		definition: ChannelInstanceConfig,
 		services: ChannelRuntimeServices,
-		onStatus?: (message: string) => void,
+		status?: StatusReporter,
 	): Promise<ChannelRuntime> {
+		return this.create(name, definition, services, 'active', status);
+	}
+
+	static prepare(
+		name: string,
+		definition: ChannelInstanceConfig,
+		services: ChannelRuntimeServices,
+		status?: StatusReporter,
+	): Promise<ChannelRuntime> {
+		return this.create(name, definition, services, 'prepared', status);
+	}
+
+	private static async create(
+		name: string,
+		definition: ChannelInstanceConfig,
+		services: ChannelRuntimeServices,
+		activation: 'prepared' | 'active',
+		status?: StatusReporter,
+	): Promise<ChannelRuntime> {
+		const bindingId = randomUUID();
 		let connection: ChannelHostConnection | undefined;
 		let sessionSubscription: ChannelSubscription | undefined;
 		let chatSubscription: Awaited<ReturnType<ChannelHostClient['subscribe']>> | undefined;
@@ -142,25 +170,16 @@ export class ChannelRuntime {
 				throw operationError('plugin-loading', error);
 			}
 			const clientId = definition.clientId ?? createChannelClientId(name, definition.session);
-			let candidates: readonly HostCandidate[];
+			let connected: OpenedSession;
 			try {
-				candidates = await resolveHostCandidates(services, definition, onStatus);
+				connected = await services.sessionCatalog.openSession({ ...definition, clientId });
 			} catch (error) {
-				throw operationError('agent-host-discovery', error);
-			}
-			let connected: Awaited<ReturnType<typeof connectOwningHost>>;
-			try {
-				connected = await connectOwningHost(
-					services,
-					candidates,
-					definition,
-					clientId,
-					onStatus,
-				);
-			} catch (error) {
-				throw operationError('agent-host-connection', error);
+				throw operationError(sessionFailureStage(error), error);
 			}
 			connection = connected.connection;
+			for (const warning of connected.warnings) {
+				status?.report(warning);
+			}
 			try {
 				connection.client.setResourceRequestHandlers(
 					await createPluginResourceRequestHandlers(plugin.path),
@@ -169,7 +188,6 @@ export class ChannelRuntime {
 				throw operationError('plugin-loading', error);
 			}
 			sessionSubscription = connected.subscription;
-			const hostTarget = connected.target;
 			let chat: string;
 			try {
 				chat = resolveChat(connected.state, definition.chat, definition.session);
@@ -180,6 +198,13 @@ export class ChannelRuntime {
 			} catch (error) {
 				throw operationError('session-resolution', error);
 			}
+			const management = services.management?.bind({
+				channel: name,
+				bindingId,
+				...(definition.host ? { preferredHost: definition.host } : {}),
+				session: definition.session,
+				chat,
+			});
 
 			let customization: ReturnType<typeof createPluginCustomization>;
 			try {
@@ -192,12 +217,14 @@ export class ChannelRuntime {
 			} catch (error) {
 				throw operationError('plugin-loading', error);
 			}
-			publishActiveClient(connection.client, definition.session, {
-				clientId: connection.clientId,
-				displayName: `ahp-channels (${plugin.name})`,
-				tools: [],
-				customizations: [customization],
-			});
+			if (activation === 'active') {
+				publishActiveClient(connection.client, definition.session, {
+					clientId: connection.clientId,
+					displayName: `ahp-channels (${plugin.name})`,
+					tools: [...(management?.tools ?? [])],
+					customizations: [customization],
+				});
+			}
 			mcp = services.createMcpChannel(server.config);
 			let channelInfo: StartedMcpChannel;
 			let startupFailure: ChannelOperationError | undefined;
@@ -210,7 +237,10 @@ export class ChannelRuntime {
 					'mcp-startup',
 					new AggregateError(errors, errors.map(candidate => candidate.message).join('; ')),
 				);
-				onStatus?.(startupFailure.message);
+				status?.report(startupFailure.message);
+				if (activation === 'prepared') {
+					throw startupFailure;
+				}
 				mcp = new CustomizationOnlyChannel(plugin.name);
 				channelInfo = await mcp.start();
 			}
@@ -223,11 +253,16 @@ export class ChannelRuntime {
 				chatSubscription: chatSubscription.subscription,
 				channel: mcp,
 				channelInfo,
+				...(management ? { management } : {}),
 				customizations: [customization],
 				eventJournal: services.createEventJournal?.(name),
-				onStatus,
+				...(status ? { status } : {}),
 			});
-			await bridge.start();
+			if (activation === 'prepared') {
+				await bridge.startPaused();
+			} else {
+				await bridge.start();
+			}
 			return new ChannelRuntime(
 				name,
 				definition,
@@ -235,10 +270,12 @@ export class ChannelRuntime {
 				sessionSubscription,
 				bridge,
 				mcp.whenStopped,
-				hostTarget,
+				connected.host.actual,
 				channelInfo,
 				chat,
 				new Date().toISOString(),
+				bindingId,
+				activation,
 				startupFailure,
 			);
 		} catch (error) {
@@ -271,10 +308,11 @@ export class ChannelRuntime {
 			plugin: this.definition.plugin,
 			session: this.definition.session,
 			chat: this.chat,
-			host: this.hostTarget.id,
+			host: this.host,
 			clientId: this.connection.clientId,
 			channelName: this.channelInfo.name,
 			startedAt: this.startedAt,
+			bindingId: this.bindingId,
 			busy: this.bridge.busy,
 			mode: this.startupFailure ? 'customization-only' : 'mcp',
 		};
@@ -288,12 +326,40 @@ export class ChannelRuntime {
 		return this.bridge.quiesce();
 	}
 
+	beginHandoff(id: string): void {
+		this.bridge.beginHandoff(id);
+	}
+
+	waitForHandoffReady(id: string, signal: AbortSignal): Promise<void> {
+		return this.bridge.waitForHandoffReady(id, signal);
+	}
+
+	cancelHandoff(id: string): Promise<void> {
+		return this.bridge.cancelHandoff(id);
+	}
+
+	quiesceHandoff(id: string): Promise<boolean> {
+		return this.bridge.quiesceHandoff(id);
+	}
+
+	async activate(): Promise<void> {
+		if (this.lifecycle === 'active') {
+			return;
+		}
+		if (this.lifecycle !== 'prepared') {
+			throw new Error(`Cannot activate channel '${this.name}' in state '${this.lifecycle}'`);
+		}
+		await this.bridge.activate();
+		this.lifecycle = 'active';
+	}
+
 	async close(): Promise<void> {
 		this.closePromise ??= this.doClose();
 		return this.closePromise;
 	}
 
 	private async doClose(): Promise<void> {
+		this.lifecycle = 'closed';
 		const errors: Error[] = [];
 		await cleanup('bridge', () => this.bridge.close(), errors);
 		await cleanup('session subscription', () => this.sessionSubscription.close(), errors);
@@ -327,168 +393,18 @@ class CustomizationOnlyChannel implements McpChannelClient {
 	}
 }
 
-interface HostCandidate {
-	readonly target: AgentHostConnectionTarget;
-	readonly fallback: boolean;
-	readonly verifySessionCatalog: boolean;
-}
-
-async function resolveHostCandidates(
-	services: ChannelRuntimeServices,
-	definition: ChannelInstanceConfig,
-	onStatus?: (message: string) => void,
-): Promise<readonly HostCandidate[]> {
-	if (!definition.host) {
-		const endpoints = await services.discoverAgentHosts();
-		if (endpoints.length === 0) {
-			throw new Error('No running local Agent Host endpoints were discovered');
-		}
-		return endpoints.map(target => ({
-			target,
-			fallback: false,
-			verifySessionCatalog: true,
-		}));
+function sessionFailureStage(error: unknown): ChannelFailureStage {
+	if (!(error instanceof SessionHostResolutionError)) {
+		return 'agent-host-connection';
 	}
-
-	if (!isHostAliasSelector(definition.host)) {
-		return [{
-			target: await services.resolveAgentHost(definition.host),
-			fallback: false,
-			verifySessionCatalog: false,
-		}];
+	switch (error.stage) {
+		case 'discovery':
+			return 'agent-host-discovery';
+		case 'connection':
+			return 'agent-host-connection';
+		case 'session':
+			return 'session-resolution';
 	}
-
-	let preferred: AgentHostConnectionTarget | undefined;
-	try {
-		preferred = await services.resolveAgentHost(definition.host);
-	} catch (error) {
-		if (!(error instanceof HostAliasResolutionError) || error.code !== 'unavailable') {
-			throw error;
-		}
-		onStatus?.(`${error.message}; searching other local Agent Hosts for the bound session`);
-	}
-
-	let fallbackEndpoints: readonly AgentHostEndpoint[] = [];
-	try {
-		fallbackEndpoints = await services.discoverAgentHosts();
-	} catch (error) {
-		if (!preferred) {
-			throw error;
-		}
-		onStatus?.(`Local Agent Host fallback discovery failed: ${sanitizeErrorSummary(errorMessage(error))}`);
-	}
-
-	const candidates: HostCandidate[] = [];
-	if (preferred) {
-		candidates.push({
-			target: preferred,
-			fallback: false,
-			verifySessionCatalog: false,
-		});
-	}
-	for (const target of fallbackEndpoints) {
-		if (target.id === preferred?.id) {
-			continue;
-		}
-		candidates.push({
-			target,
-			fallback: true,
-			verifySessionCatalog: true,
-		});
-	}
-	if (candidates.length === 0) {
-		throw new Error(`Host alias '${definition.host}' is unavailable and no fallback Agent Hosts were discovered`);
-	}
-	return candidates;
-}
-
-async function connectOwningHost(
-	services: ChannelRuntimeServices,
-	candidates: readonly HostCandidate[],
-	definition: ChannelInstanceConfig,
-	clientId: string,
-	onStatus?: (message: string) => void,
-): Promise<{
-	readonly target: AgentHostConnectionTarget;
-	readonly connection: ChannelHostConnection;
-	readonly subscription: ChannelSubscription;
-	readonly state: SessionState;
-}> {
-	if (candidates.length === 0) {
-		throw new Error('No Agent Host connection candidates were resolved');
-	}
-	const errors: Error[] = [];
-	let failureStage: ChannelFailureStage = 'agent-host-connection';
-	for (const candidate of candidates) {
-		const { target } = candidate;
-		let connection: ChannelHostConnection | undefined;
-		let subscription: ChannelSubscription | undefined;
-		try {
-			try {
-				connection = await services.connectAgentHost(target, clientId);
-			} catch (error) {
-				throw operationError('agent-host-connection', error);
-			}
-			try {
-				if (candidate.verifySessionCatalog && !await hostHasSession(connection.client, definition.session)) {
-					throw new Error('Session is not present in this Agent Host catalog');
-				}
-				const subscribed = await connection.client.subscribe(definition.session);
-				subscription = subscribed.subscription;
-				if (!subscribed.result.snapshot) {
-					throw new Error('Agent Host returned no session state snapshot');
-				}
-				if (candidate.fallback && definition.host) {
-					onStatus?.(`Host alias '${definition.host}' did not connect; using local fallback ${target.id} for ${definition.session}`);
-				}
-				return {
-					target,
-					connection,
-					subscription,
-					state: subscribed.result.snapshot.state as SessionState,
-				};
-			} catch (error) {
-				throw operationError('session-resolution', error);
-			}
-		} catch (error) {
-			if (error instanceof ChannelOperationError && error.stage === 'session-resolution') {
-				failureStage = 'session-resolution';
-			}
-			errors.push(toError(target.id, error));
-			await cleanup(target.id, () => subscription?.close(), errors);
-			await cleanup(target.id, () => connection?.client.shutdown(), errors);
-		}
-	}
-	throw new ChannelOperationError(
-		failureStage,
-		`No Agent Host candidate owns session ${definition.session}: ${errors.map(error => error.message).join('; ')}`,
-		recoveryGuidance(failureStage),
-		{ cause: new AggregateError(errors) },
-	);
-}
-
-async function hostHasSession(client: ChannelHostClient, session: string): Promise<boolean> {
-	const seenCursors = new Set<string>();
-	let cursor: string | undefined;
-	for (let page = 0; page < 100; page++) {
-		const result = await client.request('listSessions', {
-			channel: 'ahp-root://',
-			limit: 100,
-			...(cursor ? { cursor } : {}),
-		});
-		if (result.items.some(candidate => candidate.resource === session)) {
-			return true;
-		}
-		if (!result.nextCursor) {
-			return false;
-		}
-		if (seenCursors.has(result.nextCursor)) {
-			throw new Error('Agent Host returned a repeated session cursor');
-		}
-		seenCursors.add(result.nextCursor);
-		cursor = result.nextCursor;
-	}
-	throw new Error('Agent Host session catalog exceeded 100 pages');
 }
 
 function operationError(stage: ChannelFailureStage, error: unknown): ChannelOperationError {

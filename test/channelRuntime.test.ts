@@ -15,14 +15,19 @@ import { describe, it } from 'node:test';
 import {
 	ChannelRuntime,
 	type ChannelHostClient,
+	type ChannelSessionCatalog,
 	type ChannelRuntimeServices,
 	type ChannelSubscription,
 } from '../src/channelRuntime.js';
 import { ChannelOperationError } from '../src/channelHealth.js';
-import { HostAliasResolutionError } from '../src/agentHosts.js';
-import { selectAgentHost, type AgentHostEndpoint } from '../src/endpoints.js';
+import type { AgentHostEndpoint } from '../src/endpoints.js';
 import type { McpChannelClient, StartedMcpChannel } from '../src/mcpChannel.js';
 import { PluginIntegrityError, PluginLoadingError } from '../src/plugins.js';
+import {
+	SessionHostResolutionError,
+	type OpenedSession,
+	type OpenSessionRequest,
+} from '../src/sessionCatalog.js';
 
 const sessionUri = 'ahp-session:/session';
 const chatUri = 'ahp-chat:/chat';
@@ -165,6 +170,55 @@ class TestHostClient implements ChannelHostClient {
 	}
 }
 
+class TestSessionCatalog implements ChannelSessionCatalog {
+	openSessionHook: ((target: OpenSessionRequest) => Promise<OpenedSession>) | undefined;
+
+	constructor(private readonly client: TestHostClient) { }
+
+	async openSession(target: OpenSessionRequest): Promise<OpenedSession> {
+		if (this.openSessionHook) {
+			return this.openSessionHook(target);
+		}
+		if (!this.client.sessionAvailable) {
+			throw new SessionHostResolutionError('session', `No Agent Host candidate owns session ${target.session}`);
+		}
+		let subscribed: Awaited<ReturnType<TestHostClient['subscribe']>>;
+		try {
+			subscribed = await this.client.subscribe(target.session);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new SessionHostResolutionError(
+				'session',
+				message.replace('host-reported-secret', '[redacted]'),
+				{ cause: error },
+			);
+		}
+		if (!subscribed.result.snapshot) {
+			await subscribed.subscription.close();
+			throw new SessionHostResolutionError('session', 'Agent Host returned no valid session state snapshot');
+		}
+		return {
+			host: { ...(target.host ? { preferred: target.host } : {}), actual: endpoint.id, fallback: false },
+			connection: { client: this.client, clientId: 'client' },
+			subscription: subscribed.subscription,
+			state: subscribed.result.snapshot.state as SessionState,
+			warnings: [],
+		};
+	}
+
+	async discoverSessions(): Promise<never> {
+		throw new Error('Unexpected session discovery');
+	}
+
+	async discoverChats(): Promise<never> {
+		throw new Error('Unexpected chat discovery');
+	}
+
+	async validateBinding(): Promise<never> {
+		throw new Error('Unexpected binding validation');
+	}
+}
+
 class TestMcpChannel implements McpChannelClient {
 	closed = false;
 	private resolveStopped!: () => void;
@@ -235,6 +289,7 @@ describe('ChannelRuntime', () => {
 				clientId: 'client',
 				channelName: 'fake-channel',
 				startedAt: snapshot.startedAt,
+				bindingId: snapshot.bindingId,
 				busy: false,
 				mode: 'mcp',
 			},
@@ -283,6 +338,7 @@ describe('ChannelRuntime', () => {
 				clientId: 'client',
 				channelName: 'fake',
 				startedAt: runtime.snapshot.startedAt,
+				bindingId: runtime.snapshot.bindingId,
 				busy: false,
 				mode: 'customization-only',
 			},
@@ -300,29 +356,48 @@ describe('ChannelRuntime', () => {
 		assert.equal(client.shutDown, true);
 	});
 
-	it('finds the session owner when the newest Agent Host does not have it', async () => {
+	it('prepares a healthy replacement without publishing it until activation', async () => {
+		const client = new TestHostClient();
+		const runtime = await ChannelRuntime.prepare('personal', {
+			plugin: 'fake',
+			session: sessionUri,
+			enabled: true,
+		}, createServices(client, new TestMcpChannel()));
+		assert.equal(client.dispatched.some(item =>
+			item.action.type === ActionType.SessionActiveClientSet
+		), false);
+
+		await runtime.activate();
+		assert.equal(client.dispatched.some(item =>
+			item.action.type === ActionType.SessionActiveClientSet
+		), true);
+		await runtime.close();
+	});
+
+	it('rejects a prepared replacement whose channel process cannot start', async () => {
+		const client = new TestHostClient();
+		await assert.rejects(
+			ChannelRuntime.prepare('personal', {
+				plugin: 'fake',
+				session: sessionUri,
+				enabled: true,
+			}, createServices(client, new TestMcpChannel(new Error('missing destination credential')))),
+			(error: unknown) => error instanceof ChannelOperationError
+				&& error.stage === 'mcp-startup'
+				&& /missing destination credential/.test(error.message),
+		);
+		assert.equal(client.dispatched.some(item =>
+			item.action.type === ActionType.SessionActiveClientSet
+		), false);
+		assert.equal(client.shutDown, true);
+	});
+
+	it('uses the session owner selected by the shared catalog service', async () => {
 		const client = new TestHostClient();
 		const mcp = new TestMcpChannel();
 		const services = createServices(client, mcp);
-		const wrongEndpoint: AgentHostEndpoint = {
-			...endpoint,
-			id: 'editor:2:wrong',
-			type: 'editor',
-			endpoint: { type: 'socket', path: 'wrong' },
-		};
-		services.discoverAgentHosts = async () => [wrongEndpoint, endpoint];
-		const attempted: string[] = [];
-		services.connectAgentHost = async (candidate, clientId) => {
-			attempted.push(candidate.id);
-			return {
-				client: candidate === wrongEndpoint
-					? Object.assign(new TestHostClient(), {
-						sessionAvailable: false,
-					})
-					: client,
-				clientId,
-			};
-		};
+		services.sessionCatalog.openSessionHook = target =>
+			openTestSession(client, target, 'editor:3:owner');
 
 		const runtime = await ChannelRuntime.start('personal', {
 			plugin: 'fake',
@@ -330,46 +405,23 @@ describe('ChannelRuntime', () => {
 			enabled: true,
 		}, services);
 		try {
-			assert.deepEqual({
-				attempted,
-				host: runtime.snapshot.host,
-			}, {
-				attempted: [wrongEndpoint.id, endpoint.id],
-				host: endpoint.id,
-			});
+			assert.equal(runtime.snapshot.host, 'editor:3:owner');
 		} finally {
 			await runtime.close();
 		}
 	});
 
 	it('prefers an alias and falls back only to a local host owning the bound session', async () => {
-		const preferredClient = new TestHostClient();
-		preferredClient.sessionSnapshotAvailable = false;
-		const wrongClient = new TestHostClient();
-		wrongClient.sessionAvailable = false;
 		const fallbackClient = new TestHostClient();
 		const mcp = new TestMcpChannel();
-		const services = createServices(preferredClient, mcp);
-		const preferred = { ...endpoint, id: 'standalone:1:preferred' };
-		const wrong = { ...endpoint, id: 'editor:2:wrong', type: 'editor' as const };
-		const fallback = { ...endpoint, id: 'editor:3:fallback', type: 'editor' as const };
-		services.resolveAgentHost = async selector => {
-			assert.equal(selector, '@work');
-			return preferred;
-		};
-		services.discoverAgentHosts = async () => [wrong, fallback];
-		const attempted: string[] = [];
-		services.connectAgentHost = async (candidate, clientId) => {
-			attempted.push(candidate.id);
-			return {
-				client: candidate.id === preferred.id
-					? preferredClient
-					: candidate.id === wrong.id
-						? wrongClient
-						: fallbackClient,
-				clientId,
-			};
-		};
+		const services = createServices(fallbackClient, mcp);
+		services.sessionCatalog.openSessionHook = target => openTestSession(
+			fallbackClient,
+			target,
+			'editor:3:fallback',
+			["Host alias '@work' did not connect; using local fallback editor:3:fallback for ahp-session:/session"],
+			true,
+		);
 		const statuses: string[] = [];
 
 		const runtime = await ChannelRuntime.start('personal', {
@@ -378,10 +430,9 @@ describe('ChannelRuntime', () => {
 			chat: chatUri,
 			host: '@work',
 			enabled: true,
-		}, services, message => statuses.push(message));
+		}, services, { report: message => statuses.push(message) });
 		try {
-			assert.deepEqual(attempted, [preferred.id, wrong.id, fallback.id]);
-			assert.equal(runtime.snapshot.host, fallback.id);
+			assert.equal(runtime.snapshot.host, 'editor:3:fallback');
 			assert.equal(runtime.snapshot.session, sessionUri);
 			assert.equal(runtime.snapshot.chat, chatUri);
 			assert.ok(statuses.some(message => /using local fallback/.test(message)));
@@ -392,26 +443,25 @@ describe('ChannelRuntime', () => {
 
 	it('falls back when an alias is unavailable but rejects ambiguous aliases', async () => {
 		const services = createServices(new TestHostClient(), new TestMcpChannel());
-		services.resolveAgentHost = async () => {
-			throw new HostAliasResolutionError('unavailable', "Host alias '@work' is unavailable");
-		};
+		services.sessionCatalog.openSessionHook = target => openTestSession(
+			new TestHostClient(),
+			target,
+			endpoint.id,
+			["Host alias '@work' is unavailable; searching other local Agent Hosts for the bound session"],
+			true,
+		);
 		const statuses: string[] = [];
 		const runtime = await ChannelRuntime.start('personal', {
 			plugin: 'fake',
 			session: sessionUri,
 			host: '@work',
 			enabled: true,
-		}, services, message => statuses.push(message));
+		}, services, { report: message => statuses.push(message) });
 		await runtime.close();
 		assert.ok(statuses.some(message => /searching other local Agent Hosts/.test(message)));
 
-		let discovered = false;
-		services.resolveAgentHost = async () => {
-			throw new HostAliasResolutionError('ambiguous', "Host alias '@work' is ambiguous");
-		};
-		services.discoverAgentHosts = async () => {
-			discovered = true;
-			return [endpoint];
+		services.sessionCatalog.openSessionHook = async () => {
+			throw new SessionHostResolutionError('discovery', "Host alias '@work' is ambiguous");
 		};
 		await assert.rejects(
 			ChannelRuntime.start('personal', {
@@ -424,7 +474,6 @@ describe('ChannelRuntime', () => {
 				&& error.stage === 'agent-host-discovery'
 				&& /ambiguous/.test(error.message),
 		);
-		assert.equal(discovered, false);
 	});
 
 	it('cleans up when the chat snapshot is unavailable', async () => {
@@ -458,8 +507,8 @@ describe('ChannelRuntime', () => {
 
 	it('categorizes Agent Host discovery at its operation boundary', async () => {
 			const services = createServices(new TestHostClient(), new TestMcpChannel());
-			services.discoverAgentHosts = async () => {
-				throw new Error('registry unavailable');
+			services.sessionCatalog.openSessionHook = async () => {
+				throw new SessionHostResolutionError('discovery', 'registry unavailable');
 			};
 
 			await assert.rejects(
@@ -530,7 +579,11 @@ describe('ChannelRuntime', () => {
 	});
 });
 
-function createServices(client: TestHostClient, mcp: TestMcpChannel): ChannelRuntimeServices {
+interface TestRuntimeServices extends ChannelRuntimeServices {
+	readonly sessionCatalog: TestSessionCatalog;
+}
+
+function createServices(client: TestHostClient, mcp: TestMcpChannel): TestRuntimeServices {
 	return {
 		async resolvePlugin() {
 			return {
@@ -541,18 +594,32 @@ function createServices(client: TestHostClient, mcp: TestMcpChannel): ChannelRun
 				},
 			};
 		},
-		async discoverAgentHosts() {
-			return [endpoint];
-		},
-		async resolveAgentHost(selector) {
-			return selectAgentHost([endpoint], selector);
-		},
-		async connectAgentHost(_endpoint, clientId) {
-			assert.match(clientId, /^[a-f0-9-]+$/);
-			return { client, clientId: 'client' };
-		},
+		sessionCatalog: new TestSessionCatalog(client),
 		createMcpChannel() {
 			return mcp;
 		},
+	};
+}
+
+async function openTestSession(
+	client: TestHostClient,
+	target: OpenSessionRequest,
+	actualHost: string,
+	warnings: readonly string[] = [],
+	fallback = false,
+): Promise<OpenedSession> {
+	assert.match(target.clientId ?? '', /^[a-f0-9-]+$/);
+	const subscribed = await client.subscribe(target.session);
+	assert.ok(subscribed.result.snapshot);
+	return {
+		host: {
+			...(target.host ? { preferred: target.host } : {}),
+			actual: actualHost,
+			fallback,
+		},
+		connection: { client, clientId: 'client' },
+		subscription: subscribed.subscription,
+		state: subscribed.result.snapshot.state as SessionState,
+		warnings,
 	};
 }
