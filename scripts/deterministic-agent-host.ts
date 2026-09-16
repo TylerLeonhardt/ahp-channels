@@ -32,7 +32,8 @@ import {
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
-import { dirname, join, relative } from 'node:path';
+import { homedir } from 'node:os';
+import { join, relative } from 'node:path';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import {
 	ATTACHMENT_FIXTURE_VERSION,
@@ -159,7 +160,9 @@ export class DeterministicAgentHost {
 		this.peers.add(peer);
 		socket.on('message', data => {
 			void this.handleMessage(peer, data).catch(error => {
-				socket.close(1011, error instanceof Error ? error.message : String(error));
+				console.error('[deterministic-agent-host] Message handling failed:', error);
+				// WebSocket close reasons are limited to 123 UTF-8 bytes.
+				socket.close(1011, 'Message handling failed');
 			});
 		});
 		socket.once('close', () => this.removePeer(peer));
@@ -621,7 +624,7 @@ export class DeterministicAgentHost {
 		this.publishAction(chat, {
 			type: ActionType.ChatToolCallComplete,
 			turnId, toolCallId,
-			result: await readFixtureSharedAttachment(scenario, this.registryDirectory),
+			result: await readFixtureSharedAttachment(scenario),
 		});
 		this.startAttachmentTool(hosted, chat, turnId, scenario, 'return');
 	}
@@ -815,8 +818,8 @@ export class DeterministicAgentHost {
 	}
 }
 
-async function readFixtureSharedAttachment(scenario: AttachmentScenario, registryDirectory: string): Promise<ToolCallResult> {
-	const inbox = await realpath(join(dirname(registryDirectory), 'user-home', '.claude', 'channels', 'fakechat', 'inbox'));
+async function readFixtureSharedAttachment(scenario: AttachmentScenario): Promise<ToolCallResult> {
+	const inbox = await realpath(join(homedir(), '.claude', 'channels', 'fakechat', 'inbox'));
 	const path = await realpath(requireString(scenario.sharedPath, 'official shared upload path'));
 	assert.match(relative(inbox, path), /^\d+\.txt$/, 'The fixture host must not read outside its own official inbox');
 	const bytes = await readFile(path);

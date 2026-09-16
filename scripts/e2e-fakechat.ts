@@ -14,10 +14,11 @@ import {
 import type { Subscription, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import WebSocket, { type RawData } from 'ws';
 import { connectAgentHost, resolveChat, type ConnectedAgentHost } from '../src/ahp.js';
 import { ensureDaemonStarted, probeDaemon, requestDaemon, stopDaemon } from '../src/daemonClient.js';
@@ -39,8 +40,10 @@ if (permissionMode && attachmentMode) {
 	throw new Error('Choose either --permissions or --attachments, not both');
 }
 
-const testRoot = join(repositoryRoot, '.ahp-channels', `fakechat-e2e-${randomUUID()}`);
-const fakeHome = join(testRoot, 'user-home');
+// Keep the daemon's Unix socket independent of the checkout path length.
+const testRoot = await mkdtemp(join(tmpdir(), 'ahp-fc-'));
+const workspace = join(testRoot, 'workspace');
+const fakeHome = join(workspace, 'user-home');
 const bunCache = join(testRoot, 'bun-cache');
 const session = `ahp-session:/${randomUUID()}`;
 const sockets = new Set<WebSocket>();
@@ -55,7 +58,6 @@ let chatSubscription: Subscription | undefined;
 let primaryError: unknown;
 
 try {
-	await mkdir(testRoot, { recursive: true });
 	await requireBun();
 	const port = await allocateLoopbackPort();
 	const fixtureRegistry = join(testRoot, 'agent-host-registry');
@@ -107,7 +109,11 @@ try {
 		throw new Error('The local Agent Host advertises no agent providers');
 	}
 
-	await client.request('createSession', { channel: session, provider });
+	await client.request('createSession', {
+		channel: session,
+		provider,
+		workingDirectories: [pathToFileURL(workspace).href],
+	});
 	sessionCreated = true;
 	const subscribedSession = await client.subscribe(session);
 	sessionSubscription = subscribedSession.subscription;

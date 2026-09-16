@@ -337,6 +337,11 @@ credentials or external messaging service, and removes its temporary
 `AHP_CHANNELS_HOME`, plugin home, Bun cache, channel, daemon, and AHP session on
 both success and failure.
 
+The daemon home uses a short OS-temporary path so Unix socket addresses do not
+depend on checkout depth. The agent receives a separate temporary working
+directory containing the plugin's upload state; permission-test targets remain
+outside that working directory.
+
 ### Permission relay E2E
 
 `npm run e2e:permissions` uses the same harness and a test-only native-permission
