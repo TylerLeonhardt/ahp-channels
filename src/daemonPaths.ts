@@ -1,7 +1,8 @@
 import { randomBytes, createHash } from 'node:crypto';
-import { mkdir, open, readFile, rm } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
+import { withFileLock, writeFileAtomic } from './lockedFile.js';
 
 export interface DaemonPaths {
 	readonly endpoint: string;
@@ -44,39 +45,20 @@ export async function removeStaleDaemonSocket(home: string): Promise<void> {
 }
 
 export async function getOrCreateDaemonToken(home: string): Promise<string> {
+	const existing = await readDaemonToken(home);
+	if (existing !== undefined) {
+		return existing;
+	}
 	const { tokenFile } = getDaemonPaths(home);
-	await mkdir(home, { recursive: true });
-	try {
-		const handle = await open(tokenFile, 'wx', 0o600);
-		let written = false;
-		try {
-			const token = randomBytes(32).toString('base64url');
-			await handle.writeFile(`${token}\n`, 'utf8');
-			written = true;
-			return token;
-		} finally {
-			await handle.close();
-			if (!written) {
-				await rm(tokenFile, { force: true });
-			}
+	return withFileLock(tokenFile, async () => {
+		const current = await readDaemonToken(home);
+		if (current !== undefined) {
+			return current;
 		}
-	} catch (error) {
-		if (!isNodeError(error) || error.code !== 'EEXIST') {
-			throw error;
-		}
-	}
-
-	const deadline = Date.now() + 2000;
-	while (true) {
-		const token = (await readFile(tokenFile, 'utf8')).trim();
-		if (/^[A-Za-z0-9_-]{43}$/.test(token)) {
-			return token;
-		}
-		if (Date.now() >= deadline) {
-			throw new Error(`Invalid daemon token file: ${tokenFile}`);
-		}
-		await new Promise(resolve => setTimeout(resolve, 20));
-	}
+		const token = randomBytes(32).toString('base64url');
+		await writeFileAtomic(tokenFile, `${token}\n`);
+		return token;
+	});
 }
 
 export async function readDaemonToken(home: string): Promise<string | undefined> {

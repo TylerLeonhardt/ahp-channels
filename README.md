@@ -336,8 +336,9 @@ ahp-channels daemon start
 ```
 
 Control traffic uses a per-install random token over a local named pipe on
-Windows or a mode-`0600` Unix socket. Configuration writes are atomic and use a
-heartbeat-backed cross-process lock.
+Windows or a mode-`0600` Unix socket. Token creation is locked and atomic so
+concurrent startup probes cannot observe a partially written token.
+Configuration writes are atomic and use a heartbeat-backed cross-process lock.
 
 ### Approve tools from a channel
 
