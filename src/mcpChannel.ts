@@ -7,9 +7,11 @@ import {
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { z } from 'zod';
 import type { ChannelEvent } from './channelPrompt.js';
+import type { ChannelPermissionTransport } from './channelPermissions.js';
 import type { LogWriter } from './daemonLog.js';
+import { McpPermissionTransport, supportsChannelPermissions } from './mcpPermissions.js';
 import type { StdioMcpServerConfig } from './plugins.js';
-import { ProcessTreeStdioClientTransport } from './processTreeStdioTransport.js';
+import { ChannelStdioClientTransport } from './channelStdioTransport.js';
 import { VERSION } from './version.js';
 
 const ChannelNotificationSchema = z.object({
@@ -28,6 +30,7 @@ export interface StartedMcpChannel {
 
 export interface McpChannelClient {
 	readonly whenStopped: Promise<void>;
+	readonly permissions?: ChannelPermissionTransport;
 	start(): Promise<StartedMcpChannel>;
 	setChannelHandler(handler: (event: ChannelEvent) => void | Promise<void>): Promise<void>;
 	callTool(name: string, args: Record<string, unknown>): Promise<ToolCallResult>;
@@ -45,7 +48,8 @@ export class McpChannelProcess implements McpChannelClient {
 		name: 'ahp-channels',
 		version: VERSION,
 	});
-	private transport: ProcessTreeStdioClientTransport | undefined;
+	private readonly permissionTransport = new McpPermissionTransport(this.client);
+	private transport: ChannelStdioClientTransport | undefined;
 	private channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
 	private readonly pendingEvents: ChannelEvent[] = [];
 	private resolveStopped!: () => void;
@@ -75,8 +79,14 @@ export class McpChannelProcess implements McpChannelClient {
 		});
 	}
 
+	get permissions(): ChannelPermissionTransport | undefined {
+		return supportsChannelPermissions(this.client.getServerCapabilities()?.experimental)
+			? this.permissionTransport
+			: undefined;
+	}
+
 	async start(): Promise<StartedMcpChannel> {
-		this.transport = new ProcessTreeStdioClientTransport({
+		this.transport = new ChannelStdioClientTransport({
 			command: this.config.command,
 			args: [...this.config.args],
 			...(this.config.cwd ? { cwd: this.config.cwd } : {}),

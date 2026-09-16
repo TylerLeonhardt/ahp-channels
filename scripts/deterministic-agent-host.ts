@@ -1,5 +1,6 @@
 import {
 	ActionType,
+	ConfirmationOptionKind,
 	ContentEncoding,
 	CustomizationLoadStatus,
 	CustomizationType,
@@ -8,6 +9,8 @@ import {
 	SessionStatus,
 	ToolCallConfirmationReason,
 	ToolCallContributorKind,
+	ToolCallStatus,
+	ResponsePartKind,
 	chatReducer,
 	sessionReducer,
 	type ActionEnvelope,
@@ -33,6 +36,7 @@ const PROTOCOL_VERSION = '0.9.0';
 const PROVIDER = 'deterministic-e2e';
 const MODEL = 'deterministic-e2e';
 const EXPECTED_REPLY = /\bFAKECHAT_(?:FIRST|RESTART)_[0-9a-f-]+\b/i;
+const PERMISSION_MARKER = /\bFAKECHAT_PERMISSION_[A-Z]+_[0-9a-f-]+\b/i;
 
 interface PendingRequest {
 	readonly resolve: (value: unknown) => void;
@@ -52,7 +56,10 @@ interface HostedSession {
 	state: SessionState;
 	chatState: ChatState;
 	readonly createdAt: string;
-	readonly pendingToolCalls: Map<string, string>;
+	readonly pendingToolCalls: Map<string, {
+		readonly turnId: string;
+		readonly permission?: { readonly marker: string; readonly path: string };
+	}>;
 }
 
 interface JsonRpcRequest {
@@ -381,17 +388,56 @@ export class DeterministicAgentHost {
 			return;
 		}
 		assertChatAction(action);
+		if (action.type === ActionType.ChatToolCallConfirmed) {
+			const tool = hosted.chatState.activeTurn?.responseParts.find(part =>
+				part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === action.toolCallId
+			);
+			if (hosted.chatState.activeTurn?.id !== action.turnId
+				|| tool?.kind !== ResponsePartKind.ToolCall
+				|| tool.toolCall.status !== ToolCallStatus.PendingConfirmation) {
+				this.broadcastAction(channel, action, origin, 'Tool is not awaiting confirmation');
+				return;
+			}
+		}
 		hosted.chatState = chatReducer(hosted.chatState, action);
 		this.broadcastAction(channel, action, origin);
 		if (action.type === ActionType.ChatTurnStarted) {
-			await this.startReplyTool(hosted, channel, action.turnId, action.message.text);
+			const marker = PERMISSION_MARKER.exec(action.message.text)?.[0];
+			if (marker) {
+				this.startPermissionTool(hosted, channel, action.turnId, marker);
+			} else {
+				const expected = EXPECTED_REPLY.exec(action.message.text)?.[0];
+				if (expected) {
+					await this.startReplyTool(hosted, channel, action.turnId, expected);
+				}
+			}
+		} else if (action.type === ActionType.ChatToolCallConfirmed) {
+			const pending = hosted.pendingToolCalls.get(action.toolCallId);
+			if (pending?.permission) {
+				hosted.pendingToolCalls.delete(action.toolCallId);
+				if (action.approved) {
+					await writeFile(pending.permission.path, pending.permission.marker);
+					this.publishAction(channel, {
+						type: ActionType.ChatToolCallComplete,
+						turnId: pending.turnId,
+						toolCallId: action.toolCallId,
+						result: { success: true, pastTenseMessage: 'Wrote the permission test marker' },
+					});
+				}
+				await this.startReplyTool(
+					hosted,
+					channel,
+					pending.turnId,
+					`${pending.permission.marker}_${action.approved ? 'ALLOWED' : 'DENIED'}`,
+				);
+			}
 		} else if (action.type === ActionType.ChatToolCallComplete) {
-			const turnId = hosted.pendingToolCalls.get(action.toolCallId);
-			if (turnId) {
+			const pending = hosted.pendingToolCalls.get(action.toolCallId);
+			if (pending && !pending.permission) {
 				hosted.pendingToolCalls.delete(action.toolCallId);
 				this.publishAction(channel, {
 					type: ActionType.ChatTurnComplete,
-					turnId,
+					turnId: pending.turnId,
 					duration: 0,
 				});
 			}
@@ -487,16 +533,34 @@ export class DeterministicAgentHost {
 		});
 	}
 
+	private startPermissionTool(hosted: HostedSession, chat: string, turnId: string, marker: string): void {
+		const toolCallId = randomUUID();
+		const path = join(this.registryDirectory, `${marker}.txt`);
+		hosted.pendingToolCalls.set(toolCallId, { turnId, permission: { marker, path } });
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallStart,
+			turnId, toolCallId,
+			toolName: 'fixture_write',
+			displayName: 'Write test marker',
+		});
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallReady,
+			turnId, toolCallId,
+			invocationMessage: 'Write a marker file inside the isolated E2E directory',
+			toolInput: JSON.stringify({ path, text: marker }),
+			options: [
+				{ id: 'allow-once', label: 'Allow once', kind: ConfirmationOptionKind.Approve },
+				{ id: 'deny', label: 'Deny', kind: ConfirmationOptionKind.Deny },
+			],
+		});
+	}
+
 	private async startReplyTool(
 		hosted: HostedSession,
 		chat: string,
 		turnId: string,
-		message: string,
+		expected: string,
 	): Promise<void> {
-		const expected = EXPECTED_REPLY.exec(message)?.[0];
-		if (!expected) {
-			return;
-		}
 		const client = hosted.state.activeClients.find(candidate =>
 			candidate.tools.some(tool => tool.name === 'reply')
 		);
@@ -504,7 +568,7 @@ export class DeterministicAgentHost {
 			throw new Error('Official fakechat reply tool was not contributed to the deterministic Agent Host');
 		}
 		const toolCallId = randomUUID();
-		hosted.pendingToolCalls.set(toolCallId, turnId);
+		hosted.pendingToolCalls.set(toolCallId, { turnId });
 		const contributor = {
 			kind: ToolCallContributorKind.Client,
 			clientId: client.clientId,
@@ -548,12 +612,14 @@ export class DeterministicAgentHost {
 		channel: string,
 		action: StateAction,
 		origin: ActionOrigin | undefined,
+		rejectionReason?: string,
 	): void {
 		const envelope: ActionEnvelope = {
 			channel,
 			action,
 			serverSeq: ++this.serverSeq,
 			origin,
+			...(rejectionReason ? { rejectionReason } : {}),
 		};
 		for (const peer of this.peers) {
 			if (peer.subscriptions.has(channel)) {

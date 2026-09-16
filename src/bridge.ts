@@ -1,9 +1,7 @@
 import {
 	ActionType,
-	ConfirmationOptionKind,
 	MessageKind,
 	PendingMessageKind,
-	ToolCallConfirmationReason,
 	ToolCallContributorKind,
 	type ActionEnvelope,
 	type ChatState,
@@ -17,12 +15,14 @@ import {
 import type { DispatchHandle, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { randomUUID } from 'node:crypto';
 import { formatChannelPrompt, type ChannelEvent } from './channelPrompt.js';
+import { ChannelPermissionRelay } from './channelPermissions.js';
 import {
 	readJournalEventId,
 	withJournalEventId,
 	type ChannelEventJournal,
 } from './eventJournal.js';
 import type { McpChannelClient, StartedMcpChannel } from './mcpChannel.js';
+import { readToolInput, type ToolInputReader } from './toolInput.js';
 
 interface PendingClientTool {
 	readonly turnId: string;
@@ -36,17 +36,17 @@ export interface ChannelBridgeOptions {
 	readonly client: {
 		dispatch(channel: string, action: StateAction, clientSeq?: number): DispatchHandle;
 		unsubscribe?(channel: string): Promise<void>;
+		request?: ToolInputReader['request'];
 	};
 	readonly clientId: string;
 	readonly session: string;
 	readonly chat: string;
 	readonly chatState: ChatState;
 	readonly chatSubscription: AsyncIterable<SubscriptionEvent> & { close(): Promise<void> };
-	readonly channel: Pick<McpChannelClient, 'setChannelHandler' | 'callTool' | 'close'>;
+	readonly channel: Pick<McpChannelClient, 'setChannelHandler' | 'callTool' | 'close' | 'permissions'>;
 	readonly channelInfo: StartedMcpChannel;
 	readonly customizations: readonly ClientPluginCustomization[];
 	readonly eventJournal?: ChannelEventJournal;
-	readonly autoApproveTools?: boolean;
 	readonly onStatus?: (message: string) => void;
 }
 
@@ -57,8 +57,8 @@ export class ChannelBridge {
 	private readonly inFlightEventHandlers = new Set<Promise<void>>();
 	private actionLoop: Promise<void> | undefined;
 	private acceptingEvents = true;
-	private closed = false;
-	private eventFailureSignalled = false;
+	private readonly lifetime = new AbortController();
+	private readonly permissionRelay: ChannelPermissionRelay | undefined;
 	private resolveEventFailure!: (error: Error) => void;
 	private readonly eventFailure = new Promise<Error>(resolve => {
 		this.resolveEventFailure = resolve;
@@ -67,6 +67,17 @@ export class ChannelBridge {
 	constructor(private readonly options: ChannelBridgeOptions) {
 		this.activeTurnId = options.chatState.activeTurn?.id;
 		this.queuedMessageIds = new Set(options.chatState.queuedMessages?.map(message => message.id));
+		if (options.channel.permissions) {
+			this.permissionRelay = new ChannelPermissionRelay(
+				options.client,
+				options.clientId,
+				options.chat,
+				options.channel.permissions,
+				options.chatState,
+			);
+			this.permissionRelay.events.on('status', message => options.onStatus?.(message));
+			this.permissionRelay.events.on('failure', error => this.resolveEventFailure(error));
+		}
 	}
 
 	get busy(): boolean {
@@ -83,7 +94,7 @@ export class ChannelBridge {
 	}
 
 	async quiesce(): Promise<boolean> {
-		if (this.closed) {
+		if (this.lifetime.signal.aborted) {
 			return false;
 		}
 		this.acceptingEvents = false;
@@ -108,6 +119,7 @@ export class ChannelBridge {
 			customizations: [...this.options.customizations],
 		});
 		this.actionLoop = this.consumeChatActions();
+		this.permissionRelay?.start();
 		if (this.options.eventJournal) {
 			await this.options.eventJournal.markDelivered(journalEventIds(this.options.chatState));
 			for (const pending of await this.options.eventJournal.pending()) {
@@ -119,12 +131,13 @@ export class ChannelBridge {
 	}
 
 	async close(): Promise<void> {
-		if (this.closed) {
+		if (this.lifetime.signal.aborted) {
 			return;
 		}
-		this.closed = true;
+		this.lifetime.abort();
 		this.acceptingEvents = false;
 		const errors: Error[] = [];
+		await this.permissionRelay?.close();
 		try {
 			await this.options.channel.close();
 		} catch (error) {
@@ -186,10 +199,7 @@ export class ChannelBridge {
 			() => this.inFlightEventHandlers.delete(handler),
 			error => {
 				this.inFlightEventHandlers.delete(handler);
-				if (!this.eventFailureSignalled) {
-					this.eventFailureSignalled = true;
-					this.resolveEventFailure(toError('channel event', error));
-				}
+				this.resolveEventFailure(toError('channel event', error));
 			},
 		);
 		return handler;
@@ -235,6 +245,7 @@ export class ChannelBridge {
 			if (event.type !== 'action') {
 				continue;
 			}
+			this.permissionRelay?.observe(event.params);
 			if (event.params.rejectionReason) {
 				const rejectedEventId = event.params.action.type === ActionType.ChatTurnStarted
 					|| event.params.action.type === ActionType.ChatPendingMessageSet
@@ -287,7 +298,15 @@ export class ChannelBridge {
 				break;
 			case ActionType.ChatToolCallConfirmed:
 				if (action.approved) {
+					const pending = this.pendingTools.get(action.toolCallId);
+					if (pending?.turnId === action.turnId
+						&& typeof pending.toolInput !== 'object'
+						&& action.editedToolInput !== undefined) {
+						pending.toolInput = action.editedToolInput;
+					}
 					await this.executeTool(action.toolCallId);
+				} else if (this.pendingTools.get(action.toolCallId)?.turnId === action.turnId) {
+					this.pendingTools.delete(action.toolCallId);
 				}
 				break;
 			case ActionType.ChatPendingMessageSet:
@@ -324,19 +343,6 @@ export class ChannelBridge {
 		pending.toolInput = action.toolInput;
 		if (action.confirmed !== undefined) {
 			await this.executeTool(action.toolCallId);
-		} else if (this.options.autoApproveTools) {
-			const selectedOptionId = action.options?.find(option =>
-				option.kind === ConfirmationOptionKind.Approve && /once/i.test(option.id)
-			)?.id ?? action.options?.find(option => option.kind === ConfirmationOptionKind.Approve)?.id;
-			this.options.client.dispatch(this.options.chat, {
-				type: ActionType.ChatToolCallConfirmed,
-				turnId: action.turnId,
-				toolCallId: action.toolCallId,
-				approved: true,
-				confirmed: ToolCallConfirmationReason.UserAction,
-				...(selectedOptionId ? { selectedOptionId } : {}),
-			});
-			this.options.onStatus?.(`approved channel tool ${pending.toolName}`);
 		}
 	}
 
@@ -349,7 +355,7 @@ export class ChannelBridge {
 
 		let args: Record<string, unknown>;
 		try {
-			args = parseToolInput(pending.toolInput);
+			args = parseToolInput(await readToolInput(this.options.client, pending.toolInput, this.lifetime.signal));
 		} catch (error) {
 			this.dispatchToolCompletion(pending, {
 				success: false,

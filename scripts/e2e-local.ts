@@ -1,6 +1,9 @@
 import {
+	ActionType,
 	CustomizationType,
 	SessionLifecycle,
+	ToolCallConfirmationReason,
+	ToolCallContributorKind,
 	sessionReducer,
 	type ChatState,
 	type RootState,
@@ -33,6 +36,8 @@ client.setResourceRequestHandlers(await createPluginResourceRequestHandlers(plug
 const session = `ahp-session:/${randomUUID()}`;
 let created = false;
 let sessionSubscription: Subscription | undefined;
+let confirmationSubscription: Subscription | undefined;
+let confirmationLoop: Promise<void> | undefined;
 let bridge: ChannelBridge | undefined;
 let mcp: McpChannelProcess | undefined;
 let primaryError: unknown;
@@ -88,6 +93,8 @@ try {
 		await chatSubscription.subscription.close();
 		throw new Error('The E2E chat returned no snapshot');
 	}
+	confirmationSubscription = client.attachSubscription(chat);
+	confirmationLoop = approveFixtureReplies(confirmationSubscription);
 
 	bridge = new ChannelBridge({
 		client,
@@ -99,7 +106,6 @@ try {
 		channel: mcp,
 		channelInfo,
 		customizations,
-		autoApproveTools: true,
 		onStatus: message => console.log(`[e2e] ${message}`),
 	});
 	await bridge.start();
@@ -110,7 +116,10 @@ try {
 		'configure',
 	);
 
-	const reply = await waitForFile(outputFile, 120_000);
+	const reply = await Promise.race([
+		waitForFile(outputFile, 120_000),
+		confirmationLoop.then(() => { throw new Error('Fixture confirmation stream closed before the reply'); }),
+	]);
 	if (reply.trim().toUpperCase() !== 'PONG') {
 		throw new Error(`Expected channel reply PONG, received ${JSON.stringify(reply)}`);
 	}
@@ -120,6 +129,8 @@ try {
 } finally {
 	const cleanupErrors: Error[] = [];
 	await cleanup('bridge', () => bridge?.close(), cleanupErrors);
+	await cleanup('fixture confirmation subscription', () => confirmationSubscription?.close(), cleanupErrors);
+	await cleanup('fixture confirmation loop', () => confirmationLoop, cleanupErrors);
 	if (!bridge) {
 		await cleanup('MCP channel', () => mcp?.close(), cleanupErrors);
 	}
@@ -137,6 +148,33 @@ try {
 	}
 	if (cleanupErrors.length > 0) {
 		throw new AggregateError(cleanupErrors, 'E2E validation passed but cleanup failed');
+	}
+}
+
+async function approveFixtureReplies(subscription: Subscription): Promise<void> {
+	const replies = new Set<string>();
+	for await (const event of subscription) {
+		if (event.type !== 'action' || event.params.rejectionReason) {
+			continue;
+		}
+		const action = event.params.action;
+		if (action.type === ActionType.ChatToolCallStart
+			&& action.toolName === 'reply'
+			&& action.contributor?.kind === ToolCallContributorKind.Client
+			&& action.contributor.clientId === connection.clientId) {
+			replies.add(action.toolCallId);
+		}
+		if (action.type === ActionType.ChatToolCallReady
+			&& action.confirmed === undefined
+			&& replies.delete(action.toolCallId)) {
+			client.dispatch(subscription.uri, {
+				type: ActionType.ChatToolCallConfirmed,
+				turnId: action.turnId,
+				toolCallId: action.toolCallId,
+				approved: true,
+				confirmed: ToolCallConfirmationReason.UserAction,
+			});
+		}
 	}
 }
 

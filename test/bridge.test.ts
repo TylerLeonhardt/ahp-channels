@@ -114,7 +114,6 @@ describe('ChannelBridge', () => {
 				}],
 				nonce: 'plugin-nonce',
 			}],
-			autoApproveTools: true,
 			onStatus: message => statuses.push(message),
 		});
 
@@ -151,7 +150,6 @@ describe('ChannelBridge', () => {
 				{ id: 'allow-once', label: 'Allow Once', kind: ConfirmationOptionKind.Approve },
 			],
 		}));
-		await waitFor(() => dispatched.some(item => item.action.type === ActionType.ChatToolCallConfirmed));
 		subscription.push(actionEvent({
 			type: ActionType.ChatToolCallConfirmed,
 			turnId: turnAction.turnId,
@@ -161,6 +159,7 @@ describe('ChannelBridge', () => {
 			selectedOptionId: 'allow-once',
 		}));
 		await waitFor(() => dispatched.some(item => item.action.type === ActionType.ChatToolCallComplete));
+		assert.equal(dispatched.some(item => item.action.type === ActionType.ChatToolCallConfirmed), false);
 		await bridge.close();
 
 		assert.deepEqual({

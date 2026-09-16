@@ -3,6 +3,7 @@ import {
 	SessionLifecycle,
 	SessionStatus,
 	type ListSessionsResult,
+	type ResourceReadResult,
 	type SessionState,
 	type StateAction,
 	type SubscribeResult,
@@ -63,6 +64,7 @@ class TestHostClient implements ChannelHostClient {
 	readonly dispatched: Array<{ channel: string; action: StateAction }> = [];
 	readonly subscriptions = new Map<string, TestSubscription>();
 	shutDown = false;
+	sessionAvailable = true;
 	resourceHandlers: ResourceRequestHandlers | null | undefined;
 	resourceHandlersSetBeforeActiveClient = false;
 
@@ -121,16 +123,21 @@ class TestHostClient implements ChannelHostClient {
 		return { result: {}, subscription };
 	}
 
-	async request(): Promise<ListSessionsResult> {
+	request(method: 'listSessions'): Promise<ListSessionsResult>;
+	request(method: 'resourceRead'): Promise<ResourceReadResult>;
+	async request(method: 'listSessions' | 'resourceRead'): Promise<ListSessionsResult | ResourceReadResult> {
+		if (method === 'resourceRead') {
+			throw new Error('No tool-input resource is published by this test host');
+		}
 		return {
-			items: [{
+			items: this.sessionAvailable ? [{
 				resource: sessionUri,
 				provider: 'test',
 				title: 'Test',
 				status: SessionStatus.Idle,
 				createdAt: new Date(0).toISOString(),
 				modifiedAt: new Date(0).toISOString(),
-			}],
+			}] : [],
 		};
 	}
 
@@ -306,9 +313,7 @@ describe('ChannelRuntime', () => {
 			return {
 				client: candidate === wrongEndpoint
 					? Object.assign(new TestHostClient(), {
-						async request() {
-							return { items: [] };
-						},
+						sessionAvailable: false,
 					})
 					: client,
 				clientId,
@@ -382,7 +387,7 @@ describe('ChannelRuntime', () => {
 
 	it('categorizes session resolution without parsing the error message', async () => {
 			const client = new TestHostClient();
-			client.request = async () => ({ items: [] });
+			client.sessionAvailable = false;
 
 			await assert.rejects(
 				ChannelRuntime.start('personal', {
