@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { probeDaemon } from '../src/daemonClient.js';
 import { getOrCreateDaemonToken } from '../src/daemonPaths.js';
+import { parseDaemonStartupMessage } from '../src/daemonStartup.js';
 import {
 	DAEMON_PROTOCOL_VERSION,
 	DaemonProtocolError,
@@ -19,6 +20,18 @@ afterEach(async () => {
 });
 
 describe('daemon control protocol', () => {
+	it('validates startup messages', () => {
+		assert.deepEqual(parseDaemonStartupMessage({ type: 'ready' }), { type: 'ready' });
+		assert.deepEqual(parseDaemonStartupMessage({ type: 'busy' }), { type: 'busy' });
+		assert.deepEqual(parseDaemonStartupMessage({ type: 'error', message: 'cannot open log' }), {
+			type: 'error',
+			message: 'cannot open log',
+		});
+		for (const value of [null, {}, { type: 'unknown' }, { type: 'error', message: 42 }]) {
+			assert.throws(() => parseDaemonStartupMessage(value), /Invalid daemon startup message/);
+		}
+	});
+
 	it('rejects unknown request fields and incomplete responses', () => {
 		assert.throws(
 			() => parseDaemonRequest({

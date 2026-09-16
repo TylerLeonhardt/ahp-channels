@@ -122,6 +122,18 @@ channel is processing a turn, so an in-flight reply is never silently orphaned.
 Inbound events with stable platform IDs are journaled before AHP dispatch and
 deduplicated across process restarts.
 
+Daemon and channel-process output is written to `daemon.log`. The active log is
+limited to 1 MiB, with the three most recent 1 MiB rotations retained as
+`daemon.log.1` through `daemon.log.3`. Rotation occurs while the daemon is
+running, and an oversized log from an older installation is reduced to its
+newest 1 MiB when the daemon starts. `ahp-channels daemon logs` prints the
+active log path; inspect the numbered files for older failure context.
+An exclusive, heartbeat-backed file lock prevents competing daemon starts
+from rotating each other's logs. Startup errors are returned to the CLI even
+when the log cannot be opened. Node warnings, uncaught exceptions, unhandled
+rejections, and runtime module-loading failures are also recorded; fatal
+errors still terminate the daemon with a non-zero exit code.
+
 Each named channel pins the plugin installation that was active when the
 channel was created. A later plugin upgrade does not affect that channel until
 `channel upgrade` is run.

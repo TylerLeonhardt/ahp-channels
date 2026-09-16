@@ -46,7 +46,11 @@ try {
 			AHP_CHANNELS_FAKE_OUTPUT: outputFile,
 			AHP_CHANNELS_FAKE_MESSAGE: 'Use the reply tool to send exactly PONG. Do not answer in the transcript.',
 		},
-	}, chunk => process.stderr.write(`[fake-channel] ${chunk}`));
+	}, {
+		write(chunk: string): void {
+			process.stderr.write(`[fake-channel] ${chunk}`);
+		},
+	});
 	const channelInfo = await mcp.start();
 
 	const rootSnapshot = connection.initializeResult.snapshots.find(snapshot => snapshot.resource === 'ahp-root://');

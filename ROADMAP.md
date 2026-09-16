@@ -72,9 +72,10 @@ files.
 - Strict daemon protocol and persisted-state validation with secret-safe,
   actionable CLI output.
 
-## Next: Operational reliability
+## Completed: Operational reliability
 
-- Rotate and bound daemon logs while retaining recent failure context.
+- Runtime rotation caps daemon and channel-process logs at 1 MiB each while
+  retaining the three most recent files for failure context.
 
 ## Next: Host selection and release validation
 

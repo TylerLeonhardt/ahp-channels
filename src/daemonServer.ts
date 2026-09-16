@@ -11,6 +11,7 @@ import {
 	type PersistedChannelHealth,
 } from './channelHealth.js';
 import { ConfigStore, isValidChannelInstanceName, retargetChannelInstance, type AppConfig, type ChannelInstanceConfig } from './config.js';
+import { ConsoleDaemonLogger, type DaemonLogger } from './daemonLog.js';
 import { getDaemonPaths } from './daemonPaths.js';
 import {
 	DAEMON_PROTOCOL_VERSION,
@@ -74,6 +75,7 @@ export class DaemonServer {
 		private readonly token: string,
 		private readonly configStore: ConfigStore,
 		private readonly runtimeFactory: DaemonRuntimeFactory,
+		private readonly logger: DaemonLogger = new ConsoleDaemonLogger(),
 	) {
 		this.server = createServer(socket => this.handleConnection(socket));
 		this.healthStore = new FileChannelHealthStore(home);
@@ -134,7 +136,7 @@ export class DaemonServer {
 		}
 		this.stabilityTimers.clear();
 		await this.operationQueue.catch(error => {
-			console.error(`[daemon] In-flight operation failed during shutdown: ${formatError(error)}`);
+			this.logger.error(`[daemon] In-flight operation failed during shutdown: ${formatError(error)}`);
 		});
 
 		const runtimes = [...this.runtimes.values()];
@@ -197,7 +199,7 @@ export class DaemonServer {
 				)));
 		});
 		socket.once('error', error => {
-			console.error(`[daemon] Control connection failed: ${error.message}`);
+			this.logger.error(`[daemon] Control connection failed: ${error.message}`);
 		});
 	}
 
@@ -235,7 +237,7 @@ export class DaemonServer {
 				return this.status();
 			case 'shutdown':
 				setImmediate(() => void this.close().catch(error => {
-					console.error(`[daemon] Shutdown failed: ${formatError(error)}`);
+					this.logger.error(`[daemon] Shutdown failed: ${formatError(error)}`);
 				}));
 				return this.status();
 			case 'channel.create':
@@ -395,7 +397,7 @@ export class DaemonServer {
 		this.transitions.set(name, 'starting');
 		try {
 			const runtime = await this.runtimeFactory.start(name, definition, message => {
-				console.log(`[channel:${name}] ${message}`);
+				this.logger.info(`[channel:${name}] ${message}`);
 			});
 			this.runtimes.set(name, runtime);
 			if (runtime.startupFailure) {
@@ -536,7 +538,7 @@ export class DaemonServer {
 			try {
 				await runtime.close();
 			} catch (closeError) {
-				console.error(`[channel:${name}] Cleanup after failure failed: ${formatError(closeError)}`);
+				this.logger.error(`[channel:${name}] Cleanup after failure failed: ${formatError(closeError)}`);
 			} finally {
 				this.transitions.delete(name);
 			}
@@ -545,7 +547,7 @@ export class DaemonServer {
 				await this.scheduleRestart(name);
 			}
 		}).catch(cleanupError => {
-			console.error(`[channel:${name}] Failed to process runtime exit: ${formatError(cleanupError)}`);
+			this.logger.error(`[channel:${name}] Failed to process runtime exit: ${formatError(cleanupError)}`);
 		});
 	}
 
@@ -597,11 +599,11 @@ export class DaemonServer {
 				try {
 					await this.startOne(name, definition);
 				} catch (error) {
-					console.error(`[channel:${name}] Restart attempt failed: ${formatError(error)}`);
+					this.logger.error(`[channel:${name}] Restart attempt failed: ${formatError(error)}`);
 					await this.scheduleRestart(name);
 				}
 			}).catch(error => {
-				console.error(`[channel:${name}] Restart failed: ${formatError(error)}`);
+				this.logger.error(`[channel:${name}] Restart failed: ${formatError(error)}`);
 			});
 		}, delay);
 		timer.unref();

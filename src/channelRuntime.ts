@@ -8,6 +8,7 @@ import {
 	type ChannelFailureStage,
 } from './channelHealth.js';
 import type { ChannelInstanceConfig } from './config.js';
+import type { LogWriter } from './daemonLog.js';
 import { discoverLocalAgentHosts, selectAgentHost, type AgentHostEndpoint } from './endpoints.js';
 import { FileChannelEventJournal, type ChannelEventJournal } from './eventJournal.js';
 import { McpChannelProcess, type McpChannelClient, type StartedMcpChannel } from './mcpChannel.js';
@@ -67,18 +68,19 @@ export interface ChannelHostConnection {
 
 export interface ChannelRuntimeServiceOptions {
 	readonly home?: string;
+	readonly stderr?: LogWriter;
 }
 
 export function createChannelRuntimeServices(
 	plugins: PluginManager,
 	options: ChannelRuntimeServiceOptions = {},
 ): ChannelRuntimeServices {
-	const { home } = options;
+	const { home, stderr } = options;
 	return {
 		resolvePlugin: (nameOrPath, installation) => plugins.resolvePlugin(nameOrPath, installation),
 		discoverAgentHosts: () => discoverLocalAgentHosts(),
 		connectAgentHost: async (endpoint, clientId) => connectAgentHost(endpoint, clientId),
-		createMcpChannel: config => new McpChannelProcess(config),
+		createMcpChannel: config => new McpChannelProcess(config, stderr),
 		...(home ? { createEventJournal: (name: string) => new FileChannelEventJournal(home, name) } : {}),
 	};
 }
