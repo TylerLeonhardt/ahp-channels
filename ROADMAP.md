@@ -102,6 +102,8 @@ files.
   rejection, and restart recovery to the committed source.
 - Deterministic two-host external-channel E2E with distinct source and
   destination session/chat identities.
+- Combined handoff and in-flight MCP resource-materialization coverage with
+  byte-exact text/image results and no stale results in the destination chat.
 
 ## Next: Remote identity and release validation
 

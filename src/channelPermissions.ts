@@ -87,6 +87,7 @@ export class ChannelPermissionRelay {
 	private readonly offered = new WeakSet<ToolCallPendingConfirmationState>();
 	private readonly tasks = new Set<Promise<void>>();
 	private readonly lifetime = new AbortController();
+	private started = false;
 	private readonly onVerdict = (verdict: ChannelPermissionVerdict) => {
 		const pending = this.requests.get(verdict.request_id);
 		if (!pending || pending.phase !== 'awaiting' || !this.isCurrent(pending)) {
@@ -113,6 +114,10 @@ export class ChannelPermissionRelay {
 	}
 
 	start(): void {
+		if (this.started || this.lifetime.signal.aborted) {
+			return;
+		}
+		this.started = true;
 		this.reconcile();
 		if (this.transport) {
 			this.events.emit('status', 'tool permission relay enabled for this chat; sender authorization is owned by the channel plugin');
@@ -170,7 +175,7 @@ export class ChannelPermissionRelay {
 	}
 
 	private reconcile(): void {
-		if (this.lifetime.signal.aborted) {
+		if (!this.started || this.lifetime.signal.aborted) {
 			return;
 		}
 		for (const request of this.requests.values()) {

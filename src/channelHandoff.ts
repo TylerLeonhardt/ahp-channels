@@ -1,6 +1,7 @@
 import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { sanitizeErrorSummary } from './channelHealth.js';
 import type { ChannelBindingTarget, ResolvedChannelBinding } from './sessionCatalog.js';
 import { getInstanceRoot } from './instancePaths.js';
 import { withFileLock, writeFileAtomic } from './lockedFile.js';
@@ -103,6 +104,21 @@ export class FileChannelHandoffStore {
 	private path(name: string): string {
 		return join(getInstanceRoot(this.home, name), 'handoff.json');
 	}
+}
+
+export function failedHandoff(
+	record: ChannelHandoffRecord,
+	error: unknown,
+	recovery = false,
+): ChannelHandoffRecord {
+	const { recovery: _recovery, ...current } = record;
+	return {
+		...current,
+		state: 'failed',
+		updatedAt: new Date().toISOString(),
+		...(recovery ? { recovery: 'source' as const } : {}),
+		error: sanitizeErrorSummary(error instanceof Error ? error.message : String(error)),
+	};
 }
 
 function withoutVersion(value: z.infer<typeof HandoffRecordSchema>): ChannelHandoffRecord {

@@ -315,6 +315,12 @@ binding; the implementation never chains the older `switch` and `select-host`
 commands through an invalid intermediate combination. A failed destination
 start restores the previous persisted binding and runtime.
 
+When the daemon is stopped, terminal binding changes use the same recovery-aware
+binding service as daemon startup and handoff commits. An interrupted request is
+reconciled before a later explicit selection is saved, and stale operations
+cannot overwrite an intervening binding change. Offline selection does not
+start the daemon or a plugin process.
+
 Selection redirects future channel traffic. It does not create sessions,
 migrate or clone history, move agent work, or implicitly cancel a turn.
 Remote-host identity and credential management remain unsupported.
@@ -346,6 +352,11 @@ binding has already changed. The source bridge then:
 3. applies the host, session, and optional chat together at that safe boundary;
 4. replays held messages to the destination, or back to the restored source
    after cancellation or rollback.
+
+Preparing a destination does not publish its tools, approve tool requests, or
+execute restored calls. Those side effects wait until the destination binding
+is durably committed; normal management errors are returned as failed tool
+results rather than stopping the source bridge.
 
 The first accepted request owns the pending slot. Conflicting handoffs are
 rejected, and only that source binding can cancel it before commit. A stale
@@ -550,6 +561,14 @@ reply finishes through the plugin, and the daemon safely moves the binding.
 A second external message then reaches the destination session and its reply
 returns through the restarted plugin. Assertions use distinct markers and
 verify preferred host, actual host, session, and chat identities.
+
+`npm run e2e:handoff -- --resources` runs the same handoff while a real MCP
+`resources/read` request is held open in the isolated fixture. The source agent
+receives the pending handoff result before that read is released; the source
+plugin remains running, materialized text and PNG bytes reach only the source
+chat, and the source reply completes before the binding changes. Both handoff
+variants run in CI alongside the unmodified official fakechat smoke and the
+existing permission and attachment fixtures.
 
 This is deterministic fixture evidence, not a real-model or browser run. The
 harness uses isolated daemon, host, plugin, and external-channel state and

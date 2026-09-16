@@ -161,11 +161,11 @@ class BoundDaemonChannelManagement implements BoundChannelManagement {
 				case MANAGEMENT_TOOL_NAMES.listChats:
 					return dataResult(await this.listChats(args, signal));
 				case MANAGEMENT_TOOL_NAMES.handoff:
-					return this.requestHandoff(args, signal);
+					return await this.requestHandoff(args, signal);
 				case MANAGEMENT_TOOL_NAMES.handoffStatus:
-					return this.handoffStatus(args, signal);
+					return await this.handoffStatus(args, signal);
 				case MANAGEMENT_TOOL_NAMES.cancelHandoff:
-					return this.cancelHandoff(args, signal);
+					return await this.cancelHandoff(args, signal);
 				default:
 					return failedResult(`Unknown channel management tool '${name}'`);
 			}

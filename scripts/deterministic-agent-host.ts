@@ -49,6 +49,7 @@ import {
 	type AttachmentPhase,
 	type AttachmentScenario,
 } from '../test/fixtures/attachment-contract.js';
+import { HANDOFF_RESOURCE_TOOL, assertHandoffResource } from '../test/fixtures/handoff-resource.js';
 
 const PROTOCOL_VERSION = '0.9.0';
 const PROVIDER = 'deterministic-e2e';
@@ -63,6 +64,7 @@ export interface DeterministicHandoffTarget {
 	readonly session: string;
 	readonly chat: string;
 	readonly sourceReply: string;
+	readonly resourceId?: string;
 }
 
 interface PendingRequest {
@@ -88,6 +90,7 @@ interface HostedSession {
 		readonly permission?: { readonly marker: string; readonly path: string };
 		readonly attachment?: { readonly scenario: AttachmentScenario; readonly phase: AttachmentPhase };
 		readonly handoffReply?: string;
+		readonly handoffResource?: { readonly id: string; readonly sourceReply?: string };
 	}>;
 }
 
@@ -166,6 +169,15 @@ export class DeterministicAgentHost {
 			throw new Error(`Invalid deterministic handoff marker: ${marker}`);
 		}
 		this.handoffTargets.set(marker, target);
+	}
+
+	requestConfiguredHandoff(marker: string): void {
+		const hosted = [...this.sessions.values()].find(session =>
+			session.chatState.activeTurn?.message.text.includes(marker)
+		);
+		const turn = hosted?.chatState.activeTurn;
+		assert.ok(hosted && turn, 'The external handoff message must reach the source turn first');
+		this.startHandoffTool(hosted, hosted.chatState.resource, turn.id, marker);
 	}
 
 	private accept(socket: WebSocket): void {
@@ -449,7 +461,12 @@ export class DeterministicAgentHost {
 			} else if (marker) {
 				this.startPermissionTool(hosted, channel, action.turnId, marker);
 			} else if (handoffMarker) {
-				this.startHandoffTool(hosted, channel, action.turnId, handoffMarker);
+				const resourceId = this.handoffTargets.get(handoffMarker)?.resourceId;
+				if (resourceId) {
+					this.startHandoffResource(hosted, channel, action.turnId, resourceId);
+				} else {
+					this.startHandoffTool(hosted, channel, action.turnId, handoffMarker);
+				}
 			} else {
 				const expected = EXPECTED_REPLY.exec(action.message.text)?.[0];
 				if (expected) {
@@ -478,12 +495,31 @@ export class DeterministicAgentHost {
 			}
 		} else if (action.type === ActionType.ChatToolCallComplete) {
 			const pending = hosted.pendingToolCalls.get(action.toolCallId);
-			if (pending?.handoffReply) {
+			if (pending?.handoffResource) {
+				assertHandoffResource(action.result, pending.handoffResource.id);
+				hosted.pendingToolCalls.delete(action.toolCallId);
+				if (pending.handoffResource.sourceReply) {
+					await this.startReplyTool(hosted, channel, pending.turnId, pending.handoffResource.sourceReply);
+				}
+			} else if (pending?.handoffReply) {
 				hosted.pendingToolCalls.delete(action.toolCallId);
 				if (!action.result.success || action.result.structuredContent?.['state'] !== 'pending') {
 					throw new Error(`Bridge handoff tool did not return an accurate pending result: ${JSON.stringify(action.result)}`);
 				}
-				await this.startReplyTool(hosted, channel, pending.turnId, pending.handoffReply);
+				const resource = [...hosted.pendingToolCalls].find(([, tool]) =>
+					tool.turnId === pending.turnId && tool.handoffResource
+				);
+				if (resource?.[1].handoffResource) {
+					hosted.pendingToolCalls.set(resource[0], {
+						...resource[1],
+						handoffResource: {
+							id: resource[1].handoffResource.id,
+							sourceReply: pending.handoffReply,
+						},
+					});
+				} else {
+					await this.startReplyTool(hosted, channel, pending.turnId, pending.handoffReply);
+				}
 			} else if (pending && !pending.permission) {
 				hosted.pendingToolCalls.delete(action.toolCallId);
 				if (pending.attachment) {
@@ -739,6 +775,28 @@ export class DeterministicAgentHost {
 			contributor,
 			invocationMessage: `Send ${expected} to fakechat`,
 			toolInput: JSON.stringify({ text: expected }),
+		});
+	}
+
+	private startHandoffResource(hosted: HostedSession, chat: string, turnId: string, resourceId: string): void {
+		const client = hosted.state.activeClients.find(candidate =>
+			candidate.tools.some(tool => tool.name === HANDOFF_RESOURCE_TOOL)
+		);
+		assert.ok(client, 'The handoff resource tool must be discovered through MCP');
+		const toolCallId = randomUUID();
+		hosted.pendingToolCalls.set(toolCallId, { turnId, handoffResource: { id: resourceId } });
+		const contributor = { kind: ToolCallContributorKind.Client, clientId: client.clientId } as const;
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallStart,
+			turnId, toolCallId, contributor,
+			toolName: HANDOFF_RESOURCE_TOOL,
+			displayName: 'Read the handoff fixture resource',
+		});
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallReady,
+			turnId, toolCallId, contributor,
+			invocationMessage: 'Read text and image bytes before the handoff finishes',
+			toolInput: JSON.stringify({ resource_id: resourceId }),
 		});
 	}
 

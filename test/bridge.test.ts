@@ -308,6 +308,38 @@ describe('ChannelBridge', () => {
 		assert.deepEqual(toolCalls, [{ name: 'reply', args: { text: 'resumed reply' } }]);
 	});
 
+	it('defers restored tool permissions and execution until destination activation', async context => {
+		const fixture = createToolFixture(context);
+		await fixture.bridge.startPaused();
+		assert.deepEqual(fixture.dispatched, []);
+		assert.deepEqual(fixture.calls, []);
+
+		fixture.confirm();
+		await new Promise(resolve => setImmediate(resolve));
+		assert.deepEqual(fixture.dispatched, []);
+		assert.equal(fixture.host.readCount, 0);
+		assert.deepEqual(fixture.calls, []);
+
+		await fixture.bridge.activate();
+		await waitFor(() => fixture.dispatched.some(action => action.type === ActionType.ChatToolCallComplete));
+		assert.deepEqual(fixture.calls, ['reply']);
+	});
+
+	it('does not resurrect a tool completed while the destination was prepared', async context => {
+		const fixture = createToolFixture(context);
+		await fixture.bridge.startPaused();
+		fixture.subscription.push(actionEvent({
+			type: ActionType.ChatToolCallComplete,
+			turnId: 'tool-turn',
+			toolCallId: 'owned-tool',
+			result: { success: false, pastTenseMessage: 'Cancelled while preparing' },
+		}));
+		await new Promise(resolve => setImmediate(resolve));
+		await fixture.bridge.activate();
+		assert.deepEqual(fixture.calls, []);
+		assert.equal(fixture.dispatched.some(action => action.type === ActionType.ChatToolCallConfirmed), false);
+	});
+
 	for (const type of [ActionType.ChatTurnCancelled, ActionType.ChatTurnComplete] as const) {
 		it(`cancels a referenced input read immediately on ${type}`, async context => {
 			const fixture = createToolFixture(context);
@@ -598,6 +630,7 @@ describe('ChannelBridge', () => {
 		const subscription = new TestSubscription();
 		const dispatched: StateAction[] = [];
 		let channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
+		let enqueueGate: Promise<void> | undefined;
 		const pending: Array<{ id: string; event: ChannelEvent; receivedAt: string; stableIdentity: boolean }> = [];
 		const bridge = new ChannelBridge({
 			client: {
@@ -637,8 +670,9 @@ describe('ChannelBridge', () => {
 			customizations: [],
 			eventJournal: {
 				async enqueue(_source, event) {
+					await enqueueGate;
 					const value = {
-						id: 'held-event',
+						id: `held-${pending.length}`,
 						event,
 						receivedAt: new Date(0).toISOString(),
 						stableIdentity: true,
@@ -676,6 +710,23 @@ describe('ChannelBridge', () => {
 		await readiness;
 		assert.equal(await bridge.quiesceHandoff('handoff-request'), true);
 
+		const lateEnqueue = deferred<void>();
+		enqueueGate = lateEnqueue.promise;
+		const handling = channelHandler?.({ content: 'late held message' });
+		let quiesced = false;
+		const quiescing = bridge.quiesceHandoff('handoff-request').then(result => {
+			quiesced = result;
+		});
+		try {
+			await new Promise(resolve => setImmediate(resolve));
+			assert.equal(quiesced, false, 'Final quiescence must drain a late journal write');
+		} finally {
+			lateEnqueue.resolve();
+		}
+		await handling;
+		await quiescing;
+		assert.equal(quiesced, true, 'A held message must not fail an otherwise idle handoff');
+
 		await bridge.cancelHandoff('handoff-request');
 		const replay = dispatched.find(action =>
 			action.type === ActionType.ChatTurnStarted
@@ -683,6 +734,9 @@ describe('ChannelBridge', () => {
 		);
 		assert.ok(replay?.type === ActionType.ChatTurnStarted);
 		assert.match(replay.message.text, /arrived while pending/);
+		const queued = dispatched.find(action => action.type === ActionType.ChatPendingMessageSet);
+		assert.ok(queued?.type === ActionType.ChatPendingMessageSet);
+		assert.match(queued.message.text, /late held message/);
 	});
 
 	it('journals destination events while prepared and replays them only after activation', async context => {

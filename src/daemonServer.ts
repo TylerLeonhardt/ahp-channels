@@ -2,8 +2,10 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmod, rm } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
 import { ChannelRuntime, validateChannelDefinition, type ChannelRuntimeSnapshot } from './channelRuntime.js';
+import { ChannelBindingError, ChannelBindingService } from './channelBindings.js';
 import {
 	FileChannelHandoffStore,
+	failedHandoff,
 	type ChannelHandoffRecord,
 } from './channelHandoff.js';
 import {
@@ -11,7 +13,6 @@ import {
 	FileChannelHealthStore,
 	failureFromError,
 	recoveryGuidance,
-	sanitizeErrorSummary,
 	type ChannelHealth,
 	type PersistedChannelHealth,
 } from './channelHealth.js';
@@ -104,6 +105,7 @@ export class DaemonServer {
 	private rejectListening!: (error: unknown) => void;
 	private readonly healthStore: FileChannelHealthStore;
 	private readonly handoffStore: FileChannelHandoffStore;
+	private readonly bindings: ChannelBindingService;
 	readonly whenClosed = new Promise<void>(resolve => {
 		this.resolveClosed = resolve;
 	});
@@ -127,6 +129,7 @@ export class DaemonServer {
 		this.server = createServer(socket => this.handleConnection(socket));
 		this.healthStore = new FileChannelHealthStore(home);
 		this.handoffStore = new FileChannelHandoffStore(home);
+		this.bindings = new ChannelBindingService(configStore, this.handoffStore);
 		void this.whenReady.catch(() => undefined);
 		void this.whenListening.catch(() => undefined);
 	}
@@ -252,7 +255,9 @@ export class DaemonServer {
 			void this.processRequest(buffer.slice(0, newline), requestLifetime.signal)
 				.then(response => this.writeResponse(socket, response))
 				.catch(error => this.writeResponse(socket, errorResponse(
-					error instanceof DaemonProtocolError ? error.code : 'INTERNAL_ERROR',
+					error instanceof DaemonProtocolError || error instanceof ChannelBindingError
+						? error.code
+						: 'INTERNAL_ERROR',
 					formatError(error),
 				)));
 		});
@@ -884,7 +889,7 @@ export class DaemonServer {
 		let configUpdated = false;
 		let preparedRuntime: ManagedChannelRuntime | undefined;
 		try {
-			await this.configStore.update(current => withChannel(current, name, next));
+			await this.bindings.replace(name, previous, next, handoff?.requestId);
 			configUpdated = true;
 			if (next.enabled) {
 				this.restartAttempts.delete(name);
@@ -922,7 +927,11 @@ export class DaemonServer {
 				}
 			}
 			if (configUpdated) {
-				await this.configStore.update(current => withChannel(current, name, previous));
+				try {
+					await this.bindings.replace(name, next, previous, handoff?.requestId);
+				} catch (rollbackError) {
+					errors.push(toError('persisted binding rollback', rollbackError));
+				}
 			}
 			if (handoff) {
 				try {
@@ -933,7 +942,10 @@ export class DaemonServer {
 			}
 			if (wasRunning || previous.enabled) {
 				try {
-					await this.startOne(name, previous);
+					const restored = await this.getDefinition(name);
+					if (restored.enabled) {
+						await this.startOne(name, restored);
+					}
 				} catch (rollbackError) {
 					errors.push(toError('rollback', rollbackError));
 					await this.recordFailure(name, rollbackError);
@@ -1128,36 +1140,14 @@ export class DaemonServer {
 	}
 
 	private async loadHandoffs(config: AppConfig): Promise<AppConfig> {
-			let current = config;
-			for (const name of Object.keys(config.channels)) {
-				const record = await this.handoffStore.read(name);
-				if (!record) {
-					continue;
-				}
-				const restoreSource = record.state === 'pending' || record.recovery === 'source';
-				if (!restoreSource) {
-					this.handoffRecords.set(name, record);
-					continue;
-				}
-				const definition = current.channels[name];
-				if (!definition) {
-					continue;
-				}
-				const source = rebindChannelInstance(definition, {
-					host: record.source.host ?? null,
-					session: record.source.session,
-					...(record.source.chat ? { chat: record.source.chat } : {}),
-				});
-				current = await this.configStore.update(value => withChannel(value, name, source));
-				await this.setHandoffRecord(name, record.state === 'pending'
-					? failedHandoff(
-						record,
-						new Error('Daemon restarted before the handoff was applied; the committed source binding was restored'),
-					)
-					: failedHandoff(record, record.error ?? 'Handoff rollback restored the committed source binding'));
+		for (const name of Object.keys(config.channels)) {
+			const recovered = await this.bindings.recover(name);
+			if (recovered.handoff) {
+				this.handoffRecords.set(name, recovered.handoff);
 			}
-			return current;
 		}
+		return this.configStore.read();
+	}
 
 	private async interruptPendingHandoffs(): Promise<void> {
 			const operations = [...this.pendingHandoffs.entries()];
@@ -1288,21 +1278,6 @@ function appliedHandoff(
 				chat: runtime.snapshot.chat,
 			}
 			: record.resolvedTarget,
-	};
-}
-
-function failedHandoff(
-	record: ChannelHandoffRecord,
-	error: unknown,
-	recovery: boolean = false,
-): ChannelHandoffRecord {
-	const { recovery: _recovery, ...current } = record;
-	return {
-		...current,
-		state: 'failed',
-		updatedAt: new Date().toISOString(),
-		...(recovery ? { recovery: 'source' as const } : {}),
-		error: sanitizeErrorSummary(formatError(error)),
 	};
 }
 

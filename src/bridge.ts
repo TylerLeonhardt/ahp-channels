@@ -36,7 +36,7 @@ interface PendingClientTool {
 	readonly abort: AbortController;
 	readonly restored: boolean;
 	toolInput?: ChatToolCallReadyAction['toolInput'];
-	executed: boolean;
+	phase: 'awaiting-confirmation' | 'ready' | 'executing';
 }
 
 interface PendingBridgeHandoff {
@@ -78,7 +78,7 @@ export class ChannelBridge {
 	private readonly inFlightToolExecutions = new Set<Promise<void>>();
 	private actionLoop: Promise<void> | undefined;
 	private acceptingEvents = false;
-	private activationState: 'new' | 'paused' | 'active' | 'closed' = 'new';
+	private activationState: 'new' | 'paused' | 'activating' | 'active' | 'closed' = 'new';
 	private readonly activationHeldEventIds = new Set<string>();
 	private pendingHandoff: PendingBridgeHandoff | undefined;
 	private readonly lifetime = new AbortController();
@@ -100,6 +100,9 @@ export class ChannelBridge {
 				const pending = this.trackToolStart({ ...part.toolCall, turnId: turn.id }, true);
 				if (pending) {
 					pending.toolInput = part.toolCall.toolInput;
+					if (part.toolCall.status === ToolCallStatus.Running) {
+						pending.phase = 'ready';
+					}
 				}
 			}
 		}
@@ -206,9 +209,9 @@ export class ChannelBridge {
 			return false;
 		}
 		await pending.ready;
+		await this.drainEventHandlers();
 		return this.pendingHandoff === pending
 			&& !this.busy
-			&& this.inFlightEventHandlers.size === 0
 			&& this.inFlightToolExecutions.size === 0;
 	}
 
@@ -228,6 +231,11 @@ export class ChannelBridge {
 			throw new Error(`Cannot activate a channel bridge in state '${this.activationState}'`);
 		}
 		this.publishClient();
+		this.activationState = 'activating';
+		this.permissionRelay.start();
+		for (const toolCallId of this.pendingTools.keys()) {
+			this.executeTool(toolCallId);
+		}
 		if (this.options.eventJournal) {
 			await this.replayHeldEvents(
 				this.activationHeldEventIds,
@@ -251,10 +259,10 @@ export class ChannelBridge {
 			this.publishClient();
 		}
 		this.actionLoop = this.consumeChatActions();
-		this.permissionRelay.start();
-		for (const part of this.options.chatState.activeTurn?.responseParts ?? []) {
-			if (part.kind === ResponsePartKind.ToolCall && part.toolCall.status === ToolCallStatus.Running) {
-				this.executeTool(part.toolCall.toolCallId);
+		if (!paused) {
+			this.permissionRelay.start();
+			for (const toolCallId of this.pendingTools.keys()) {
+				this.executeTool(toolCallId);
 			}
 		}
 		if (this.options.eventJournal) {
@@ -334,7 +342,7 @@ export class ChannelBridge {
 			if (this.pendingHandoff) {
 				this.pendingHandoff.heldEventIds.add(journaled.id);
 				this.options.status?.report('held inbound channel message until the pending handoff finishes');
-			} else if (this.activationState === 'paused') {
+			} else if (this.activationState === 'paused' || this.activationState === 'activating') {
 				this.activationHeldEventIds.add(journaled.id);
 				this.options.status?.report('held inbound channel message until the destination binding commits');
 			} else {
@@ -470,6 +478,9 @@ export class ChannelBridge {
 					if (typeof pending.toolInput !== 'object' && action.editedToolInput !== undefined) {
 						pending.toolInput = action.editedToolInput;
 					}
+					if (pending.phase !== 'executing') {
+						pending.phase = 'ready';
+					}
 					this.executeTool(action.toolCallId);
 				} else {
 					this.cancelTool(pending);
@@ -516,7 +527,7 @@ export class ChannelBridge {
 			toolName: action.toolName,
 			abort: new AbortController(),
 			restored,
-			executed: false,
+			phase: 'awaiting-confirmation',
 		};
 		this.pendingTools.set(action.toolCallId, pending);
 		return pending;
@@ -529,16 +540,20 @@ export class ChannelBridge {
 		}
 		pending.toolInput = action.toolInput ?? pending.toolInput;
 		if (action.confirmed !== undefined) {
+			if (pending.phase !== 'executing') {
+				pending.phase = 'ready';
+			}
 			this.executeTool(action.toolCallId);
 		}
 	}
 
 	private executeTool(toolCallId: string): void {
 		const pending = this.pendingTools.get(toolCallId);
-		if (!pending || pending.executed || !this.isCurrentTool(pending)) {
+		if ((this.activationState !== 'active' && this.activationState !== 'activating')
+			|| !pending || pending.phase !== 'ready' || !this.isCurrentTool(pending)) {
 			return;
 		}
-		pending.executed = true;
+		pending.phase = 'executing';
 		const task = this.runTool(pending);
 		this.inFlightToolExecutions.add(task);
 		void task.then(

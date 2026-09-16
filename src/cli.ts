@@ -5,6 +5,8 @@ import { Command } from 'commander';
 import { isAbsolute, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { AgentHostService, type HostAliasInspection } from './agentHosts.js';
+import { ChannelBindingService } from './channelBindings.js';
+import { FileChannelHandoffStore } from './channelHandoff.js';
 import { ChannelRuntime, createChannelRuntimeServices, validateChannelDefinition } from './channelRuntime.js';
 import {
 	ConfigStore,
@@ -42,6 +44,7 @@ const store = new ConfigStore();
 const plugins = new PluginManager(store);
 const agentHosts = new AgentHostService(store);
 const sessionCatalog = new SessionCatalogService(agentHosts);
+const bindings = new ChannelBindingService(store, new FileChannelHandoffStore(store.home));
 
 program
 	.name('ahp-channels')
@@ -379,7 +382,6 @@ channel
 		if (!reference.installation) {
 			throw new Error(`Channel '${name}' uses a plugin path and cannot be upgraded through the plugin registry`);
 		}
-		const updated = { ...current, installation: reference.installation };
 		const daemonStatus = await probeDaemon(store.home);
 		if (daemonStatus) {
 			const status = await requestDaemon(store.home, {
@@ -390,8 +392,10 @@ channel
 			printChannelStatus(requireChannelStatus(status, name));
 			return;
 		}
+		const recovered = await bindings.recover(name);
+		const updated = { ...recovered.definition, installation: reference.installation };
 		await validateChannelDefinition(plugins, updated);
-		await store.update(config => withChannel(config, name, updated));
+		await bindings.replace(name, recovered.definition, updated);
 		printChannelStatus(stoppedChannelStatus(name, updated));
 	});
 channel
@@ -424,10 +428,10 @@ channel
 			printChannelStatus(requireChannelStatus(status, name));
 			return;
 		}
-		const current = await getOfflineChannel(name);
+		const { definition: current } = await bindings.recover(name);
 		const definition = retargetChannelInstance(current, options.session, options.chat);
 		await validateChannelDefinition(plugins, definition);
-		await store.update(config => withChannel(config, name, definition));
+		await bindings.replace(name, current, definition);
 		printChannelStatus(stoppedChannelStatus(name, definition));
 	});
 channel
@@ -495,13 +499,13 @@ channel
 			printChannelStatus(requireChannelStatus(status, name));
 			return;
 		}
-		const current = await getOfflineChannel(name);
+		const { definition: current } = await bindings.recover(name);
 		const definition = {
 			...current,
 			host: options.host,
 		};
 		await validateChannelDefinition(plugins, definition);
-		await store.update(config => withChannel(config, name, definition));
+		await bindings.replace(name, current, definition);
 		printChannelStatus(stoppedChannelStatus(name, definition));
 	});
 channel
@@ -801,14 +805,14 @@ async function handoffChannel(name: string, target: ChannelBindingTarget): Promi
 		printChannelStatus(requireChannelStatus(status, name));
 		return;
 	}
-	const current = await getOfflineChannel(name);
+	const { definition: current } = await bindings.recover(name);
 	const next = rebindChannelInstance(current, target);
 	await validateChannelDefinition(plugins, next);
 	const resolved = await sessionCatalog.validateBinding(next);
 	for (const warning of resolved.warnings) {
 		console.error(`Warning: ${warning}`);
 	}
-	await store.update(config => withChannel(config, name, next));
+	await bindings.replace(name, current, next);
 	printChannelStatus(stoppedChannelStatus(name, next));
 }
 

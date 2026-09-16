@@ -512,6 +512,15 @@ describe('DaemonServer', () => {
 			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
 			assert.equal(source.closed, false);
 
+			const competingToolResult = await management.callTool(
+				MANAGEMENT_TOOL_NAMES.handoff,
+				{ host: '@destination', session: 'ahp-session:/other' },
+				new AbortController().signal,
+			);
+			assert.equal(competingToolResult.success, false);
+			assert.match(competingToolResult.error?.message ?? '', /already pending/);
+			assert.equal(source.closed, false);
+
 			await assert.rejects(
 				requestDaemon(home, {
 					command: 'channel.handoff.request',

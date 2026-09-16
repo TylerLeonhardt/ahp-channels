@@ -11,6 +11,7 @@ import {
 import type { Subscription, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { EventEmitter, once } from 'node:events';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -26,6 +27,7 @@ import {
 	stopDaemon,
 } from '../src/daemonClient.js';
 import { discoverAgentHostsInRegistryDirectories } from '../src/endpoints.js';
+import { HANDOFF_RESOURCE_TOOL, assertHandoffResource, handoffResourceUri } from '../test/fixtures/handoff-resource.js';
 import {
 	DeterministicAgentHost,
 	type DeterministicHandoffTarget,
@@ -44,6 +46,7 @@ const destinationSession = `ahp-session:/${randomUUID()}`;
 const handoffMarker = `AHP_CHANNEL_HANDOFF_${randomUUID()}`;
 const sourceReply = `HANDOFF_SOURCE_REPLY_${randomUUID()}`;
 const destinationReply = `FAKECHAT_FIRST_${randomUUID()}`;
+const resourceId = process.argv.includes('--resources') ? randomUUID() : undefined;
 const hosts = [
 	new DeterministicAgentHost(sourceRegistry),
 	new DeterministicAgentHost(destinationRegistry),
@@ -83,6 +86,7 @@ try {
 		session: destinationSession,
 		chat: destination.chat,
 		sourceReply,
+		...(resourceId ? { resourceId } : {}),
 	};
 	hosts[0].configureHandoff(handoffMarker, target);
 	await createFixturePlugin(pluginPath, port);
@@ -134,14 +138,20 @@ try {
 
 	const sourceSocket = await connectExternalChannel(port);
 	sockets.add(sourceSocket);
+	const sourceProgress = new EventEmitter<{ pending: [] }>();
 	const sourceTurn = observeSourceHandoffTurn(
 		source.chatSubscription,
 		handoffMarker,
 		sourceRuntime.clientId,
+		sourceProgress,
+		resourceId,
 	);
 	const sourceResponse = waitForExactExternalReply(sourceSocket, sourceReply);
+	const resourceHandoff = resourceId
+		? verifyResourceHandoff(sourceSocket, sourceProgress, sourceRuntime.bindingId, resourceId)
+		: Promise.resolve();
 	sendExternalMessage(sourceSocket, `Please redirect this channel now: ${handoffMarker}`);
-	await Promise.all([sourceTurn, sourceResponse]);
+	await Promise.all([sourceTurn, sourceResponse, resourceHandoff]);
 	await waitForSocketClose(sourceSocket);
 	sockets.delete(sourceSocket);
 
@@ -169,6 +179,7 @@ try {
 		destination.chatState,
 		destination.chatSubscription,
 		destinationReply,
+		resourceId,
 	);
 	const destinationResponse = waitForExactExternalReply(destinationSocket, destinationReply);
 	sendExternalMessage(
@@ -186,6 +197,7 @@ try {
 		`${sourceEndpoint.id}/${sourceSession}/${source.chat}`,
 		'->',
 		`${destinationEndpoint.id}/${destinationSession}/${destination.chat}`,
+		...(resourceId ? ['including an in-flight MCP resources/read with exact text and PNG bytes'] : []),
 		'(fixture agent, fixture external channel; no real model or browser)',
 	].join(' '));
 } catch (error) {
@@ -344,10 +356,14 @@ async function observeSourceHandoffTurn(
 	subscription: Subscription,
 	marker: string,
 	clientId: string,
+	progress: EventEmitter<{ pending: [] }>,
+	expectedResourceId?: string,
 ): Promise<void> {
 	let turnId: string | undefined;
 	let sawPendingResult = false;
 	let sawSourceReply = false;
+	let resourceToolCallId: string | undefined;
+	let sawResourceResult = false;
 	const deadline = Date.now() + 30_000;
 	while (Date.now() < deadline) {
 		const event = await nextEvent(subscription, deadline - Date.now());
@@ -372,6 +388,18 @@ async function observeSourceHandoffTurn(
 			&& action.result.structuredContent?.['state'] === 'pending') {
 			assert.equal(action.result.success, true);
 			sawPendingResult = true;
+			progress.emit('pending');
+		}
+		if (action.type === ActionType.ChatToolCallStart && action.toolName === HANDOFF_RESOURCE_TOOL) {
+			resourceToolCallId = action.toolCallId;
+			assert.equal(action.contributor?.kind, ToolCallContributorKind.Client);
+			assert.equal(action.contributor.clientId, clientId);
+		}
+		if (action.type === ActionType.ChatToolCallComplete && action.toolCallId === resourceToolCallId) {
+			assert.ok(expectedResourceId);
+			assert.equal(sawPendingResult, true, 'Resource materialization must finish after the pending handoff result');
+			assertHandoffResource(action.result, expectedResourceId);
+			sawResourceResult = true;
 		}
 		if (action.type === ActionType.ChatToolCallStart && action.toolName === 'reply') {
 			sawSourceReply = true;
@@ -379,6 +407,9 @@ async function observeSourceHandoffTurn(
 		if (action.type === ActionType.ChatTurnComplete) {
 			assert.equal(sawPendingResult, true, 'Source agent must receive an accurate pending handoff result');
 			assert.equal(sawSourceReply, true, 'Source response must finish through the plugin before handoff');
+			if (expectedResourceId) {
+				assert.equal(sawResourceResult, true, 'The source turn must consume the materialized resource before handoff');
+			}
 			return;
 		}
 	}
@@ -389,6 +420,7 @@ async function observeDestinationTurn(
 	initial: ChatState,
 	subscription: Subscription,
 	marker: string,
+	sourceResourceId?: string,
 ): Promise<void> {
 	let turnId = initial.activeTurn?.message.text.includes(marker)
 		? initial.activeTurn.id
@@ -400,6 +432,10 @@ async function observeDestinationTurn(
 			continue;
 		}
 		const action = event.params.action;
+		if (sourceResourceId && action.type === ActionType.ChatToolCallComplete) {
+			assert.ok(!JSON.stringify(action.result).includes(handoffResourceUri(sourceResourceId)),
+				'Source resource results must never be published in the destination chat');
+		}
 		if (action.type === ActionType.ChatTurnStarted && action.message.text.includes(marker)) {
 			turnId = action.turnId;
 		}
@@ -408,6 +444,25 @@ async function observeDestinationTurn(
 		}
 	}
 	throw new Error('Timed out observing the destination turn');
+}
+
+async function verifyResourceHandoff(
+	socket: WebSocket,
+	progress: EventEmitter<{ pending: [] }>,
+	sourceBindingId: string,
+	id: string,
+): Promise<void> {
+	const pending = once(progress, 'pending', { signal: AbortSignal.timeout(30_000) });
+	const request = waitForExternalMessage(socket, { type: 'resource-read-started', uri: handoffResourceUri(id) })
+		.then(() => hosts[0].requestConfiguredHandoff(handoffMarker));
+	await Promise.all([pending, request]);
+	const status = await requestDaemon(testRoot, { command: 'status' });
+	const channel = status.channels.find(candidate => candidate.name === CHANNEL_NAME);
+	assert.equal(channel?.handoff?.state, 'pending');
+	assert.equal(channel.runtime?.bindingId, sourceBindingId);
+	assert.equal(channel.definition.session, sourceSession);
+	assert.equal(socket.readyState, WebSocket.OPEN, 'The source plugin must survive the blocked resource read');
+	socket.send(JSON.stringify({ type: 'release-resource', uri: handoffResourceUri(id) }));
 }
 
 async function waitForAppliedHandoff(home: string) {
@@ -431,9 +486,13 @@ function sendExternalMessage(socket: WebSocket, text: string): void {
 }
 
 function waitForExactExternalReply(socket: WebSocket, expected: string): Promise<void> {
+	return waitForExternalMessage(socket, { type: 'assistant', text: expected });
+}
+
+function waitForExternalMessage(socket: WebSocket, expected: Readonly<Record<string, string>>): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const timer = setTimeout(
-			() => finish(new Error(`Timed out waiting for external reply ${expected}`)),
+			() => finish(new Error(`Timed out waiting for external message ${JSON.stringify(expected)}`)),
 			30_000,
 		);
 		const onMessage = (data: RawData) => {
@@ -444,11 +503,11 @@ function waitForExactExternalReply(socket: WebSocket, expected: string): Promise
 				finish(new Error('External channel returned invalid JSON', { cause: error }));
 				return;
 			}
-			if (isRecord(value) && value['type'] === 'assistant' && value['text'] === expected) {
+			if (isRecord(value) && Object.entries(expected).every(([key, item]) => value[key] === item)) {
 				finish();
 			}
 		};
-		const onClose = () => finish(new Error(`External channel closed before reply ${expected}`));
+		const onClose = () => finish(new Error(`External channel closed before message ${JSON.stringify(expected)}`));
 		const finish = (error?: Error) => {
 			clearTimeout(timer);
 			socket.off('message', onMessage);
