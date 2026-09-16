@@ -88,7 +88,6 @@ try {
 		await chatSubscription.subscription.close();
 		throw new Error('The E2E chat returned no snapshot');
 	}
-
 	bridge = new ChannelBridge({
 		client,
 		clientId: connection.clientId,
@@ -99,7 +98,6 @@ try {
 		channel: mcp,
 		channelInfo,
 		customizations,
-		autoApproveTools: true,
 		onStatus: message => console.log(`[e2e] ${message}`),
 	});
 	await bridge.start();
@@ -110,7 +108,10 @@ try {
 		'configure',
 	);
 
-	const reply = await waitForFile(outputFile, 120_000);
+	const reply = await Promise.race([
+		waitForFile(outputFile, 120_000),
+		bridge.whenStopped.then(() => { throw new Error('Channel bridge stopped before the reply'); }),
+	]);
 	if (reply.trim().toUpperCase() !== 'PONG') {
 		throw new Error(`Expected channel reply PONG, received ${JSON.stringify(reply)}`);
 	}

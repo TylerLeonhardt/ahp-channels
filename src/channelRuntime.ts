@@ -1,4 +1,4 @@
-import type { ChatState, ListSessionsResult, SessionState, StateAction, SubscribeResult } from '@microsoft/agent-host-protocol';
+import type { ChatState, ListSessionsResult, ResourceReadParams, ResourceReadResult, SessionState, StateAction, SubscribeResult } from '@microsoft/agent-host-protocol';
 import type { DispatchHandle, ResourceRequestHandlers, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { connectAgentHost, createChannelClientId, resolveChat } from './ahp.js';
 import { ChannelBridge, publishActiveClient } from './bridge.js';
@@ -56,6 +56,7 @@ export interface ChannelHostClient {
 		readonly cursor?: string;
 		readonly limit?: number;
 	}): Promise<ListSessionsResult>;
+	request(method: 'resourceRead', params: ResourceReadParams): Promise<ResourceReadResult>;
 	subscribe(uri: string): Promise<{ result: SubscribeResult; subscription: ChannelSubscription }>;
 	unsubscribe(uri: string): Promise<void>;
 	shutdown(): Promise<void>;

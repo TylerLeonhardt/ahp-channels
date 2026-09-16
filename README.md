@@ -152,6 +152,61 @@ Control traffic uses a per-install random token over a local named pipe on
 Windows or a mode-`0600` Unix socket. Configuration writes are atomic and use a
 heartbeat-backed cross-process lock.
 
+### Approve tools from a channel
+
+Tools contributed by a channel, such as its `reply` tool, are automatically
+approved for that channel's client. Trust requires both the exact client
+identity and a tool name in its published tool list; a host tool or another
+client's tool named `reply` is not trusted by name alone. Execution still waits
+for the Agent Host to accept the approval. This works even without native
+permission support and does not enable session-wide "allow all" permissions.
+Only run channel plugins whose contributed tools you trust.
+Pending calls for tools the channel no longer advertises are denied explicitly;
+already-running unavailable calls report a failure instead of leaving the turn
+waiting. Cancellation stops pending argument reads and prevents a new channel
+tool invocation afterward. It cannot undo effects of a tool that already began.
+
+Channel plugins that advertise `claude/channel/permission: {}` can relay tool
+approval requests for other tools in their bound AHP chat. Missing or `false`
+capabilities leave those approvals in the Agent Host UI. The bridge uses the native
+[`permission_request` / `permission` notifications](https://code.claude.com/docs/en/channels-reference#relay-permission-prompts),
+not plugin-specific reply tools or model-parsed chat commands.
+
+When another tool needs confirmation, the plugin receives its name, a sanitized
+description and argument preview, and a short request ID. Use the plugin's
+approval controls, such as Telegram's Allow/Deny buttons or `yes abcde` /
+`no abcde` replies. A verdict applies only to that pending call; it never
+selects a session-wide trust option. Execution still waits for an accepted
+Agent Host confirmation. The Agent Host dialog remains available, and a
+decision there invalidates the channel request.
+
+Previews visibly neutralize control characters and disguise-prone Unicode,
+mask recognizable credential tokens, and mark omitted content while retaining
+both ends of long values. They are bounded previews, not exhaustive secret
+detection or full diffs. Review the complete input in the Agent Host UI if the
+preview is insufficient to make a safe decision.
+
+Requests expire after five minutes. Duplicate, unknown, superseded, and
+expired verdicts do not approve tools or become agent messages. Stopping a
+channel invalidates its requests; restarting reconstructs pending tool
+confirmations from the host snapshot and issues fresh requests. Referenced
+arguments are read for the preview and re-read before approval; changed
+content requires another decision. Inputs that cannot be read or exceed
+1 MiB are not offered for remote approval, and the reason is logged.
+
+**Trust boundary:** the channel plugin owns sender authentication, pairing,
+allowlists, and prompt delivery. Native verdicts contain a request ID and
+decision, not a sender identity; the bridge cannot independently enforce
+same-sender approval. Enable permission-capable channels only when you trust
+the plugin and its authorized users to approve tool use in the bound chat,
+including turns started from the editor.
+
+Tool-use and mid-execution re-confirmations are supported. Project trust,
+MCP authentication/consent, result-review confirmations, and arbitrary user
+questions remain in the Agent Host UI.
+Re-confirmation previews include the current permission request, with the
+original tool intention shown only as additional context.
+
 ## Manage plugin versions
 
 ```powershell
@@ -193,6 +248,7 @@ npm run test:package
 npm run e2e:local
 npm run e2e:daemon
 npm run e2e:fakechat
+npm run e2e:permissions
 ```
 
 ### Official fakechat E2E
@@ -208,6 +264,10 @@ customization, and client-tool protocol used by a full agent provider, but
 needs no model credentials. The default local mode remains available for
 validating against a real installed Agent Host.
 
+The deterministic host also requires confirmation for the contributed `reply`
+tool. The bridge must automatically approve it before execution; the E2E
+harnesses observe the flow without injecting approval decisions.
+
 The test installs the real `fakechat@claude-plugins-official` plugin through the
 built CLI, creates a temporary AHP session and named channel, and exchanges an
 exact message and reply through fakechat's browser-facing WebSocket. It then
@@ -216,6 +276,32 @@ available loopback port instead of assuming fakechat's default, requires no
 credentials or external messaging service, and removes its temporary
 `AHP_CHANNELS_HOME`, plugin home, Bun cache, channel, daemon, and AHP session on
 both success and failure.
+
+### Permission relay E2E
+
+`npm run e2e:permissions` uses the same harness and a test-only native-permission
+extension around the unmodified official fakechat server. Official fakechat
+does not currently advertise the permission capability, so this is explicitly
+an extended fixture, separate from the normal official-fakechat smoke test.
+The real fakechat web UI, reply tools, Bun process, daemon, and AHP protocol are
+still exercised. CI runs both modes.
+
+```powershell
+$env:AHP_CHANNELS_E2E_USE_FIXTURE_HOST = '1'
+npm run e2e:permissions
+```
+
+The deterministic host requests permission for an actual marker-file write
+inside isolated test state. The test answers through fakechat's browser-facing
+WebSocket, checks the bridge-authored AHP verdict, and verifies that allowing
+writes the file while denying does not. It also restarts the daemon with a
+pending request and verifies that a stale allow reply cannot override a fresh
+denial. The approval observer does not dispatch confirmations.
+
+For browser-driven testing, add `-- --interactive`. The harness prints its UI
+URL, message to send, and expected verdict for each case. The fixture-only
+`/permissions` command displays outstanding cards after the browser reconnects;
+it models the message history a real chat platform keeps.
 
 See [SHIPPING.md](./SHIPPING.md) for the npm prerelease gates and
 [PUBLISHING.md](./PUBLISHING.md) for the tag-driven release process.

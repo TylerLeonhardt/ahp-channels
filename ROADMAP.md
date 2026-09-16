@@ -89,9 +89,15 @@ files.
 - Resolve alpha feedback and document protocol, host, and plugin compatibility
   limits.
 
+## Completed: Tool permission relay
+
+- Native channel permission requests and verdicts with sanitized previews,
+  short-lived request IDs, and Agent Host-authoritative decisions.
+- Fakechat-based approval and denial coverage, including a pending request
+  across daemon restart and stale verdict rejection.
+
 ## Later: Protocol coverage
 
-- Permission relay with sanitized previews and expiring request IDs.
 - Attachment and resource-reference translation.
 
 ## Later: Marketplace and distribution

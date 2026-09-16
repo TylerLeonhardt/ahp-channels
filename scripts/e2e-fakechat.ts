@@ -1,20 +1,20 @@
 import {
 	ActionType,
-	ConfirmationOptionKind,
 	CustomizationLoadStatus,
 	CustomizationType,
 	SessionLifecycle,
 	ToolCallConfirmationReason,
+	ToolCallContributorKind,
 	sessionReducer,
 	type ChatState,
-	type ChatToolCallReadyAction,
 	type RootState,
 	type SessionAction,
 	type SessionState,
 } from '@microsoft/agent-host-protocol';
 import type { Subscription, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import assert from 'node:assert/strict';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -32,6 +32,8 @@ import { DeterministicAgentHost } from './deterministic-agent-host.js';
 const CHANNEL_NAME = 'fakechat-e2e';
 const PLUGIN_NAME = 'fakechat';
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const permissionMode = process.argv.includes('--permissions');
+const interactive = process.argv.includes('--interactive');
 
 const testRoot = await mkdtemp(join(tmpdir(), 'ahp-fakechat-'));
 const fakeHome = join(testRoot, 'user-home');
@@ -88,6 +90,10 @@ try {
 	const client = connection.client;
 	await mkdir(fakeHome, { recursive: true });
 	const installedFakechat = await installOfficialFakechat(testRoot);
+	const permissionPlugin = permissionMode
+		? await createPermissionFixture(testRoot, installedFakechat.path)
+		: undefined;
+	const expectedInstallation = permissionMode ? undefined : installedFakechat.installation;
 
 	const rootSnapshot = connection.initializeResult.snapshots.find(snapshot => snapshot.resource === 'ahp-root://');
 	const provider = (rootSnapshot?.state as RootState | undefined)?.agents[0]?.provider;
@@ -120,8 +126,8 @@ try {
 		command: 'channel.create',
 		name: CHANNEL_NAME,
 		definition: {
-			plugin: PLUGIN_NAME,
-			installation: installedFakechat.installation,
+			plugin: permissionPlugin ?? PLUGIN_NAME,
+			...(expectedInstallation ? { installation: expectedInstallation } : {}),
 			session,
 			enabled: false,
 			host: endpoint.id,
@@ -129,7 +135,7 @@ try {
 		start: true,
 	});
 	channelCreated = true;
-	const clientId = requireRunningChannel(created, installedFakechat.installation);
+	const clientId = requireRunningChannel(created, expectedInstallation);
 	sessionState = await waitForFakechatContribution(sessionState, sessionSubscription, clientId);
 	await waitForFakechatReady(testRoot, port);
 	await access(join(installedFakechat.path, 'node_modules'));
@@ -139,13 +145,44 @@ try {
 
 	let socket = await connectFakechat(port);
 	sockets.add(socket);
-	await runRoundTrip(
-		client,
-		socket,
-		initialChatState,
-		chatSubscription,
-		`FAKECHAT_FIRST_${randomUUID()}`,
-	);
+	let pendingRestart: {
+		readonly marker: string;
+		readonly requestId: string;
+		readonly finished: Promise<void>;
+	} | undefined;
+	if (permissionMode) {
+		for (const allowed of [true, false]) {
+			const marker = `FAKECHAT_PERMISSION_${allowed ? 'ALLOW' : 'DENY'}_${randomUUID()}`;
+			const path = join(fixtureRegistry, `${marker}.txt`);
+			if (interactive) {
+				console.log(`FAKECHAT_BROWSER_URL=http://127.0.0.1:${port}/`);
+				console.log(`FAKECHAT_BROWSER_PROMPT=${permissionPrompt(marker, path)}`);
+				console.log(`FAKECHAT_BROWSER_VERDICT=${allowed ? 'yes' : 'no'}`);
+				await observePermissionTurn(chatSubscription, marker, allowed, clientId);
+			} else {
+				await runPermissionRoundTrip(socket, chatSubscription, marker, path, allowed, clientId);
+			}
+			if (useFixtureHost) {
+				if (allowed) {
+					assert.equal(await readFile(path, 'utf8'), marker);
+				} else {
+					await assertMissing(path);
+				}
+			}
+		}
+		const marker = `FAKECHAT_PERMISSION_RESTART_${randomUUID()}`;
+		const finished = observePermissionTurn(chatSubscription, marker, false, clientId);
+		const prompt = waitForPermissionPrompt(socket);
+		sendFakechat(socket, permissionPrompt(marker, join(fixtureRegistry, `${marker}.txt`)));
+		pendingRestart = { marker, requestId: (await prompt).id, finished };
+	} else {
+		await runRoundTrip(
+			socket,
+			initialChatState,
+			chatSubscription,
+			`FAKECHAT_FIRST_${randomUUID()}`,
+		);
+	}
 	await access(join(fakeHome, '.claude', 'channels', 'fakechat', 'outbox'));
 	await closeWebSocket(socket);
 	sockets.delete(socket);
@@ -157,7 +194,7 @@ try {
 
 	const restarted = await ensureDaemonStarted(testRoot);
 	daemonStarted = true;
-	const restartedClientId = requireRunningChannel(restarted, installedFakechat.installation);
+	const restartedClientId = requireRunningChannel(restarted, expectedInstallation);
 	sessionState = await waitForFakechatContribution(
 		sessionState,
 		sessionSubscription,
@@ -167,19 +204,34 @@ try {
 
 	socket = await connectFakechat(port);
 	sockets.add(socket);
-	await runRoundTrip(
-		client,
-		socket,
-		initialChatState,
-		chatSubscription,
-		`FAKECHAT_RESTART_${randomUUID()}`,
-	);
+	if (pendingRestart) {
+		const prompt = waitForPermissionPrompt(socket);
+		sendFakechat(socket, '/permissions');
+		const resumed = await prompt;
+		assert.notEqual(resumed.id, pendingRestart.requestId, 'Restart must issue a fresh approval ID');
+		const reply = waitForPermissionResult(socket, `${pendingRestart.marker}_DENIED`);
+		sendFakechat(socket, `yes ${pendingRestart.requestId}`);
+		sendFakechat(socket, `no ${resumed.id}`);
+		await Promise.all([pendingRestart.finished, reply]);
+		if (useFixtureHost) {
+			await assertMissing(join(fixtureRegistry, `${pendingRestart.marker}.txt`));
+		}
+	} else {
+		await runRoundTrip(
+			socket,
+			initialChatState,
+			chatSubscription,
+			`FAKECHAT_RESTART_${randomUUID()}`,
+		);
+	}
 	await closeWebSocket(socket);
 	sockets.delete(socket);
 
 	await requestDaemon(testRoot, { command: 'channel.delete', name: CHANNEL_NAME });
 	channelCreated = false;
-	console.log(`Official fakechat E2E passed on 127.0.0.1:${port}, including daemon restart`);
+	console.log(permissionMode
+		? `Native permission relay E2E passed on 127.0.0.1:${port} using the extended fakechat fixture: allow, deny, pending restart, stale verdict`
+		: `Official fakechat E2E passed on 127.0.0.1:${port}, including daemon restart`);
 } catch (error) {
 	primaryError = error;
 } finally {
@@ -275,6 +327,28 @@ async function installOfficialFakechat(home: string): Promise<InstalledFakechat>
 	return { installation, path: plugin.path };
 }
 
+async function createPermissionFixture(home: string, installedPlugin: string): Promise<string> {
+	const path = join(home, 'fakechat-permission-fixture');
+	await mkdir(join(path, '.claude-plugin'), { recursive: true });
+	await writeFile(join(path, '.claude-plugin', 'plugin.json'), JSON.stringify({
+		name: PLUGIN_NAME,
+		version: '0.1.0-permissions-fixture',
+	}));
+	await writeFile(join(path, '.mcp.json'), JSON.stringify({
+		mcpServers: {
+			fakechat: {
+				command: process.execPath,
+				args: [
+					'--import', import.meta.resolve('tsx'),
+					join(repositoryRoot, 'test', 'fixtures', 'fakechat-permissions.ts'),
+					installedPlugin,
+				],
+			},
+		},
+	}));
+	return path;
+}
+
 async function allocateLoopbackPort(): Promise<number> {
 	const server = createServer();
 	try {
@@ -296,7 +370,7 @@ async function allocateLoopbackPort(): Promise<number> {
 	}
 }
 
-function requireRunningChannel(status: DaemonStatus, installation: string): string {
+function requireRunningChannel(status: DaemonStatus, installation: string | undefined): string {
 	const channel = status.channels.find(candidate => candidate.name === CHANNEL_NAME);
 	if (channel?.state !== 'running'
 		|| !channel.runtime
@@ -305,6 +379,149 @@ function requireRunningChannel(status: DaemonStatus, installation: string): stri
 		throw new Error(`fakechat channel did not start: ${JSON.stringify(channel)}`);
 	}
 	return channel.runtime.clientId;
+}
+
+function permissionPrompt(marker: string, path: string): string {
+	return `Ask for approval before writing exactly ${marker} to ${path}. If allowed, reply with exactly ${marker}_ALLOWED; if denied, reply with exactly ${marker}_DENIED. Use the fakechat reply tool, not transcript text.`;
+}
+
+function sendFakechat(socket: WebSocket, text: string): void {
+	socket.send(JSON.stringify({ id: `e2e-${randomUUID()}`, text }));
+}
+
+async function runPermissionRoundTrip(
+	socket: WebSocket,
+	subscription: Subscription,
+	marker: string,
+	path: string,
+	allowed: boolean,
+	clientId: string,
+): Promise<void> {
+	const finished = observePermissionTurn(subscription, marker, allowed, clientId);
+	const prompt = waitForPermissionPrompt(socket);
+	const reply = waitForPermissionResult(socket, `${marker}_${allowed ? 'ALLOWED' : 'DENIED'}`);
+	try {
+		sendFakechat(socket, permissionPrompt(marker, path));
+		const request = await prompt;
+		assert.match(request.text, /Approve this call only/);
+		assert.match(request.text, /expires/);
+		sendFakechat(socket, `${allowed ? 'yes' : 'no'} ${request.id}`);
+		await Promise.all([finished, reply]);
+	} catch (error) {
+		void Promise.allSettled([finished, prompt, reply]);
+		throw error;
+	}
+}
+
+function waitForPermissionPrompt(socket: WebSocket): Promise<{ id: string; text: string }> {
+	return waitForFakechatMessage(socket, 'a permission request').then(text => {
+		const match = /^Permission request ([a-km-z]{5}):/.exec(text);
+		if (!match) {
+			throw new Error(`Expected a permission request, received ${JSON.stringify(text)}`);
+		}
+		return { id: match[1], text };
+	});
+}
+
+function waitForPermissionResult(socket: WebSocket, expected: string): Promise<void> {
+	return waitForFakechatMessage(socket, expected, expected).then(() => undefined);
+}
+
+function waitForFakechatMessage(socket: WebSocket, description: string, expected?: string): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => finish(new Error(`Timed out waiting for fakechat ${description}`)), 120_000);
+		const onMessage = (data: RawData) => {
+			let value: unknown;
+			try {
+				value = JSON.parse(String(data));
+			} catch (error) {
+				finish(new Error('fakechat returned invalid JSON', { cause: error }));
+				return;
+			}
+			if (!isRecord(value) || value['type'] !== 'msg' || value['from'] !== 'assistant' || typeof value['text'] !== 'string') {
+				return;
+			}
+			if (expected && value['text'].startsWith('Permission request ')) {
+				return;
+			}
+			if (expected && value['text'] !== expected) {
+				finish(new Error(`Expected ${expected}, received ${JSON.stringify(value['text'])}`));
+				return;
+			}
+			finish(undefined, value['text']);
+		};
+		const onClose = () => finish(new Error(`fakechat disconnected before ${description}`));
+		const onError = (error: Error) => finish(error);
+		const finish = (error?: Error, text?: string) => {
+			clearTimeout(timer);
+			socket.off('message', onMessage);
+			socket.off('close', onClose);
+			socket.off('error', onError);
+			if (error) {
+				reject(error);
+			} else if (text !== undefined) {
+				resolve(text);
+			}
+		};
+		socket.on('message', onMessage);
+		socket.once('close', onClose);
+		socket.once('error', onError);
+	});
+}
+
+async function observePermissionTurn(
+	subscription: Subscription,
+	marker: string,
+	allowed: boolean,
+	clientId: string,
+): Promise<void> {
+	let activeTurnId: string | undefined;
+	const pendingTools = new Set<string>();
+	const channelTools = new Set<string>();
+	const decided = new Set<string>();
+	const deadline = Date.now() + 120_000;
+	while (Date.now() < deadline) {
+		const event = await nextEvent(subscription, deadline - Date.now());
+		if (event.type !== 'action' || event.params.rejectionReason) {
+			continue;
+		}
+		const action = event.params.action;
+		if (action.type === ActionType.ChatTurnStarted && action.message.text.includes(marker)) {
+			activeTurnId = action.turnId;
+		}
+		if ('turnId' in action && action.turnId === activeTurnId) {
+			if (action.type === ActionType.ChatToolCallStart
+				&& action.contributor?.kind === ToolCallContributorKind.Client
+				&& action.contributor.clientId === clientId) {
+				channelTools.add(action.toolCallId);
+			}
+			if (action.type === ActionType.ChatToolCallReady
+				&& action.confirmed === undefined
+				&& !channelTools.has(action.toolCallId)) {
+				pendingTools.add(action.toolCallId);
+			}
+			if (action.type === ActionType.ChatToolCallConfirmed && channelTools.has(action.toolCallId)) {
+				assert.equal(action.approved, true, 'Contributed channel tools must be automatically approved');
+				assert.equal(action.confirmed, ToolCallConfirmationReason.NotNeeded);
+				assert.equal(action.selectedOptionId, undefined, 'Automatic approval must not change session policy');
+				assert.equal(event.params.origin?.clientId, clientId, 'The bridge must approve its own tools');
+			}
+			if (action.type === ActionType.ChatToolCallConfirmed && pendingTools.has(action.toolCallId)) {
+				assert.equal(action.approved, allowed, 'Tool decision must match the fakechat verdict');
+				assert.equal(event.params.origin?.clientId, clientId, 'Only the bridge may relay the UI verdict');
+				assert.ok(!decided.has(action.toolCallId), 'A permission request must be settled once');
+				decided.add(action.toolCallId);
+			}
+			if (action.type === ActionType.ChatTurnComplete) {
+				assert.ok(decided.size > 0, 'The turn must actually require and receive a relayed permission decision');
+				return;
+			}
+			if (action.type === ActionType.ChatTurnCancelled || action.type === ActionType.ChatError) {
+				throw new Error(`Permission E2E turn ended unexpectedly: ${action.type}`);
+			}
+		}
+	}
+	throw new Error('Timed out observing a permission-relayed turn');
 }
 
 async function waitForFakechatContribution(
@@ -435,7 +652,6 @@ async function connectFakechat(port: number): Promise<WebSocket> {
 }
 
 async function runRoundTrip(
-	client: ConnectedAgentHost['client'],
 	socket: WebSocket,
 	initialChatState: ChatState,
 	subscription: Subscription,
@@ -447,7 +663,7 @@ async function runRoundTrip(
 		'Do not include quotes, punctuation, formatting, or any other text.',
 	].join(' ');
 	const messageId = `e2e-${randomUUID()}`;
-	const turn = approveChannelTurn(client, initialChatState, subscription, expectedReply);
+	const turn = observeChannelTurn(initialChatState, subscription, expectedReply);
 	const reply = waitForExactReply(socket, expectedReply);
 	try {
 		socket.send(JSON.stringify({ id: messageId, text: prompt }));
@@ -500,8 +716,7 @@ function waitForExactReply(socket: WebSocket, expected: string): Promise<void> {
 	});
 }
 
-async function approveChannelTurn(
-	client: ConnectedAgentHost['client'],
+async function observeChannelTurn(
 	initial: ChatState,
 	subscription: Subscription,
 	expectedMarker: string,
@@ -520,12 +735,6 @@ async function approveChannelTurn(
 			activeTurnId = action.turnId;
 			continue;
 		}
-		if (action.type === ActionType.ChatToolCallReady
-			&& action.turnId === activeTurnId
-			&& action.confirmed === undefined) {
-			approveTool(client, subscription.uri, action);
-			continue;
-		}
 		if ((action.type === ActionType.ChatTurnComplete
 			|| action.type === ActionType.ChatTurnCancelled
 			|| action.type === ActionType.ChatError)
@@ -537,24 +746,6 @@ async function approveChannelTurn(
 		}
 	}
 	throw new Error(`Timed out waiting for fakechat turn containing ${expectedMarker}`);
-}
-
-function approveTool(
-	client: ConnectedAgentHost['client'],
-	chat: string,
-	action: ChatToolCallReadyAction,
-): void {
-	const selectedOptionId = action.options?.find(option =>
-		option.kind === ConfirmationOptionKind.Approve && /once/i.test(option.id)
-	)?.id ?? action.options?.find(option => option.kind === ConfirmationOptionKind.Approve)?.id;
-	client.dispatch(chat, {
-		type: ActionType.ChatToolCallConfirmed,
-		turnId: action.turnId,
-		toolCallId: action.toolCallId,
-		approved: true,
-		confirmed: ToolCallConfirmationReason.UserAction,
-		...(selectedOptionId ? { selectedOptionId } : {}),
-	});
 }
 
 async function waitForSessionChat(initial: SessionState, subscription: Subscription): Promise<SessionState> {

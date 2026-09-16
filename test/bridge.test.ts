@@ -1,19 +1,26 @@
 import {
 	ActionType,
+	ContentEncoding,
 	ConfirmationOptionKind,
 	CustomizationEnablementKind,
 	CustomizationType,
 	MessageKind,
 	PendingMessageKind,
+	ResponsePartKind,
+	ToolCallCancellationReason,
 	ToolCallConfirmationReason,
 	ToolCallContributorKind,
+	ToolCallStatus,
 	ToolResultContentType,
+	type ChatState,
+	type ResourceReadResult,
 	type StateAction,
+	type ToolCallPendingConfirmationState,
 	type ToolCallResult,
 } from '@microsoft/agent-host-protocol';
 import type { DispatchHandle, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { describe, it, type TestContext } from 'node:test';
 import { ChannelBridge } from '../src/bridge.js';
 import type { ChannelEvent } from '../src/channelPrompt.js';
 
@@ -57,7 +64,7 @@ class TestSubscription implements AsyncIterable<SubscriptionEvent> {
 }
 
 describe('ChannelBridge', () => {
-	it('routes an inbound event and executes a client-owned tool', async () => {
+	it('auto-approves a contributed tool but executes only after the host accepts', async context => {
 		const dispatched: Array<{ channel: string; action: StateAction }> = [];
 		let channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
 		const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
@@ -114,9 +121,9 @@ describe('ChannelBridge', () => {
 				}],
 				nonce: 'plugin-nonce',
 			}],
-			autoApproveTools: true,
 			onStatus: message => statuses.push(message),
 		});
+		context.after(() => bridge.close());
 
 		await bridge.start();
 		await channelHandler?.({ content: 'hello', meta: { chat_id: '42' } });
@@ -131,6 +138,7 @@ describe('ChannelBridge', () => {
 		assert.equal(turnActions.length, 2);
 		const turnAction = turnActions[1];
 		assert.ok(turnAction?.type === ActionType.ChatTurnStarted);
+		subscription.push(actionEvent(turnAction));
 
 		subscription.push(actionEvent({
 			type: ActionType.ChatToolCallStart,
@@ -152,15 +160,23 @@ describe('ChannelBridge', () => {
 			],
 		}));
 		await waitFor(() => dispatched.some(item => item.action.type === ActionType.ChatToolCallConfirmed));
-		subscription.push(actionEvent({
+		const confirmation = dispatched.find(item => item.action.type === ActionType.ChatToolCallConfirmed)?.action;
+		assert.deepEqual(confirmation, {
 			type: ActionType.ChatToolCallConfirmed,
 			turnId: turnAction.turnId,
 			toolCallId: 'tool-1',
 			approved: true,
-			confirmed: ToolCallConfirmationReason.UserAction,
-			selectedOptionId: 'allow-once',
-		}));
+			confirmed: ToolCallConfirmationReason.NotNeeded,
+		});
+		assert.deepEqual(toolCalls, []);
+		assert.ok(confirmation?.type === ActionType.ChatToolCallConfirmed);
+		subscription.push(actionEvent({ ...confirmation, turnId: 'previous-turn' }));
+		subscription.push(actionEvent(confirmation, 'read only'));
+		await waitFor(() => statuses.filter(message => message === 'action rejected: read only').length === 2);
+		assert.deepEqual(toolCalls, []);
+		subscription.push(actionEvent(confirmation));
 		await waitFor(() => dispatched.some(item => item.action.type === ActionType.ChatToolCallComplete));
+		assert.equal(dispatched.filter(item => item.action.type === ActionType.ChatToolCallConfirmed).length, 1);
 		await bridge.close();
 
 		assert.deepEqual({
@@ -223,6 +239,162 @@ describe('ChannelBridge', () => {
 		});
 	});
 
+	it('restores a pending contributed tool from a snapshot and waits for host approval', async context => {
+		const subscription = new TestSubscription();
+		const dispatched: StateAction[] = [];
+		const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+		const bridge = new ChannelBridge({
+			client: {
+				dispatch(_channel, action) {
+					dispatched.push(action);
+					return { clientSeq: dispatched.length };
+				},
+			},
+			clientId: 'channel-client',
+			session: 'ahp-session:/session',
+			chat: 'ahp-chat:/chat',
+			chatState: {
+				resource: 'ahp-chat:/chat',
+				title: 'Chat',
+				status: 1,
+				modifiedAt: new Date(0).toISOString(),
+				turns: [],
+				activeTurn: {
+					id: 'resumed-turn',
+					startedAt: new Date(0).toISOString(),
+					message: { text: 'reply', origin: { kind: MessageKind.User } },
+					usage: undefined,
+					responseParts: [{
+						kind: ResponsePartKind.ToolCall,
+						toolCall: {
+							toolCallId: 'resumed-tool',
+							toolName: 'reply',
+							displayName: 'Reply',
+							contributor: { kind: ToolCallContributorKind.Client, clientId: 'channel-client' },
+							status: ToolCallStatus.PendingConfirmation,
+							invocationMessage: 'Reply',
+							toolInput: '{"text":"resumed reply"}',
+						},
+					}],
+				},
+			},
+			chatSubscription: subscription,
+			channel: {
+				async setChannelHandler() { },
+				async callTool(name, args) {
+					toolCalls.push({ name, args });
+					return { success: true, pastTenseMessage: 'Replied' };
+				},
+				async close() { },
+			},
+			channelInfo: { name: 'fake', tools: [{ name: 'reply' }] },
+			customizations: [],
+		});
+		context.after(() => bridge.close());
+		await bridge.start();
+		const confirmation = dispatched.find(action => action.type === ActionType.ChatToolCallConfirmed);
+		assert.deepEqual(confirmation, {
+			type: ActionType.ChatToolCallConfirmed,
+			turnId: 'resumed-turn',
+			toolCallId: 'resumed-tool',
+			approved: true,
+			confirmed: ToolCallConfirmationReason.NotNeeded,
+		});
+		assert.deepEqual(toolCalls, []);
+		assert.ok(confirmation);
+		subscription.push(actionEvent(confirmation));
+		await waitFor(() => dispatched.some(action => action.type === ActionType.ChatToolCallComplete));
+		assert.deepEqual(toolCalls, [{ name: 'reply', args: { text: 'resumed reply' } }]);
+	});
+
+	for (const type of [ActionType.ChatTurnCancelled, ActionType.ChatTurnComplete] as const) {
+		it(`cancels a referenced input read immediately on ${type}`, async context => {
+			const fixture = createToolFixture(context);
+			const input = deferred<ResourceReadResult>();
+			fixture.host.readResult = input.promise;
+			await fixture.bridge.start();
+			fixture.confirm();
+			await waitFor(() => fixture.host.readCount === 1);
+			fixture.subscription.push(actionEvent({ type, turnId: 'tool-turn', duration: 0 }));
+			try {
+				await waitFor(() => !fixture.bridge.busy);
+			} finally {
+				input.resolve({ data: '{"text":"too late"}', encoding: ContentEncoding.Utf8 });
+			}
+			await fixture.bridge.close();
+			assert.deepEqual(fixture.calls, []);
+			assert.equal(fixture.dispatched.some(action => action.type === ActionType.ChatToolCallComplete), false);
+		});
+	}
+
+	it('discards the result of a running MCP call when its turn is cancelled', async context => {
+		const fixture = createToolFixture(context);
+		const result = deferred<ToolCallResult>();
+		fixture.channel.result = result.promise;
+		await fixture.bridge.start();
+		fixture.confirm();
+		await waitFor(() => fixture.calls.length === 1);
+		fixture.subscription.push(actionEvent({
+			type: ActionType.ChatTurnCancelled, turnId: 'tool-turn', duration: 0,
+		}));
+		try {
+			await waitFor(() => !fixture.bridge.busy);
+		} finally {
+			result.reject(new Error('late MCP failure after cancellation'));
+		}
+		await fixture.bridge.close();
+		assert.equal(fixture.dispatched.some(action => action.type === ActionType.ChatToolCallComplete), false);
+	});
+
+	it('invalidates an input read when the host completes that tool', async context => {
+		const fixture = createToolFixture(context);
+		const input = deferred<ResourceReadResult>();
+		fixture.host.readResult = input.promise;
+		await fixture.bridge.start();
+		fixture.confirm();
+		await waitFor(() => fixture.host.readCount === 1);
+		fixture.subscription.push(actionEvent({
+			type: ActionType.ChatToolCallComplete, turnId: 'tool-turn', toolCallId: 'owned-tool',
+			result: { success: false, pastTenseMessage: 'Timed out', error: { message: 'Host timed out the tool' } },
+		}));
+		fixture.subscription.push(actionEvent({
+			type: ActionType.ChatTurnComplete, turnId: 'tool-turn', duration: 0,
+		}));
+		try {
+			await waitFor(() => !fixture.bridge.busy);
+		} finally {
+			input.resolve({ data: '{}', encoding: ContentEncoding.Utf8 });
+		}
+		await fixture.bridge.close();
+		assert.deepEqual(fixture.calls, []);
+	});
+
+	it('denies a restored tool that the channel no longer provides', async context => {
+		const fixture = createToolFixture(context, 'removed');
+		await fixture.bridge.start();
+		const decision = fixture.dispatched.find(action => action.type === ActionType.ChatToolCallConfirmed);
+		assert.ok(decision?.type === ActionType.ChatToolCallConfirmed && !decision.approved);
+		assert.equal(decision.reason, ToolCallCancellationReason.Denied);
+		fixture.subscription.push(actionEvent(decision));
+		fixture.subscription.push(actionEvent({
+			type: ActionType.ChatTurnComplete, turnId: 'tool-turn', duration: 0,
+		}));
+		await waitFor(() => !fixture.bridge.busy);
+		assert.deepEqual(fixture.calls, []);
+		assert.equal(fixture.host.readCount, 0);
+	});
+
+	it('explicitly fails an unavailable owned tool restored in running state', async context => {
+		const fixture = createToolFixture(context, 'removed', true);
+		await fixture.bridge.start();
+		await waitFor(() => fixture.dispatched.some(action => action.type === ActionType.ChatToolCallComplete));
+		const completion = fixture.dispatched.find(action => action.type === ActionType.ChatToolCallComplete);
+		assert.ok(completion?.type === ActionType.ChatToolCallComplete && !completion.result.success);
+		assert.match(completion.result.error?.message ?? '', /removed.*no longer available/);
+		assert.deepEqual(fixture.calls, []);
+		assert.equal(fixture.host.readCount, 0);
+	});
+
 	it('stays busy while queued messages are pending', async () => {
 		const subscription = new TestSubscription();
 		let dispatchCount = 0;
@@ -280,6 +452,74 @@ describe('ChannelBridge', () => {
 		await bridge.close();
 	});
 });
+
+function createToolFixture(context: TestContext, toolName = 'reply', running = false) {
+	const subscription = new TestSubscription();
+	const dispatched: StateAction[] = [];
+	const calls: string[] = [];
+	const host = {
+		readCount: 0,
+		readResult: undefined as Promise<ResourceReadResult> | undefined,
+		async request(): Promise<ResourceReadResult> {
+			this.readCount++;
+			return this.readResult ?? { data: '{"text":"hello"}', encoding: ContentEncoding.Utf8 };
+		},
+		dispatch(_channel: string, action: StateAction): DispatchHandle {
+			dispatched.push(action);
+			return { clientSeq: dispatched.length };
+		},
+	};
+	const channel = {
+		result: undefined as Promise<ToolCallResult> | undefined,
+		async setChannelHandler() { },
+		async callTool(name: string): Promise<ToolCallResult> {
+			calls.push(name);
+			return this.result ?? { success: true, pastTenseMessage: 'Replied' };
+		},
+		async close() { },
+	};
+	const tool: ToolCallPendingConfirmationState = {
+		toolCallId: 'owned-tool', toolName, displayName: toolName,
+		contributor: { kind: ToolCallContributorKind.Client, clientId: 'channel-client' },
+		status: ToolCallStatus.PendingConfirmation,
+		invocationMessage: 'Send a reply',
+		toolInput: { uri: 'ahp-session:/session/input' },
+	};
+	const state: ChatState = {
+		resource: 'ahp-chat:/chat', title: 'Chat', status: 1,
+		modifiedAt: new Date(0).toISOString(), turns: [],
+		activeTurn: {
+			id: 'tool-turn', startedAt: new Date(0).toISOString(),
+			message: { text: 'reply', origin: { kind: MessageKind.User } },
+			usage: undefined,
+			responseParts: [{
+				kind: ResponsePartKind.ToolCall,
+				toolCall: running ? { ...tool, status: ToolCallStatus.Running, confirmed: ToolCallConfirmationReason.NotNeeded } : tool,
+			}],
+		},
+	};
+	const bridge = new ChannelBridge({
+		client: host, clientId: 'channel-client', session: 'ahp-session:/session', chat: state.resource,
+		chatState: state, chatSubscription: subscription, channel,
+		channelInfo: { name: 'fake', tools: [{ name: 'reply' }] }, customizations: [],
+	});
+	context.after(() => bridge.close());
+	const confirm = () => subscription.push(actionEvent({
+		type: ActionType.ChatToolCallConfirmed, turnId: 'tool-turn', toolCallId: 'owned-tool',
+		approved: true, confirmed: ToolCallConfirmationReason.NotNeeded,
+	}));
+	return { bridge, host, channel, subscription, dispatched, calls, confirm };
+}
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (error: Error) => void;
+	const promise = new Promise<T>((onResolve, onReject) => {
+		resolve = onResolve;
+		reject = onReject;
+	});
+	return { promise, resolve, reject };
+}
 
 function actionEvent(action: StateAction, rejectionReason?: string): SubscriptionEvent {
 	return {

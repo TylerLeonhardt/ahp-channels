@@ -36,6 +36,8 @@
 - [ ] Soak the alpha with fakechat, Telegram, and Discord.
 - [x] Add actionable channel health diagnostics.
 - [x] Add log rotation.
+- [x] Relay tool confirmations through permission-capable channels and verify
+      approval and denial with fakechat.
 - [ ] Document credential injection and restart requirements for plugins that
       accept credentials only through their environment.
 - [ ] Resolve alpha feedback and document host, protocol, and plugin

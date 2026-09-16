@@ -1,10 +1,9 @@
 import {
 	ActionType,
-	ConfirmationOptionKind,
 	MessageKind,
 	PendingMessageKind,
-	ToolCallConfirmationReason,
-	ToolCallContributorKind,
+	ResponsePartKind,
+	ToolCallStatus,
 	type ActionEnvelope,
 	type ChatState,
 	type ChatToolCallReadyAction,
@@ -16,18 +15,22 @@ import {
 } from '@microsoft/agent-host-protocol';
 import type { DispatchHandle, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import { randomUUID } from 'node:crypto';
+import { raceAbort } from './async.js';
 import { formatChannelPrompt, type ChannelEvent } from './channelPrompt.js';
+import { ChannelPermissionRelay, isChannelToolContributor } from './channelPermissions.js';
 import {
 	readJournalEventId,
 	withJournalEventId,
 	type ChannelEventJournal,
 } from './eventJournal.js';
 import type { McpChannelClient, StartedMcpChannel } from './mcpChannel.js';
+import { readToolInput, type ToolInputReader } from './toolInput.js';
 
 interface PendingClientTool {
 	readonly turnId: string;
 	readonly toolCallId: string;
 	readonly toolName: string;
+	readonly abort: AbortController;
 	toolInput?: ChatToolCallReadyAction['toolInput'];
 	executed: boolean;
 }
@@ -36,17 +39,17 @@ export interface ChannelBridgeOptions {
 	readonly client: {
 		dispatch(channel: string, action: StateAction, clientSeq?: number): DispatchHandle;
 		unsubscribe?(channel: string): Promise<void>;
+		request?: ToolInputReader['request'];
 	};
 	readonly clientId: string;
 	readonly session: string;
 	readonly chat: string;
 	readonly chatState: ChatState;
 	readonly chatSubscription: AsyncIterable<SubscriptionEvent> & { close(): Promise<void> };
-	readonly channel: Pick<McpChannelClient, 'setChannelHandler' | 'callTool' | 'close'>;
+	readonly channel: Pick<McpChannelClient, 'setChannelHandler' | 'callTool' | 'close' | 'permissions'>;
 	readonly channelInfo: StartedMcpChannel;
 	readonly customizations: readonly ClientPluginCustomization[];
 	readonly eventJournal?: ChannelEventJournal;
-	readonly autoApproveTools?: boolean;
 	readonly onStatus?: (message: string) => void;
 }
 
@@ -55,10 +58,11 @@ export class ChannelBridge {
 	private readonly queuedMessageIds: Set<string>;
 	private readonly pendingTools = new Map<string, PendingClientTool>();
 	private readonly inFlightEventHandlers = new Set<Promise<void>>();
+	private readonly inFlightToolExecutions = new Set<Promise<void>>();
 	private actionLoop: Promise<void> | undefined;
 	private acceptingEvents = true;
-	private closed = false;
-	private eventFailureSignalled = false;
+	private readonly lifetime = new AbortController();
+	private readonly permissionRelay: ChannelPermissionRelay;
 	private resolveEventFailure!: (error: Error) => void;
 	private readonly eventFailure = new Promise<Error>(resolve => {
 		this.resolveEventFailure = resolve;
@@ -67,6 +71,28 @@ export class ChannelBridge {
 	constructor(private readonly options: ChannelBridgeOptions) {
 		this.activeTurnId = options.chatState.activeTurn?.id;
 		this.queuedMessageIds = new Set(options.chatState.queuedMessages?.map(message => message.id));
+		const turn = options.chatState.activeTurn;
+		for (const part of turn?.responseParts ?? []) {
+			if (turn && part.kind === ResponsePartKind.ToolCall
+				&& (part.toolCall.status === ToolCallStatus.PendingConfirmation
+					|| part.toolCall.status === ToolCallStatus.Running
+					&& !options.channelInfo.tools.some(tool => tool.name === part.toolCall.toolName))) {
+				const pending = this.trackToolStart({ ...part.toolCall, turnId: turn.id });
+				if (pending) {
+					pending.toolInput = part.toolCall.toolInput;
+				}
+			}
+		}
+		this.permissionRelay = new ChannelPermissionRelay(
+			options.client,
+			options.clientId,
+			options.chat,
+			options.channel.permissions,
+			options.chatState,
+			options.channelInfo.tools,
+		);
+		this.permissionRelay.events.on('status', message => options.onStatus?.(message));
+		this.permissionRelay.events.on('failure', error => this.resolveEventFailure(error));
 	}
 
 	get busy(): boolean {
@@ -83,7 +109,7 @@ export class ChannelBridge {
 	}
 
 	async quiesce(): Promise<boolean> {
-		if (this.closed) {
+		if (this.lifetime.signal.aborted) {
 			return false;
 		}
 		this.acceptingEvents = false;
@@ -108,6 +134,12 @@ export class ChannelBridge {
 			customizations: [...this.options.customizations],
 		});
 		this.actionLoop = this.consumeChatActions();
+		this.permissionRelay.start();
+		for (const part of this.options.chatState.activeTurn?.responseParts ?? []) {
+			if (part.kind === ResponsePartKind.ToolCall && part.toolCall.status === ToolCallStatus.Running) {
+				this.executeTool(part.toolCall.toolCallId);
+			}
+		}
 		if (this.options.eventJournal) {
 			await this.options.eventJournal.markDelivered(journalEventIds(this.options.chatState));
 			for (const pending of await this.options.eventJournal.pending()) {
@@ -119,12 +151,17 @@ export class ChannelBridge {
 	}
 
 	async close(): Promise<void> {
-		if (this.closed) {
+		if (this.lifetime.signal.aborted) {
 			return;
 		}
-		this.closed = true;
+		this.lifetime.abort();
 		this.acceptingEvents = false;
+		for (const pending of this.pendingTools.values()) {
+			this.cancelTool(pending);
+		}
 		const errors: Error[] = [];
+		await this.permissionRelay.close();
+		await Promise.allSettled([...this.inFlightToolExecutions]);
 		try {
 			await this.options.channel.close();
 		} catch (error) {
@@ -186,10 +223,7 @@ export class ChannelBridge {
 			() => this.inFlightEventHandlers.delete(handler),
 			error => {
 				this.inFlightEventHandlers.delete(handler);
-				if (!this.eventFailureSignalled) {
-					this.eventFailureSignalled = true;
-					this.resolveEventFailure(toError('channel event', error));
-				}
+				this.resolveEventFailure(toError('channel event', error));
 			},
 		);
 		return handler;
@@ -235,6 +269,7 @@ export class ChannelBridge {
 			if (event.type !== 'action') {
 				continue;
 			}
+			this.permissionRelay.observe(event.params);
 			if (event.params.rejectionReason) {
 				const rejectedEventId = event.params.action.type === ActionType.ChatTurnStarted
 					|| event.params.action.type === ActionType.ChatPendingMessageSet
@@ -267,6 +302,11 @@ export class ChannelBridge {
 		}
 		switch (action.type) {
 			case ActionType.ChatTurnStarted:
+				for (const pending of this.pendingTools.values()) {
+					if (pending.turnId !== action.turnId) {
+						this.cancelTool(pending);
+					}
+				}
 				this.activeTurnId = action.turnId;
 				if (action.queuedMessageId) {
 					this.queuedMessageIds.delete(action.queuedMessageId);
@@ -278,18 +318,40 @@ export class ChannelBridge {
 				if (this.activeTurnId === action.turnId) {
 					this.activeTurnId = undefined;
 				}
+				for (const pending of this.pendingTools.values()) {
+					if (pending.turnId === action.turnId) {
+						this.cancelTool(pending);
+					}
+				}
 				break;
 			case ActionType.ChatToolCallStart:
 				this.trackToolStart(action);
 				break;
 			case ActionType.ChatToolCallReady:
-				await this.trackToolReady(action);
+				this.trackToolReady(action);
 				break;
-			case ActionType.ChatToolCallConfirmed:
+			case ActionType.ChatToolCallConfirmed: {
+				const pending = this.pendingTools.get(action.toolCallId);
+				if (!pending || pending.turnId !== action.turnId || this.activeTurnId !== action.turnId) {
+					break;
+				}
 				if (action.approved) {
-					await this.executeTool(action.toolCallId);
+					if (typeof pending.toolInput !== 'object' && action.editedToolInput !== undefined) {
+						pending.toolInput = action.editedToolInput;
+					}
+					this.executeTool(action.toolCallId);
+				} else {
+					this.cancelTool(pending);
 				}
 				break;
+			}
+			case ActionType.ChatToolCallComplete: {
+				const pending = this.pendingTools.get(action.toolCallId);
+				if (pending?.turnId === action.turnId) {
+					this.cancelTool(pending);
+				}
+				break;
+			}
 			case ActionType.ChatPendingMessageSet:
 				if (action.kind === PendingMessageKind.Queued) {
 					this.queuedMessageIds.add(action.id);
@@ -303,64 +365,104 @@ export class ChannelBridge {
 		}
 	}
 
-	private trackToolStart(action: ChatToolCallStartAction): void {
-		if (action.contributor?.kind !== ToolCallContributorKind.Client
-			|| action.contributor.clientId !== this.options.clientId) {
+	private trackToolStart(
+		action: Pick<ChatToolCallStartAction, 'turnId' | 'toolCallId' | 'toolName' | 'contributor'>,
+	): PendingClientTool | undefined {
+		if (!isChannelToolContributor(action, this.options.clientId)) {
 			return;
 		}
-		this.pendingTools.set(action.toolCallId, {
+		const previous = this.pendingTools.get(action.toolCallId);
+		if (previous?.turnId === action.turnId) {
+			return previous;
+		}
+		if (previous) {
+			this.cancelTool(previous);
+		}
+		const pending: PendingClientTool = {
 			turnId: action.turnId,
 			toolCallId: action.toolCallId,
 			toolName: action.toolName,
+			abort: new AbortController(),
 			executed: false,
-		});
+		};
+		this.pendingTools.set(action.toolCallId, pending);
+		return pending;
 	}
 
-	private async trackToolReady(action: ChatToolCallReadyAction): Promise<void> {
+	private trackToolReady(action: ChatToolCallReadyAction): void {
 		const pending = this.pendingTools.get(action.toolCallId);
-		if (!pending) {
+		if (!pending || pending.turnId !== action.turnId || this.activeTurnId !== action.turnId) {
 			return;
 		}
-		pending.toolInput = action.toolInput;
+		pending.toolInput = action.toolInput ?? pending.toolInput;
 		if (action.confirmed !== undefined) {
-			await this.executeTool(action.toolCallId);
-		} else if (this.options.autoApproveTools) {
-			const selectedOptionId = action.options?.find(option =>
-				option.kind === ConfirmationOptionKind.Approve && /once/i.test(option.id)
-			)?.id ?? action.options?.find(option => option.kind === ConfirmationOptionKind.Approve)?.id;
-			this.options.client.dispatch(this.options.chat, {
-				type: ActionType.ChatToolCallConfirmed,
-				turnId: action.turnId,
-				toolCallId: action.toolCallId,
-				approved: true,
-				confirmed: ToolCallConfirmationReason.UserAction,
-				...(selectedOptionId ? { selectedOptionId } : {}),
-			});
-			this.options.onStatus?.(`approved channel tool ${pending.toolName}`);
+			this.executeTool(action.toolCallId);
 		}
 	}
 
-	private async executeTool(toolCallId: string): Promise<void> {
+	private executeTool(toolCallId: string): void {
 		const pending = this.pendingTools.get(toolCallId);
-		if (!pending || pending.executed) {
+		if (!pending || pending.executed || !this.isCurrentTool(pending)) {
 			return;
 		}
 		pending.executed = true;
+		const task = this.runTool(pending);
+		this.inFlightToolExecutions.add(task);
+		void task.then(
+			() => this.inFlightToolExecutions.delete(task),
+			error => {
+				this.inFlightToolExecutions.delete(task);
+				if (this.isCurrentTool(pending)) {
+					this.resolveEventFailure(toError('channel tool', error));
+				}
+			},
+		);
+	}
 
-		let args: Record<string, unknown>;
-		try {
-			args = parseToolInput(pending.toolInput);
-		} catch (error) {
+	private async runTool(pending: PendingClientTool): Promise<void> {
+		if (!this.options.channelInfo.tools.some(tool => tool.name === pending.toolName)) {
 			this.dispatchToolCompletion(pending, {
 				success: false,
 				pastTenseMessage: `Failed to call ${pending.toolName}`,
-				error: { message: error instanceof Error ? error.message : String(error) },
+				error: { message: `Channel tool '${pending.toolName}' is no longer available` },
 			});
 			return;
 		}
+		const signal = AbortSignal.any([this.lifetime.signal, pending.abort.signal]);
+		let args: Record<string, unknown>;
+		try {
+			args = parseToolInput(await readToolInput(this.options.client, pending.toolInput, signal));
+		} catch (error) {
+			if (this.isCurrentTool(pending)) {
+				this.dispatchToolCompletion(pending, {
+					success: false,
+					pastTenseMessage: `Failed to call ${pending.toolName}`,
+					error: { message: error instanceof Error ? error.message : String(error) },
+				});
+			}
+			return;
+		}
+		if (!this.isCurrentTool(pending)) {
+			return;
+		}
+		const result = await raceAbort(this.options.channel.callTool(pending.toolName, args), signal);
+		if (this.isCurrentTool(pending)) {
+			this.dispatchToolCompletion(pending, result);
+		}
+	}
 
-		const result = await this.options.channel.callTool(pending.toolName, args);
-		this.dispatchToolCompletion(pending, result);
+	private isCurrentTool(pending: PendingClientTool): boolean {
+		return !this.lifetime.signal.aborted
+			&& !pending.abort.signal.aborted
+			&& pending.turnId === this.activeTurnId
+			&& this.pendingTools.get(pending.toolCallId) === pending;
+	}
+
+	private cancelTool(pending: PendingClientTool): void {
+		pending.abort.abort();
+		if (this.pendingTools.get(pending.toolCallId) === pending) {
+			this.pendingTools.delete(pending.toolCallId);
+		}
 	}
 
 	private dispatchToolCompletion(pending: PendingClientTool, result: ToolCallResult): void {
@@ -370,8 +472,8 @@ export class ChannelBridge {
 			toolCallId: pending.toolCallId,
 			result,
 		});
-		this.pendingTools.delete(pending.toolCallId);
-		this.options.onStatus?.(`completed channel tool ${pending.toolName}`);
+		this.cancelTool(pending);
+		this.options.onStatus?.(`${result.success ? 'completed' : 'failed'} channel tool ${pending.toolName}`);
 	}
 }
 
