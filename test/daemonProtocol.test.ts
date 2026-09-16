@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
+import { setTimeout } from 'node:timers/promises';
+import { lock } from 'proper-lockfile';
 import { probeDaemon } from '../src/daemonClient.js';
-import { getOrCreateDaemonToken } from '../src/daemonPaths.js';
+import { getDaemonPaths, getOrCreateDaemonToken, readDaemonToken } from '../src/daemonPaths.js';
 import { parseDaemonStartupMessage } from '../src/daemonStartup.js';
+import { FILE_LOCK_OPTIONS } from '../src/lockedFile.js';
 import {
 	DAEMON_PROTOCOL_VERSION,
 	DaemonProtocolError,
@@ -121,7 +124,47 @@ describe('daemon control protocol', () => {
 
 		assert.equal(new Set(tokens).size, 1);
 		assert.match(tokens[0], /^[A-Za-z0-9_-]{43}$/);
+		assert.equal(await readDaemonToken(home), tokens[0]);
+		if (process.platform !== 'win32') {
+			assert.equal((await stat(getDaemonPaths(home).tokenFile)).mode & 0o777, 0o600);
+		}
 	});
+
+	it('waits for the token creation lock without exposing an unfinished token', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-token-'));
+		temporaryDirectories.push(home);
+		const { tokenFile } = getDaemonPaths(home);
+		const release = await lock(tokenFile, FILE_LOCK_OPTIONS);
+		const creating = getOrCreateDaemonToken(home);
+		try {
+			assert.equal(await Promise.race([
+				creating.then(() => 'created'),
+				setTimeout(100, 'locked'),
+			]), 'locked');
+			assert.equal(await readDaemonToken(home), undefined);
+			assert.equal(await probeDaemon(home), undefined);
+		} finally {
+			await release();
+			await creating;
+		}
+		const token = await creating;
+		assert.match(token, /^[A-Za-z0-9_-]{43}$/);
+		assert.equal(await readDaemonToken(home), token);
+		assert.equal(await getOrCreateDaemonToken(home), token);
+	});
+
+	for (const invalid of ['', 'not-a-token']) {
+		it(`rejects ${invalid ? 'malformed' : 'empty'} existing token files without replacing them`, async () => {
+			const home = await mkdtemp(join(tmpdir(), 'ahp-channels-token-'));
+			temporaryDirectories.push(home);
+			const { tokenFile } = getDaemonPaths(home);
+			await writeFile(tokenFile, invalid, { mode: 0o600 });
+
+			await assert.rejects(readDaemonToken(home), /Invalid daemon token file/);
+			await assert.rejects(getOrCreateDaemonToken(home), /Invalid daemon token file/);
+			assert.equal(await readFile(tokenFile, 'utf8'), invalid);
+		});
+	}
 
 	it('does not create state while probing an absent daemon', async () => {
 		const parent = await mkdtemp(join(tmpdir(), 'ahp-channels-token-'));

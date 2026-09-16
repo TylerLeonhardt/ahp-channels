@@ -50,15 +50,32 @@ with HTTP 422.
 
 ## Cut subsequent releases
 
+Start from a clean, current `main` checkout, then prepare a release branch:
+
 ```powershell
+git switch main
+git pull --ff-only
+
 # Choose the intended version explicitly.
 npm version prerelease --preid alpha --no-git-tag-version
 # Or: npm version patch|minor|major --no-git-tag-version
 
 $version = node -p "require('./package.json').version"
+git switch -c "release/v$version"
 git add package.json package-lock.json src/version.ts
 git commit -m "Bump version to $version"
-git push origin main
+git push -u origin HEAD
+gh pr create --base main --title "release: prepare v$version" --body "Prepare v$version for npm publication."
+```
+
+`main` requires passing Ubuntu, macOS, Windows, and E2E checks. Merge the
+release PR after those checks pass; do not bypass branch protection or publish
+an unmerged release commit. Then create the release tag from updated `main`:
+
+```powershell
+git switch main
+git pull --ff-only
+$version = node -p "require('./package.json').version"
 git tag -a "v$version" -m "v$version"
 git push origin "v$version"
 ```

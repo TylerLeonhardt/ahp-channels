@@ -165,6 +165,33 @@ startup error but keeps its plugin customizations active. Run the contributed
 setup skill in the target session. The daemon retries automatically after the
 setup turn finishes and activates the channel server when it becomes runnable.
 
+### Plugin environment and restarts
+
+For plugins configured through environment variables, follow the plugin's own
+setup instructions and set those variables before launching the bridge.
+Foreground `channel run` inherits the launching terminal's environment.
+Daemon-managed channels inherit the environment captured when their daemon
+started. In both modes, the MCP server's declared `env` values override
+inherited values.
+
+Changing variables in a terminal does not update an already-running daemon.
+`daemon start` reuses an existing daemon, and `channel restart` still uses that
+daemon's environment. To apply changed inherited variables, stop and start the
+daemon from the updated terminal:
+
+```powershell
+ahp-channels daemon stop
+ahp-channels daemon start
+```
+
+Stopping the daemon interrupts all channels it manages, so wait until they
+are idle before stopping it. Enabled channels are restored on startup. For
+foreground execution, stop and rerun `channel run` from the updated terminal.
+
+Plugin-owned credential files and live-reload behavior remain the plugin's
+responsibility; follow its documentation. The bridge does not interpret those
+files or manage plugin authentication.
+
 ## Attachments and resources
 
 The [channel contract](https://code.claude.com/docs/en/channels-reference)
@@ -279,6 +306,8 @@ them after a daemon or channel-process restart. A switch is rejected while the
 channel is processing a turn, so an in-flight reply is never silently orphaned.
 Inbound events with stable platform IDs are journaled before AHP dispatch and
 deduplicated across process restarts.
+Journal reads and updates share a cross-process lock to avoid read/replace
+races on Windows.
 
 Daemon and channel-process output is written to `daemon.log`. The active log is
 limited to 1 MiB, with the three most recent 1 MiB rotations retained as
@@ -307,8 +336,9 @@ ahp-channels daemon start
 ```
 
 Control traffic uses a per-install random token over a local named pipe on
-Windows or a mode-`0600` Unix socket. Configuration writes are atomic and use a
-heartbeat-backed cross-process lock.
+Windows or a mode-`0600` Unix socket. Token creation is locked and atomic so
+concurrent startup probes cannot observe a partially written token.
+Configuration writes are atomic and use a heartbeat-backed cross-process lock.
 
 ### Approve tools from a channel
 

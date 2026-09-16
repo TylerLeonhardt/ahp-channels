@@ -3,7 +3,10 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
+import { setTimeout } from 'node:timers/promises';
+import { lock } from 'proper-lockfile';
 import { FileChannelEventJournal } from '../src/eventJournal.js';
+import { FILE_LOCK_OPTIONS } from '../src/lockedFile.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -51,6 +54,48 @@ describe('FileChannelEventJournal', () => {
 		assert.equal(second?.stableIdentity, false);
 		assert.notEqual(first?.id, second?.id);
 		assert.equal((await journal.pending()).length, 2);
+	});
+
+	it('waits for an ongoing journal update before reading pending events', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-events-'));
+		temporaryDirectories.push(home);
+		const journal = new FileChannelEventJournal(home, 'channel');
+		const queued = await journal.enqueue('channel', { content: 'hello' });
+		assert.ok(queued);
+
+		const release = await lock(join(home, 'instances', 'channel', 'events.json'), FILE_LOCK_OPTIONS);
+		const reading = journal.pending();
+		try {
+			assert.equal(await Promise.race([
+				reading.then(() => 'read'),
+				setTimeout(100, 'locked'),
+			]), 'locked');
+		} finally {
+			await release();
+			await reading;
+		}
+		assert.deepEqual(await reading, [queued]);
+	});
+
+	it('preserves delivery and deduplication with concurrent pending reads', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-events-'));
+		temporaryDirectories.push(home);
+		const event = {
+			content: 'hello',
+			meta: { chat_id: 'scope', message_id: 'one' },
+		};
+		const journal = new FileChannelEventJournal(home, 'channel');
+		const queued = await journal.enqueue('channel', event);
+		assert.ok(queued);
+
+		const reader = new FileChannelEventJournal(home, 'channel');
+		await Promise.all([
+			journal.markDelivered([queued.id]),
+			...Array.from({ length: 8 }, () => reader.pending()),
+		]);
+
+		assert.deepEqual(await reader.pending(), []);
+		assert.equal(await reader.enqueue('channel', event), undefined);
 	});
 
 	it('fails explicitly on corrupt durable state', async () => {
