@@ -1,13 +1,23 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
+import { isAbsolute, resolve } from 'node:path';
+import { AgentHostService, type HostAliasInspection } from './agentHosts.js';
 import { connectAgentHost, listSessions } from './ahp.js';
 import { ChannelRuntime, createChannelRuntimeServices, validateChannelDefinition } from './channelRuntime.js';
-import { ConfigStore, isValidChannelInstanceName, retargetChannelInstance, type AppConfig, type ChannelInstanceConfig } from './config.js';
+import {
+	ConfigStore,
+	isValidChannelInstanceName,
+	retargetChannelInstance,
+	type AppConfig,
+	type ChannelInstanceConfig,
+	type SocketHostAliasConfig,
+	type WebSocketHostAliasConfig,
+} from './config.js';
 import { ensureDaemonStarted, probeDaemon, requestDaemon, stopDaemon } from './daemonClient.js';
 import { getDaemonPaths } from './daemonPaths.js';
 import { type ChannelDaemonStatus, type DaemonStatus } from './daemonProtocol.js';
-import { describeEndpoint, discoverLocalAgentHosts, selectAgentHost } from './endpoints.js';
+import { describeEndpoint } from './endpoints.js';
 import { removeInstanceState } from './instancePaths.js';
 import { activeInstallation, PluginManager, listInstalledPlugins } from './plugins.js';
 import { VERSION } from './version.js';
@@ -15,6 +25,7 @@ import { VERSION } from './version.js';
 const program = new Command();
 const store = new ConfigStore();
 const plugins = new PluginManager(store);
+const agentHosts = new AgentHostService(store);
 
 program
 	.name('ahp-channels')
@@ -129,12 +140,12 @@ plugin
 		}, undefined, 2));
 	});
 
-const host = program.command('host').description('Discover Agent Host connections');
+const host = program.command('host').description('Discover and configure local Agent Host connections');
 host
 	.command('discover')
 	.option('--json', 'Print machine-readable output')
 	.action(async (options: { json?: boolean }) => {
-		const endpoints = await discoverLocalAgentHosts();
+		const endpoints = await agentHosts.discover();
 		const descriptions = endpoints.map((endpoint, index) => describeEndpoint(endpoint, index));
 		if (options.json) {
 			console.log(JSON.stringify(descriptions, undefined, 2));
@@ -147,13 +158,71 @@ host
 		console.table(descriptions);
 	});
 
+const hostAlias = host.command('alias').description('Manage stable local Agent Host aliases');
+hostAlias
+	.command('add')
+	.argument('<name>')
+	.option('--host <selector>', 'Current VS Code host index or ID prefix')
+	.option('--url <url>', 'Fixed loopback ws:// or wss:// URL for a local AHP host')
+	.option('--socket <path>', 'Fixed Unix socket or Windows named-pipe path for a local AHP host')
+	.option('--token-file <path>', 'File containing the current connection token')
+	.option('--token-query-parameter <name>', 'WebSocket query parameter that carries the token')
+	.option('--without-authentication', 'Explicitly connect without a connection token')
+	.action(async (name: string, options: {
+		host?: string;
+		url?: string;
+		socket?: string;
+		tokenFile?: string;
+		tokenQueryParameter?: string;
+		withoutAuthentication?: boolean;
+	}) => {
+		const inspection = options.host
+			? await addDiscoveredHostAlias(name, options)
+			: await addExplicitHostAlias(name, options);
+		printHostAliasInspection(inspection);
+	});
+hostAlias
+	.command('list')
+	.option('--json', 'Print machine-readable output')
+	.action(async (options: { json?: boolean }) => {
+		const aliases = await agentHosts.list();
+		if (options.json) {
+			console.log(JSON.stringify(aliases, undefined, 2));
+			return;
+		}
+		if (aliases.length === 0) {
+			console.log('No host aliases configured');
+			return;
+		}
+		console.table(aliases.map(hostAliasTableRow));
+	});
+hostAlias
+	.command('inspect')
+	.argument('<name>')
+	.option('--json', 'Print machine-readable output')
+	.action(async (name: string, options: { json?: boolean }) => {
+		const inspection = await agentHosts.inspect(name);
+		if (options.json) {
+			console.log(JSON.stringify(inspection, undefined, 2));
+			return;
+		}
+		printHostAliasInspection(inspection);
+	});
+hostAlias
+	.command('remove')
+	.argument('<name>')
+	.action(async (name: string) => {
+		const removed = await agentHosts.removeAlias(name);
+		console.log(`Removed host alias @${removed}`);
+	});
+
 const session = program.command('session').description('Inspect AHP sessions');
 session
 	.command('list')
-	.option('--host <selector>', 'Discovered host index or ID prefix')
+	.option('--host <selector>', 'Host alias (@name), discovered host index, or ID prefix')
 	.action(async (options: { host?: string }) => {
-		const endpoint = selectAgentHost(await discoverLocalAgentHosts(), options.host);
-		const connection = await connectAgentHost(endpoint);
+		const target = await agentHosts.resolve(options.host);
+		const connection = await connectAgentHost(target);
 		try {
 			const sessions = await listSessions(connection.client);
 			console.table(sessions.map(item => ({
@@ -210,7 +279,7 @@ channel
 	.requiredOption('--session <uri>', 'AHP session URI')
 	.option('--chat <uri>', 'AHP chat URI; defaults to the session default chat')
 	.option('--server <name>', 'MCP server name when the plugin declares more than one')
-	.option('--host <selector>', 'Discovered host index or ID prefix')
+	.option('--host <selector>', 'Preferred host alias (@name), discovered host index, or ID prefix')
 	.option('--client-id <id>', 'Override the stable AHP client ID')
 	.option('--installation <id>', 'Pin a specific installed plugin version')
 	.option('--start', 'Start the channel immediately')
@@ -347,6 +416,30 @@ channel
 		printChannelStatus(stoppedChannelStatus(name, definition));
 	});
 channel
+	.command('select-host')
+	.argument('<name>')
+	.requiredOption('--host <selector>', 'Preferred host alias (@name), discovered host index, or ID prefix')
+	.action(async (name: string, options: { host: string }) => {
+		const daemonStatus = await probeDaemon(store.home);
+		if (daemonStatus) {
+			const status = await requestDaemon(store.home, {
+				command: 'channel.rehost',
+				name,
+				host: options.host,
+			});
+			printChannelStatus(requireChannelStatus(status, name));
+			return;
+		}
+		const current = await getOfflineChannel(name);
+		const definition = {
+			...current,
+			host: options.host,
+		};
+		await validateChannelDefinition(plugins, definition);
+		await store.update(config => withChannel(config, name, definition));
+		printChannelStatus(stoppedChannelStatus(name, definition));
+	});
+channel
 	.command('status')
 	.argument('[name]')
 	.option('--json', 'Print machine-readable output')
@@ -411,7 +504,7 @@ channel
 	.requiredOption('--session <uri>', 'AHP session URI')
 	.option('--chat <uri>', 'AHP chat URI; defaults to the session default chat')
 	.option('--server <name>', 'MCP server name when the plugin declares more than one')
-	.option('--host <selector>', 'Discovered host index or ID prefix')
+	.option('--host <selector>', 'Preferred host alias (@name), discovered host index, or ID prefix')
 	.option('--client-id <id>', 'Override the stable AHP client ID')
 	.option('--installation <id>', 'Use a specific installed plugin version')
 	.action(async (pluginName: string, options: {
@@ -431,7 +524,7 @@ channel
 			...(options.server ? { server: options.server } : {}),
 			...(options.host ? { host: options.host } : {}),
 			...(options.clientId ? { clientId: options.clientId } : {}),
-		}, createChannelRuntimeServices(plugins), message => console.log(`[channel] ${message}`));
+		}, createChannelRuntimeServices(plugins, agentHosts), message => console.log(`[channel] ${message}`));
 		try {
 			await Promise.race([
 				waitForShutdownSignal(),
@@ -512,6 +605,7 @@ function printChannelTable(channels: readonly ChannelDaemonStatus[]): void {
 		installation: channel.definition.installation?.slice(0, 12) ?? '',
 		session: channel.definition.session,
 		chat: channel.runtime?.chat ?? channel.definition.chat ?? 'default',
+		host: formatChannelHost(channel),
 		health: channel.health.state,
 		failure: channel.health.failure?.summary ?? '',
 	})));
@@ -522,6 +616,7 @@ function printChannelStatus(channel: ChannelDaemonStatus): void {
 		? ` @ ${channel.definition.installation.slice(0, 12)}`
 		: '';
 	console.log(`${channel.name}: ${channel.state} (${channel.health.state})${installation} → ${channel.definition.session}${channel.runtime ? ` (${channel.runtime.chat})` : ''}`);
+	console.log(`Host: ${formatChannelHost(channel)}`);
 	if (channel.runtime?.mode === 'customization-only') {
 		console.log('Mode: customizations available; channel MCP server unavailable');
 	}
@@ -616,4 +711,105 @@ function offlineChannelStatuses(config: AppConfig): ChannelDaemonStatus[] {
 	return Object.entries(config.channels)
 		.sort(([a], [b]) => a.localeCompare(b))
 		.map(([name, definition]) => stoppedChannelStatus(name, definition));
+}
+
+async function addDiscoveredHostAlias(
+	name: string,
+	options: {
+		host?: string;
+		url?: string;
+		socket?: string;
+		tokenFile?: string;
+		tokenQueryParameter?: string;
+		withoutAuthentication?: boolean;
+	},
+): Promise<HostAliasInspection> {
+	if (!options.host) {
+		throw new Error('--host requires a selector');
+	}
+	if (options.url
+		|| options.socket
+		|| options.tokenFile
+		|| options.tokenQueryParameter
+		|| options.withoutAuthentication) {
+		throw new Error('--host cannot be combined with explicit URL, socket, or authentication options');
+	}
+	return agentHosts.addDiscoveredAlias(name, options.host);
+}
+
+async function addExplicitHostAlias(
+	name: string,
+	options: {
+		host?: string;
+		url?: string;
+		socket?: string;
+		tokenFile?: string;
+		tokenQueryParameter?: string;
+		withoutAuthentication?: boolean;
+	},
+): Promise<HostAliasInspection> {
+	if ((options.url ? 1 : 0) + (options.socket ? 1 : 0) !== 1) {
+		throw new Error('Specify exactly one of --host, --url, or --socket');
+	}
+	if (Boolean(options.tokenFile) === Boolean(options.withoutAuthentication)) {
+		throw new Error('Specify exactly one of --token-file or --without-authentication');
+	}
+	if (options.tokenFile && !options.tokenQueryParameter) {
+		throw new Error('--token-file requires --token-query-parameter because AHP does not define authentication');
+	}
+	if (!options.tokenFile && options.tokenQueryParameter) {
+		throw new Error('--token-query-parameter requires --token-file');
+	}
+	const authentication = options.tokenFile && options.tokenQueryParameter
+		? {
+			tokenFile: absolutePath(options.tokenFile),
+			tokenQueryParameter: options.tokenQueryParameter,
+		}
+		: { withoutAuthentication: true as const };
+	const target: WebSocketHostAliasConfig | SocketHostAliasConfig = options.url
+		? {
+			kind: 'websocket',
+			url: options.url,
+			...authentication,
+		}
+		: {
+			kind: 'socket',
+			path: absolutePath(options.socket as string),
+			...authentication,
+		};
+	return agentHosts.addExplicitAlias(name, target);
+}
+
+function absolutePath(path: string): string {
+	return isAbsolute(path) ? path : resolve(path);
+}
+
+function printHostAliasInspection(inspection: HostAliasInspection): void {
+	console.table([hostAliasTableRow(inspection)]);
+}
+
+function hostAliasTableRow(inspection: HostAliasInspection): Record<string, unknown> {
+	return {
+		name: inspection.name,
+		selector: inspection.selector,
+		kind: inspection.kind,
+		state: inspection.state,
+		target: formatHostAliasLocation(inspection.target),
+		endpoint: inspection.endpoint?.['endpoint'] ?? '',
+		error: inspection.error ?? '',
+	};
+}
+
+function formatHostAliasLocation(target: Record<string, unknown>): string {
+	return String(target['registry'] ?? target['url'] ?? target['path'] ?? '');
+}
+
+function formatChannelHost(channel: ChannelDaemonStatus): string {
+	const preferred = channel.definition.host ?? 'automatic';
+	if (!channel.runtime) {
+		return preferred;
+	}
+	return channel.definition.host && channel.definition.host !== channel.runtime.host
+		? `${preferred} -> ${channel.runtime.host}`
+		: channel.runtime.host;
 }

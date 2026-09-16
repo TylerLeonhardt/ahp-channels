@@ -40,11 +40,13 @@ async function main(): Promise<void> {
 		}
 		await removeStaleDaemonSocket(home);
 		const [
+			{ AgentHostService },
 			{ ConfigStore },
 			{ createChannelRuntimeServices },
 			{ createDaemonRuntimeFactory, DaemonServer },
 			{ PluginManager },
 		] = await Promise.all([
+			import('./agentHosts.js'),
 			import('./config.js'),
 			import('./channelRuntime.js'),
 			import('./daemonServer.js'),
@@ -52,12 +54,16 @@ async function main(): Promise<void> {
 		]);
 		const configStore = new ConfigStore(home);
 		const plugins = new PluginManager(configStore);
+		const agentHosts = new AgentHostService(configStore);
 		const token = await getOrCreateDaemonToken(home);
 		daemon = new DaemonServer(
 			home,
 			token,
 			configStore,
-			createDaemonRuntimeFactory(createChannelRuntimeServices(plugins, { home, stderr: logger }), plugins),
+			createDaemonRuntimeFactory(
+				createChannelRuntimeServices(plugins, agentHosts, { home, stderr: logger }),
+				plugins,
+			),
 			logger,
 		);
 		process.once('SIGINT', shutdown);

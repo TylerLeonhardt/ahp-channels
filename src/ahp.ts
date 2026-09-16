@@ -7,7 +7,8 @@ import {
 import { AhpClient, type Subscription } from '@microsoft/agent-host-protocol/client';
 import { WebSocketTransport } from '@microsoft/agent-host-protocol/ws';
 import { createHash, randomUUID } from 'node:crypto';
-import type { AgentHostEndpoint } from './endpoints.js';
+import { sanitizeErrorSummary } from './channelHealth.js';
+import type { AgentHostConnectionTarget } from './endpoints.js';
 import { SocketWebSocketTransport } from './socketWebSocketTransport.js';
 
 export interface ConnectedAgentHost {
@@ -31,10 +32,25 @@ export function createChannelClientId(plugin: string, session: string): string {
 	return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
 }
 
-export async function connectAgentHost(endpoint: AgentHostEndpoint, clientId: string = randomUUID()): Promise<ConnectedAgentHost> {
-	const transport = endpoint.endpoint.type === 'tcp'
-		? await connectTcp(endpoint)
-		: await SocketWebSocketTransport.connect(endpoint.endpoint.path, endpoint.connectionToken);
+export async function connectAgentHost(
+	target: AgentHostConnectionTarget,
+	clientId: string = randomUUID(),
+): Promise<ConnectedAgentHost> {
+	let transport: Awaited<ReturnType<typeof connectWebSocket>> | SocketWebSocketTransport;
+	try {
+		transport = target.endpoint.type === 'socket'
+			? await SocketWebSocketTransport.connect(
+				target.endpoint.path,
+				target.connectionToken,
+				target.connectionTokenQueryParameter,
+			)
+			: await connectWebSocket(target);
+	} catch (error) {
+		throw new Error(
+			`Agent Host transport failed: ${sanitizeErrorSummary(error instanceof Error ? error.message : String(error))}`,
+			{ cause: error },
+		);
+	}
 	const client = new AhpClient(transport);
 	client.connect();
 	try {
@@ -46,15 +62,22 @@ export async function connectAgentHost(endpoint: AgentHostEndpoint, clientId: st
 		return { client, clientId, initializeResult };
 	} catch (error) {
 		await client.shutdown();
-		throw error;
+		throw new Error(
+			`Agent Host initialization failed: ${sanitizeErrorSummary(error instanceof Error ? error.message : String(error))}`,
+			{ cause: error },
+		);
 	}
 
-	async function connectTcp(endpoint: AgentHostEndpoint): Promise<WebSocketTransport> {
-		if (endpoint.endpoint.type !== 'tcp') {
-			throw new Error('Expected a TCP Agent Host endpoint');
+	async function connectWebSocket(target: AgentHostConnectionTarget): Promise<WebSocketTransport> {
+		if (target.endpoint.type === 'socket') {
+			throw new Error('Expected a WebSocket Agent Host endpoint');
 		}
-		const url = new URL(`ws://${endpoint.endpoint.host}:${endpoint.endpoint.port}/`);
-		url.searchParams.set('tkn', endpoint.connectionToken);
+		const url = target.endpoint.type === 'tcp'
+			? new URL(`ws://${target.endpoint.host}:${target.endpoint.port}/`)
+			: new URL(target.endpoint.url);
+		if (target.connectionToken !== undefined) {
+			url.searchParams.set(target.connectionTokenQueryParameter ?? 'tkn', target.connectionToken);
+		}
 		return WebSocketTransport.connect(url);
 	}
 }

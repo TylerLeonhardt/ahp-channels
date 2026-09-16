@@ -91,6 +91,22 @@ describe('daemon control protocol', () => {
 			}),
 			(error: unknown) => error instanceof DaemonProtocolError && error.code === 'INVALID_REQUEST',
 		);
+		assert.deepEqual(
+			parseDaemonRequest({
+				version: DAEMON_PROTOCOL_VERSION,
+				token: 'x'.repeat(32),
+				body: {
+					command: 'channel.rehost',
+					name: 'personal',
+					host: '@local',
+				},
+			}).body,
+			{
+				command: 'channel.rehost',
+				name: 'personal',
+				host: '@local',
+			},
+		);
 	});
 
 	it('creates one stable token under concurrent access', async () => {

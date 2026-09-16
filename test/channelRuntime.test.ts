@@ -19,7 +19,8 @@ import {
 	type ChannelSubscription,
 } from '../src/channelRuntime.js';
 import { ChannelOperationError } from '../src/channelHealth.js';
-import type { AgentHostEndpoint } from '../src/endpoints.js';
+import { HostAliasResolutionError } from '../src/agentHosts.js';
+import { selectAgentHost, type AgentHostEndpoint } from '../src/endpoints.js';
 import type { McpChannelClient, StartedMcpChannel } from '../src/mcpChannel.js';
 import { PluginIntegrityError, PluginLoadingError } from '../src/plugins.js';
 
@@ -65,6 +66,7 @@ class TestHostClient implements ChannelHostClient {
 	readonly subscriptions = new Map<string, TestSubscription>();
 	shutDown = false;
 	sessionAvailable = true;
+	sessionSnapshotAvailable = true;
 	resourceHandlers: ResourceRequestHandlers | null | undefined;
 	resourceHandlersSetBeforeActiveClient = false;
 
@@ -91,13 +93,15 @@ class TestHostClient implements ChannelHostClient {
 				defaultChat: chatUri,
 			};
 			return {
-				result: {
-					snapshot: {
-						resource: sessionUri,
-						state,
-						fromSeq: 0,
-					},
-				},
+				result: this.sessionSnapshotAvailable
+					? {
+						snapshot: {
+							resource: sessionUri,
+							state,
+							fromSeq: 0,
+						},
+					}
+					: {},
 				subscription,
 			};
 		}
@@ -338,6 +342,91 @@ describe('ChannelRuntime', () => {
 		}
 	});
 
+	it('prefers an alias and falls back only to a local host owning the bound session', async () => {
+		const preferredClient = new TestHostClient();
+		preferredClient.sessionSnapshotAvailable = false;
+		const wrongClient = new TestHostClient();
+		wrongClient.sessionAvailable = false;
+		const fallbackClient = new TestHostClient();
+		const mcp = new TestMcpChannel();
+		const services = createServices(preferredClient, mcp);
+		const preferred = { ...endpoint, id: 'standalone:1:preferred' };
+		const wrong = { ...endpoint, id: 'editor:2:wrong', type: 'editor' as const };
+		const fallback = { ...endpoint, id: 'editor:3:fallback', type: 'editor' as const };
+		services.resolveAgentHost = async selector => {
+			assert.equal(selector, '@work');
+			return preferred;
+		};
+		services.discoverAgentHosts = async () => [wrong, fallback];
+		const attempted: string[] = [];
+		services.connectAgentHost = async (candidate, clientId) => {
+			attempted.push(candidate.id);
+			return {
+				client: candidate.id === preferred.id
+					? preferredClient
+					: candidate.id === wrong.id
+						? wrongClient
+						: fallbackClient,
+				clientId,
+			};
+		};
+		const statuses: string[] = [];
+
+		const runtime = await ChannelRuntime.start('personal', {
+			plugin: 'fake',
+			session: sessionUri,
+			chat: chatUri,
+			host: '@work',
+			enabled: true,
+		}, services, message => statuses.push(message));
+		try {
+			assert.deepEqual(attempted, [preferred.id, wrong.id, fallback.id]);
+			assert.equal(runtime.snapshot.host, fallback.id);
+			assert.equal(runtime.snapshot.session, sessionUri);
+			assert.equal(runtime.snapshot.chat, chatUri);
+			assert.ok(statuses.some(message => /using local fallback/.test(message)));
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it('falls back when an alias is unavailable but rejects ambiguous aliases', async () => {
+		const services = createServices(new TestHostClient(), new TestMcpChannel());
+		services.resolveAgentHost = async () => {
+			throw new HostAliasResolutionError('unavailable', "Host alias '@work' is unavailable");
+		};
+		const statuses: string[] = [];
+		const runtime = await ChannelRuntime.start('personal', {
+			plugin: 'fake',
+			session: sessionUri,
+			host: '@work',
+			enabled: true,
+		}, services, message => statuses.push(message));
+		await runtime.close();
+		assert.ok(statuses.some(message => /searching other local Agent Hosts/.test(message)));
+
+		let discovered = false;
+		services.resolveAgentHost = async () => {
+			throw new HostAliasResolutionError('ambiguous', "Host alias '@work' is ambiguous");
+		};
+		services.discoverAgentHosts = async () => {
+			discovered = true;
+			return [endpoint];
+		};
+		await assert.rejects(
+			ChannelRuntime.start('personal', {
+				plugin: 'fake',
+				session: sessionUri,
+				host: '@work',
+				enabled: true,
+			}, services),
+			(error: unknown) => error instanceof ChannelOperationError
+				&& error.stage === 'agent-host-discovery'
+				&& /ambiguous/.test(error.message),
+		);
+		assert.equal(discovered, false);
+	});
+
 	it('cleans up when the chat snapshot is unavailable', async () => {
 		const client = new TestHostClient();
 		client.subscribe = async uri => ({
@@ -400,6 +489,24 @@ describe('ChannelRuntime', () => {
 			);
 	});
 
+	it('redacts host-reported credentials from foreground startup errors', async () => {
+			const client = new TestHostClient();
+			client.subscribe = async () => {
+				throw new Error('token=host-reported-secret refused');
+			};
+
+			await assert.rejects(
+				ChannelRuntime.start('personal', {
+					plugin: 'fake',
+					session: sessionUri,
+					enabled: true,
+				}, createServices(client, new TestMcpChannel())),
+				(error: unknown) => error instanceof ChannelOperationError
+					&& error.message.includes('token=[redacted] refused')
+					&& !error.message.includes('host-reported-secret'),
+			);
+	});
+
 	it('distinguishes plugin integrity from plugin loading failures', async () => {
 			for (const expected of [
 				{ error: new PluginIntegrityError(new Error('digest mismatch')), stage: 'plugin-integrity' },
@@ -436,6 +543,9 @@ function createServices(client: TestHostClient, mcp: TestMcpChannel): ChannelRun
 		},
 		async discoverAgentHosts() {
 			return [endpoint];
+		},
+		async resolveAgentHost(selector) {
+			return selectAgentHost([endpoint], selector);
 		},
 		async connectAgentHost(_endpoint, clientId) {
 			assert.match(clientId, /^[a-f0-9-]+$/);
