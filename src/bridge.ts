@@ -445,7 +445,7 @@ export class ChannelBridge {
 		if (!this.isCurrentTool(pending)) {
 			return;
 		}
-		const result = await raceAbort(this.options.channel.callTool(pending.toolName, args), signal);
+		const result = await raceAbort(this.options.channel.callTool(pending.toolName, args, signal), signal);
 		if (this.isCurrentTool(pending)) {
 			this.dispatchToolCompletion(pending, result);
 		}

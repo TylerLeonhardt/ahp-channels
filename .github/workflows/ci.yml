@@ -47,3 +47,6 @@ jobs:
       - run: npm run e2e:permissions
         env:
           AHP_CHANNELS_E2E_USE_FIXTURE_HOST: "1"
+      - run: npm run e2e:attachments
+        env:
+          AHP_CHANNELS_E2E_USE_FIXTURE_HOST: "1"

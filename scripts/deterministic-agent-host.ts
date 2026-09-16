@@ -7,8 +7,10 @@ import {
 	McpServerStatus,
 	SessionLifecycle,
 	SessionStatus,
+	ToolCallConfirmationReason,
 	ToolCallContributorKind,
 	ToolCallStatus,
+	ToolResultContentType,
 	ResponsePartKind,
 	chatReducer,
 	sessionReducer,
@@ -25,11 +27,27 @@ import {
 	type SessionSummary,
 	type Snapshot,
 	type StateAction,
+	type ToolCallResult,
 } from '@microsoft/agent-host-protocol';
+import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, relative } from 'node:path';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
+import {
+	ATTACHMENT_FIXTURE_VERSION,
+	ATTACHMENT_OUTSIDE_FILE,
+	ATTACHMENT_SCOPE_FILE,
+	ATTACHMENT_SCOPE_NOTE,
+	assertMaterializedAttachment,
+	assertReturnedAttachment,
+	attachmentInvocation,
+	attachmentResourceUri,
+	attachmentSample,
+	attachmentScenarioFromMessage,
+	type AttachmentPhase,
+	type AttachmentScenario,
+} from '../test/fixtures/attachment-contract.js';
 
 const PROTOCOL_VERSION = '0.9.0';
 const PROVIDER = 'deterministic-e2e';
@@ -58,6 +76,7 @@ interface HostedSession {
 	readonly pendingToolCalls: Map<string, {
 		readonly turnId: string;
 		readonly permission?: { readonly marker: string; readonly path: string };
+		readonly attachment?: { readonly scenario: AttachmentScenario; readonly phase: AttachmentPhase };
 	}>;
 }
 
@@ -402,7 +421,10 @@ export class DeterministicAgentHost {
 		this.broadcastAction(channel, action, origin);
 		if (action.type === ActionType.ChatTurnStarted) {
 			const marker = PERMISSION_MARKER.exec(action.message.text)?.[0];
-			if (marker) {
+			const attachment = attachmentScenarioFromMessage(action.message.text);
+			if (attachment) {
+				await this.startAttachmentScenario(hosted, channel, action.turnId, attachment);
+			} else if (marker) {
 				this.startPermissionTool(hosted, channel, action.turnId, marker);
 			} else {
 				const expected = EXPECTED_REPLY.exec(action.message.text)?.[0];
@@ -434,6 +456,19 @@ export class DeterministicAgentHost {
 			const pending = hosted.pendingToolCalls.get(action.toolCallId);
 			if (pending && !pending.permission) {
 				hosted.pendingToolCalls.delete(action.toolCallId);
+				if (pending.attachment) {
+					// Mirror the host-owned follow-up completion seen after real
+					// providers consume a contributed attachment tool result.
+					this.publishAction(channel, action);
+				}
+				if (pending.attachment?.phase === 'read') {
+					assertMaterializedAttachment(action.result, pending.attachment.scenario);
+					this.startAttachmentTool(hosted, channel, pending.turnId, pending.attachment.scenario, 'return');
+					return;
+				}
+				if (pending.attachment) {
+					assertReturnedAttachment(action.result, pending.attachment.scenario);
+				}
 				this.publishAction(channel, {
 					type: ActionType.ChatTurnComplete,
 					turnId: pending.turnId,
@@ -483,6 +518,9 @@ export class DeterministicAgentHost {
 		const manifest = parseJsonObject(readResourceText(manifestResult), 'plugin manifest');
 		const mcp = parseJsonObject(readResourceText(mcpResult), 'MCP configuration');
 		const servers = requireRecord(mcp['mcpServers'], 'mcpServers');
+		if (manifest['version'] === ATTACHMENT_FIXTURE_VERSION) {
+			await this.assertAttachmentResourceAccess(peer, root);
+		}
 		const plugin: PluginCustomization = {
 			type: CustomizationType.Plugin,
 			id: customization.id,
@@ -552,6 +590,89 @@ export class DeterministicAgentHost {
 				{ id: 'deny', label: 'Deny', kind: ConfirmationOptionKind.Deny },
 			],
 		});
+	}
+
+	// Scripted fixture behavior, not a real model: only begin after an official
+	// upload reaches ChatTurnStarted, and consume actual results before replying.
+	private async startAttachmentScenario(
+		hosted: HostedSession,
+		chat: string,
+		turnId: string,
+		scenario: AttachmentScenario,
+	): Promise<void> {
+		if (scenario.kind !== 'SHARED_TEXT') {
+			this.startAttachmentTool(hosted, chat, turnId, scenario, 'read');
+			return;
+		}
+		const toolCallId = randomUUID();
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallStart,
+			turnId, toolCallId,
+			toolName: 'fixture_host_read_upload',
+			displayName: 'Fixture host: read shared upload',
+		});
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallReady,
+			turnId, toolCallId,
+			invocationMessage: 'Read only the fixture-owned official inbox upload',
+			toolInput: JSON.stringify({ path: scenario.sharedPath }),
+			confirmed: ToolCallConfirmationReason.NotNeeded,
+		});
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallComplete,
+			turnId, toolCallId,
+			result: await readFixtureSharedAttachment(scenario, this.registryDirectory),
+		});
+		this.startAttachmentTool(hosted, chat, turnId, scenario, 'return');
+	}
+
+	private startAttachmentTool(
+		hosted: HostedSession,
+		chat: string,
+		turnId: string,
+		scenario: AttachmentScenario,
+		phase: AttachmentPhase,
+	): void {
+		const invocation = attachmentInvocation(scenario, phase);
+		const client = hosted.state.activeClients.find(candidate =>
+			candidate.tools.some(tool => tool.name === invocation.name)
+		);
+		assert.ok(client, `Fixture tool ${invocation.name} must be discovered, not injected by the harness`);
+		const toolCallId = randomUUID();
+		hosted.pendingToolCalls.set(toolCallId, { turnId, attachment: { scenario, phase } });
+		const contributor = { kind: ToolCallContributorKind.Client, clientId: client.clientId } as const;
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallStart,
+			turnId, toolCallId, contributor,
+			toolName: invocation.name,
+			displayName: invocation.name,
+		});
+		this.publishAction(chat, {
+			type: ActionType.ChatToolCallReady,
+			turnId, toolCallId, contributor,
+			invocationMessage: `Fixture-only attachment ${phase}`,
+			toolInput: JSON.stringify(invocation.input),
+		});
+	}
+
+	private async assertAttachmentResourceAccess(peer: HostPeer, root: string): Promise<void> {
+		const uri = new URL(ATTACHMENT_SCOPE_FILE, root).href;
+		const readable = await this.reverseRequest(peer, 'resourceRead', {
+			channel: 'ahp-root://', uri, encoding: ContentEncoding.Utf8,
+		});
+		assert.equal(readResourceText(readable), ATTACHMENT_SCOPE_NOTE, 'Legitimate fixture plugin resources must remain readable');
+		await this.reverseRequest(peer, 'resourceRequest', { channel: 'ahp-root://', uri, read: true });
+		await Promise.all([
+			assert.rejects(this.reverseRequest(peer, 'resourceRequest', {
+				channel: 'ahp-root://', uri, write: true,
+			}), /read-only/),
+			assert.rejects(this.reverseRequest(peer, 'resourceRead', {
+				channel: 'ahp-root://', uri: new URL(`../${ATTACHMENT_OUTSIDE_FILE}`, root).href, encoding: ContentEncoding.Utf8,
+			}), /outside the contributed plugin/),
+			assert.rejects(this.reverseRequest(peer, 'resourceRead', {
+				channel: 'ahp-root://', uri: attachmentResourceUri(randomUUID()), encoding: ContentEncoding.Utf8,
+			}), /Only file resources can be served/),
+		]);
 	}
 
 	private async startReplyTool(
@@ -692,6 +813,19 @@ export class DeterministicAgentHost {
 		}
 		peer.pendingRequests.clear();
 	}
+}
+
+async function readFixtureSharedAttachment(scenario: AttachmentScenario, registryDirectory: string): Promise<ToolCallResult> {
+	const inbox = await realpath(join(dirname(registryDirectory), 'user-home', '.claude', 'channels', 'fakechat', 'inbox'));
+	const path = await realpath(requireString(scenario.sharedPath, 'official shared upload path'));
+	assert.match(relative(inbox, path), /^\d+\.txt$/, 'The fixture host must not read outside its own official inbox');
+	const bytes = await readFile(path);
+	assert.deepEqual(bytes, attachmentSample('SHARED_TEXT').bytes);
+	return {
+		success: true,
+		pastTenseMessage: 'Read the fixture-owned shared upload',
+		content: [{ type: ToolResultContentType.Text, text: bytes.toString('utf8') }],
+	};
 }
 
 function waitForListening(server: WebSocketServer): Promise<void> {

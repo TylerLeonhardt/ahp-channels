@@ -96,9 +96,22 @@ files.
 - Fakechat-based approval and denial coverage, including a pending request
   across daemon restart and stale verdict rejection.
 
-## Later: Protocol coverage
+## Completed: Bounded attachment and resource-reference translation
 
-- Attachment and resource-reference translation.
+- Preserve generic channel text, metadata, and plugin instructions without
+  inventing attachment notification fields.
+- Translate MCP text, images, audio, and embedded text/blob resources into
+  model-consumable AHP tool content.
+- Resolve tool-provided resource links through the originating MCP server's
+  `resources/read` API, with byte/count limits, explicit errors, and cancellation.
+- Preserve plugin-defined tool schemas for outbound file delivery; do not
+  interpret file paths or platform metadata in the bridge.
+- Keep reverse plugin resource access read-only and scoped to the plugin root.
+
+Provider/model format support and plugin-local path conventions still apply;
+this does not add arbitrary file transfer between host and plugin machines.
+See [README.md](./README.md#attachments-and-resources) for supported paths and
+limits.
 
 ## Later: Marketplace and distribution
 
