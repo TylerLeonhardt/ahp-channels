@@ -344,6 +344,7 @@ describe('ChannelBridge', () => {
 		}
 		await fixture.bridge.close();
 		assert.equal(fixture.dispatched.some(action => action.type === ActionType.ChatToolCallComplete), false);
+		assert.equal(fixture.signals[0]?.aborted, true);
 	});
 
 	it('invalidates an input read when the host completes that tool', async context => {
@@ -457,6 +458,7 @@ function createToolFixture(context: TestContext, toolName = 'reply', running = f
 	const subscription = new TestSubscription();
 	const dispatched: StateAction[] = [];
 	const calls: string[] = [];
+	const signals: AbortSignal[] = [];
 	const host = {
 		readCount: 0,
 		readResult: undefined as Promise<ResourceReadResult> | undefined,
@@ -472,8 +474,10 @@ function createToolFixture(context: TestContext, toolName = 'reply', running = f
 	const channel = {
 		result: undefined as Promise<ToolCallResult> | undefined,
 		async setChannelHandler() { },
-		async callTool(name: string): Promise<ToolCallResult> {
+		async callTool(name: string, _args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolCallResult> {
 			calls.push(name);
+			assert.ok(signal, 'The bridge must propagate tool cancellation to MCP');
+			signals.push(signal);
 			return this.result ?? { success: true, pastTenseMessage: 'Replied' };
 		},
 		async close() { },
@@ -508,7 +512,7 @@ function createToolFixture(context: TestContext, toolName = 'reply', running = f
 		type: ActionType.ChatToolCallConfirmed, turnId: 'tool-turn', toolCallId: 'owned-tool',
 		approved: true, confirmed: ToolCallConfirmationReason.NotNeeded,
 	}));
-	return { bridge, host, channel, subscription, dispatched, calls, confirm };
+	return { bridge, host, channel, subscription, dispatched, calls, signals, confirm };
 }
 
 function deferred<T>() {

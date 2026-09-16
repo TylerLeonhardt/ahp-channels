@@ -42,6 +42,7 @@
     "e2e:daemon": "npm run build && tsx scripts/e2e-daemon-local.ts",
     "e2e:fakechat": "npm run build && tsx scripts/e2e-fakechat.ts",
     "e2e:permissions": "npm run build && tsx scripts/e2e-fakechat.ts --permissions",
+    "e2e:attachments": "npm run build && tsx scripts/e2e-fakechat.ts --attachments",
     "check": "npm run typecheck && npm test && npm run build",
     "prepack": "npm run build",
     "version": "node scripts/sync-version.mjs"

@@ -146,6 +146,29 @@ describe('plugin resource requests', () => {
 			isRpcError(AhpErrorCodes.PermissionDenied),
 		);
 	});
+
+	it('rejects directory links that escape the plugin root, including Windows junctions', async () => {
+		const parent = await mkdtemp(join(tmpdir(), 'ahp-channels-plugin-resources-'));
+		temporaryDirectories.push(parent);
+		const root = join(parent, 'plugin');
+		const outside = join(parent, 'outside');
+		await mkdir(root);
+		await mkdir(outside);
+		await writeFile(join(outside, 'attachment.txt'), 'not contributed');
+		await symlink(outside, join(root, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+		const handlers = await createPluginResourceRequestHandlers(root);
+		assert.ok(handlers.resourceRead);
+		assert.ok(handlers.resourceRequest);
+		const uri = pathToFileURL(join(root, 'linked', 'attachment.txt')).href;
+		await assert.rejects(
+			() => Promise.resolve(handlers.resourceRead?.({ channel: 'ahp-root://', uri })),
+			isRpcError(AhpErrorCodes.PermissionDenied),
+		);
+		await assert.rejects(
+			() => Promise.resolve(handlers.resourceRequest?.({ channel: 'ahp-root://', uri, read: true })),
+			isRpcError(AhpErrorCodes.PermissionDenied),
+		);
+	});
 });
 
 function isRpcError(code: number): (error: unknown) => boolean {

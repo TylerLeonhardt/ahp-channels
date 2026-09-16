@@ -18,7 +18,7 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promise
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import WebSocket, { type RawData } from 'ws';
 import { connectAgentHost, resolveChat, type ConnectedAgentHost } from '../src/ahp.js';
 import { ensureDaemonStarted, probeDaemon, requestDaemon, stopDaemon } from '../src/daemonClient.js';
@@ -27,16 +27,23 @@ import { discoverLocalAgentHosts, selectAgentHost } from '../src/endpoints.js';
 import { ConfigStore, OFFICIAL_MARKETPLACE_NAME } from '../src/config.js';
 import { PluginManager } from '../src/plugins.js';
 import { runProcess } from '../src/process.js';
+import { createAttachmentFixture, runAttachmentRoundTrips } from './attachment-e2e.js';
 import { DeterministicAgentHost } from './deterministic-agent-host.js';
 
 const CHANNEL_NAME = 'fakechat-e2e';
 const PLUGIN_NAME = 'fakechat';
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const permissionMode = process.argv.includes('--permissions');
+const attachmentMode = process.argv.includes('--attachments');
 const interactive = process.argv.includes('--interactive');
+if (permissionMode && attachmentMode) {
+	throw new Error('Choose either --permissions or --attachments, not both');
+}
 
-const testRoot = await mkdtemp(join(tmpdir(), 'ahp-fakechat-'));
-const fakeHome = join(testRoot, 'user-home');
+// Keep the daemon's Unix socket independent of the checkout path length.
+const testRoot = await mkdtemp(join(tmpdir(), 'ahp-fc-'));
+const workspace = join(testRoot, 'workspace');
+const fakeHome = join(workspace, 'user-home');
 const bunCache = join(testRoot, 'bun-cache');
 const session = `ahp-session:/${randomUUID()}`;
 const sockets = new Set<WebSocket>();
@@ -90,10 +97,11 @@ try {
 	const client = connection.client;
 	await mkdir(fakeHome, { recursive: true });
 	const installedFakechat = await installOfficialFakechat(testRoot);
-	const permissionPlugin = permissionMode
-		? await createPermissionFixture(testRoot, installedFakechat.path)
-		: undefined;
-	const expectedInstallation = permissionMode ? undefined : installedFakechat.installation;
+	const officialSource = attachmentMode ? await readFile(join(installedFakechat.path, 'server.ts')) : undefined;
+	const fixturePlugin = attachmentMode
+		? await createAttachmentFixture(testRoot, installedFakechat.path)
+		: permissionMode ? await createPermissionFixture(testRoot, installedFakechat.path) : undefined;
+	const expectedInstallation = fixturePlugin ? undefined : installedFakechat.installation;
 
 	const rootSnapshot = connection.initializeResult.snapshots.find(snapshot => snapshot.resource === 'ahp-root://');
 	const provider = (rootSnapshot?.state as RootState | undefined)?.agents[0]?.provider;
@@ -101,7 +109,11 @@ try {
 		throw new Error('The local Agent Host advertises no agent providers');
 	}
 
-	await client.request('createSession', { channel: session, provider });
+	await client.request('createSession', {
+		channel: session,
+		provider,
+		workingDirectories: [pathToFileURL(workspace).href],
+	});
 	sessionCreated = true;
 	const subscribedSession = await client.subscribe(session);
 	sessionSubscription = subscribedSession.subscription;
@@ -126,7 +138,7 @@ try {
 		command: 'channel.create',
 		name: CHANNEL_NAME,
 		definition: {
-			plugin: permissionPlugin ?? PLUGIN_NAME,
+			plugin: fixturePlugin ?? PLUGIN_NAME,
 			...(expectedInstallation ? { installation: expectedInstallation } : {}),
 			session,
 			enabled: false,
@@ -150,7 +162,19 @@ try {
 		readonly requestId: string;
 		readonly finished: Promise<void>;
 	} | undefined;
-	if (permissionMode) {
+	if (attachmentMode) {
+		await runAttachmentRoundTrips({
+			home: testRoot,
+			port,
+			socket,
+			subscription: chatSubscription,
+			state: sessionState,
+			clientId,
+			interactive,
+			fixtureHost: useFixtureHost,
+		});
+		assert.deepEqual(await readFile(join(installedFakechat.path, 'server.ts')), officialSource, 'The official fakechat server must remain unmodified');
+	} else if (permissionMode) {
 		for (const allowed of [true, false]) {
 			const marker = `FAKECHAT_PERMISSION_${allowed ? 'ALLOW' : 'DENY'}_${randomUUID()}`;
 			const path = join(fixtureRegistry, `${marker}.txt`);
@@ -187,49 +211,56 @@ try {
 	await closeWebSocket(socket);
 	sockets.delete(socket);
 
-	await stopDaemon(testRoot);
-	daemonStarted = false;
-	await waitForFakechatStopped(port);
-	sessionState = await waitForActiveClientRemoval(sessionState, sessionSubscription, clientId);
+	if (!attachmentMode) {
+		await stopDaemon(testRoot);
+		daemonStarted = false;
+		await waitForFakechatStopped(port);
+		sessionState = await waitForActiveClientRemoval(sessionState, sessionSubscription, clientId);
 
-	const restarted = await ensureDaemonStarted(testRoot);
-	daemonStarted = true;
-	const restartedClientId = requireRunningChannel(restarted, expectedInstallation);
-	sessionState = await waitForFakechatContribution(
-		sessionState,
-		sessionSubscription,
-		restartedClientId,
-	);
-	await waitForFakechatReady(testRoot, port);
-
-	socket = await connectFakechat(port);
-	sockets.add(socket);
-	if (pendingRestart) {
-		const prompt = waitForPermissionPrompt(socket);
-		sendFakechat(socket, '/permissions');
-		const resumed = await prompt;
-		assert.notEqual(resumed.id, pendingRestart.requestId, 'Restart must issue a fresh approval ID');
-		const reply = waitForPermissionResult(socket, `${pendingRestart.marker}_DENIED`);
-		sendFakechat(socket, `yes ${pendingRestart.requestId}`);
-		sendFakechat(socket, `no ${resumed.id}`);
-		await Promise.all([pendingRestart.finished, reply]);
-		if (useFixtureHost) {
-			await assertMissing(join(fixtureRegistry, `${pendingRestart.marker}.txt`));
-		}
-	} else {
-		await runRoundTrip(
-			socket,
-			initialChatState,
-			chatSubscription,
-			`FAKECHAT_RESTART_${randomUUID()}`,
+		const restarted = await ensureDaemonStarted(testRoot);
+		daemonStarted = true;
+		const restartedClientId = requireRunningChannel(restarted, expectedInstallation);
+		sessionState = await waitForFakechatContribution(
+			sessionState,
+			sessionSubscription,
+			restartedClientId,
 		);
+		await waitForFakechatReady(testRoot, port);
+
+		socket = await connectFakechat(port);
+		sockets.add(socket);
+		if (pendingRestart) {
+			const prompt = waitForPermissionPrompt(socket);
+			sendFakechat(socket, '/permissions');
+			const resumed = await prompt;
+			assert.notEqual(resumed.id, pendingRestart.requestId, 'Restart must issue a fresh approval ID');
+			const reply = waitForPermissionResult(socket, `${pendingRestart.marker}_DENIED`);
+			sendFakechat(socket, `yes ${pendingRestart.requestId}`);
+			sendFakechat(socket, `no ${resumed.id}`);
+			await Promise.all([pendingRestart.finished, reply]);
+			if (useFixtureHost) {
+				await assertMissing(join(fixtureRegistry, `${pendingRestart.marker}.txt`));
+			}
+		} else {
+			await runRoundTrip(
+				socket,
+				initialChatState,
+				chatSubscription,
+				`FAKECHAT_RESTART_${randomUUID()}`,
+			);
+		}
+		await closeWebSocket(socket);
+		sockets.delete(socket);
 	}
-	await closeWebSocket(socket);
-	sockets.delete(socket);
 
 	await requestDaemon(testRoot, { command: 'channel.delete', name: CHANNEL_NAME });
 	channelCreated = false;
-	console.log(permissionMode
+	if (attachmentMode) {
+		await waitForFakechatStopped(port);
+	}
+	console.log(attachmentMode
+		? `Attachment fixture E2E passed on 127.0.0.1:${port}; the official fakechat source is unmodified`
+		: permissionMode
 		? `Native permission relay E2E passed on 127.0.0.1:${port} using the extended fakechat fixture: allow, deny, pending restart, stale verdict`
 		: `Official fakechat E2E passed on 127.0.0.1:${port}, including daemon restart`);
 } catch (error) {
@@ -239,7 +270,9 @@ try {
 	for (const socket of sockets) {
 		await cleanup('fakechat WebSocket', () => closeWebSocket(socket), cleanupErrors);
 	}
-	if (channelCreated && daemonStarted) {
+	// A failed attachment assertion may leave a provider turn in flight. Let
+	// isolated daemon shutdown cancel it rather than requesting a guarded delete.
+	if (channelCreated && daemonStarted && !(attachmentMode && primaryError)) {
 		await cleanup(
 			'fakechat channel',
 			() => requestDaemon(testRoot, { command: 'channel.delete', name: CHANNEL_NAME }),

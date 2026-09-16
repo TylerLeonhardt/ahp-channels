@@ -23,6 +23,8 @@
 
 - [x] Contribute installed Open Plugins and their skills through AHP.
 - [x] Serve contributed plugins through read-only AHP resource requests.
+- [x] Translate bounded MCP rich content and resource links through standard
+      MCP resource reads without widening plugin filesystem access.
 - [x] Keep setup skills available when the channel MCP server cannot start.
 - [x] Remove bridge-owned plugin secret, state, and access management.
 - [x] Install plugins into immutable, versioned directories

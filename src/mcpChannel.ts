@@ -1,8 +1,6 @@
 import {
-	ToolResultContentType,
 	type ToolCallResult,
 	type ToolDefinition,
-	type ToolResultContent,
 } from '@microsoft/agent-host-protocol';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { z } from 'zod';
@@ -12,6 +10,7 @@ import type { LogWriter } from './daemonLog.js';
 import { McpPermissionTransport, supportsChannelPermissions } from './mcpPermissions.js';
 import type { StdioMcpServerConfig } from './plugins.js';
 import { ChannelStdioClientTransport } from './channelStdioTransport.js';
+import { convertToolResult, failedToolResult, formatMcpError, MAX_MCP_CONTENT_BYTES } from './mcpToolResult.js';
 import { VERSION } from './version.js';
 
 const ChannelNotificationSchema = z.object({
@@ -21,6 +20,9 @@ const ChannelNotificationSchema = z.object({
 		meta: z.record(z.string(), z.string()).optional(),
 	}),
 });
+
+// JSON can expand a decoded text byte to a six-byte escape; allow framing too.
+const MAX_CHANNEL_MESSAGE_BYTES = MAX_MCP_CONTENT_BYTES * 6 + 64 * 1024;
 
 export interface StartedMcpChannel {
 	readonly name: string;
@@ -33,7 +35,7 @@ export interface McpChannelClient {
 	readonly permissions?: ChannelPermissionTransport;
 	start(): Promise<StartedMcpChannel>;
 	setChannelHandler(handler: (event: ChannelEvent) => void | Promise<void>): Promise<void>;
-	callTool(name: string, args: Record<string, unknown>): Promise<ToolCallResult>;
+	callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolCallResult>;
 	close(): Promise<void>;
 }
 
@@ -49,6 +51,7 @@ export class McpChannelProcess implements McpChannelClient {
 		version: VERSION,
 	});
 	private readonly permissionTransport = new McpPermissionTransport(this.client);
+	private readonly lifetime = new AbortController();
 	private transport: ChannelStdioClientTransport | undefined;
 	private channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
 	private readonly pendingEvents: ChannelEvent[] = [];
@@ -62,7 +65,9 @@ export class McpChannelProcess implements McpChannelClient {
 		private readonly config: StdioMcpServerConfig,
 		private readonly stderr: LogWriter = standardErrorWriter,
 	) {
+		this.client.onerror = error => this.stderr.write(`MCP channel error: ${formatMcpError(error)}\n`);
 		this.client.onclose = () => {
+			this.lifetime.abort(new Error('MCP channel connection closed'));
 			this.stopped = true;
 			this.resolveStopped();
 		};
@@ -92,6 +97,7 @@ export class McpChannelProcess implements McpChannelClient {
 			...(this.config.cwd ? { cwd: this.config.cwd } : {}),
 			env: createChannelEnvironment(this.config.env),
 			stderr: 'pipe',
+			maxBufferSize: MAX_CHANNEL_MESSAGE_BYTES,
 		});
 		this.transport.stderr?.on('data', chunk => this.stderr.write(String(chunk)));
 		await this.client.connect(this.transport);
@@ -110,18 +116,8 @@ export class McpChannelProcess implements McpChannelClient {
 				name: tool.name,
 				...(tool.title ? { title: tool.title } : {}),
 				...(tool.description ? { description: tool.description } : {}),
-				inputSchema: {
-					type: 'object',
-					...(tool.inputSchema.properties ? { properties: tool.inputSchema.properties } : {}),
-					...(tool.inputSchema.required ? { required: tool.inputSchema.required } : {}),
-				},
-				...(tool.outputSchema ? {
-					outputSchema: {
-						type: 'object',
-						...(tool.outputSchema.properties ? { properties: tool.outputSchema.properties } : {}),
-						...(tool.outputSchema.required ? { required: tool.outputSchema.required } : {}),
-					},
-				} : {}),
+				inputSchema: tool.inputSchema,
+				...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
 			})),
 		};
 	}
@@ -136,20 +132,20 @@ export class McpChannelProcess implements McpChannelClient {
 		}
 	}
 
-	async callTool(name: string, args: Record<string, unknown>): Promise<ToolCallResult> {
+	async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolCallResult> {
+		const requestSignal = signal ? AbortSignal.any([this.lifetime.signal, signal]) : this.lifetime.signal;
+		requestSignal.throwIfAborted();
 		try {
-			const raw: unknown = await this.client.callTool({ name, arguments: args });
-			return convertToolResult(name, raw);
+			const raw: unknown = await this.client.callTool({ name, arguments: args }, undefined, { signal: requestSignal });
+			return await convertToolResult(name, raw, this.client, requestSignal);
 		} catch (error) {
-			return {
-				success: false,
-				pastTenseMessage: `Failed to call ${name}`,
-				error: { message: error instanceof Error ? error.message : String(error) },
-			};
+			requestSignal.throwIfAborted();
+			return failedToolResult(name, error);
 		}
 	}
 
 	async close(): Promise<void> {
+		this.lifetime.abort();
 		if (this.stopped) {
 			return;
 		}
@@ -173,70 +169,4 @@ export function createChannelEnvironment(
 		}
 	}
 	return { ...environment, ...overrides };
-}
-
-export function convertToolResult(toolName: string, value: unknown): ToolCallResult {
-	if (!isRecord(value) || !Array.isArray(value['content'])) {
-		return {
-			success: false,
-			pastTenseMessage: `Failed to call ${toolName}`,
-			error: { message: 'MCP server returned an unsupported tool result' },
-		};
-	}
-
-	const content = value['content'].flatMap(convertContent);
-	const isError = value['isError'] === true;
-	const errorText = content
-		.filter(item => item.type === ToolResultContentType.Text)
-		.map(item => item.text)
-		.join('\n');
-	return {
-		success: !isError,
-		pastTenseMessage: isError ? `Failed to call ${toolName}` : `Called ${toolName}`,
-		...(content.length > 0 ? { content } : {}),
-		...(isRecord(value['structuredContent']) ? { structuredContent: value['structuredContent'] } : {}),
-		...(isError ? { error: { message: errorText || `MCP tool ${toolName} failed` } } : {}),
-	};
-}
-
-function convertContent(value: unknown): ToolResultContent[] {
-	if (!isRecord(value) || typeof value['type'] !== 'string') {
-		return [];
-	}
-	if (value['type'] === 'text' && typeof value['text'] === 'string') {
-		return [{ type: ToolResultContentType.Text, text: value['text'] }];
-	}
-	if ((value['type'] === 'image' || value['type'] === 'audio')
-		&& typeof value['data'] === 'string'
-		&& typeof value['mimeType'] === 'string') {
-		return [{
-			type: ToolResultContentType.EmbeddedResource,
-			data: value['data'],
-			contentType: value['mimeType'],
-		}];
-	}
-	if (value['type'] === 'resource' && isRecord(value['resource'])) {
-		const resource = value['resource'];
-		if (typeof resource['text'] === 'string') {
-			return [{ type: ToolResultContentType.Text, text: resource['text'] }];
-		}
-		if (typeof resource['blob'] === 'string' && typeof resource['mimeType'] === 'string') {
-			return [{
-				type: ToolResultContentType.EmbeddedResource,
-				data: resource['blob'],
-				contentType: resource['mimeType'],
-			}];
-		}
-	}
-	if (value['type'] === 'resource_link' && typeof value['uri'] === 'string') {
-		return [{
-			type: ToolResultContentType.Text,
-			text: typeof value['name'] === 'string' ? `${value['name']}: ${value['uri']}` : value['uri'],
-		}];
-	}
-	return [];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

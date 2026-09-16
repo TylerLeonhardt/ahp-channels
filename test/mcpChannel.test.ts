@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { McpChannelProcess, convertToolResult, createChannelEnvironment } from '../src/mcpChannel.js';
+import { McpChannelProcess, createChannelEnvironment } from '../src/mcpChannel.js';
 
 const silentLogWriter = {
 	write(_chunk: string): void { },
@@ -78,18 +78,6 @@ describe('McpChannelProcess', () => {
 		} finally {
 			await channel.close();
 		}
-	});
-
-	it('converts MCP failures', () => {
-		assert.deepEqual(convertToolResult('reply', {
-			isError: true,
-			content: [{ type: 'text', text: 'nope' }],
-		}), {
-			success: false,
-			pastTenseMessage: 'Failed to call reply',
-			content: [{ type: 'text', text: 'nope' }],
-			error: { message: 'nope' },
-		});
 	});
 
 	it('reports an unexpected MCP process exit', async () => {

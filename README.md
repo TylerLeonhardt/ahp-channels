@@ -165,6 +165,64 @@ startup error but keeps its plugin customizations active. Run the contributed
 setup skill in the target session. The daemon retries automatically after the
 setup turn finishes and activates the channel server when it becomes runnable.
 
+## Attachments and resources
+
+The [channel contract](https://code.claude.com/docs/en/channels-reference)
+defines inbound notifications as `content: string` plus optional string
+`meta`. It does not define attachment fields or an outbound `send_attachment`
+operation. The bridge preserves the notification text, valid metadata
+attributes, and plugin instructions; it never interprets metadata as a
+filesystem grant or automatically opens a path or URL from a message.
+
+Plugins can instruct the agent to use their discovered MCP tools to retrieve
+an upload. Tool results are translated as follows:
+
+| MCP content | AHP delivery |
+| --- | --- |
+| `text` | Text, unchanged. |
+| `image` / `audio` | Embedded base64 bytes with a validated, normalized MIME type. |
+| Embedded text resource | Resource identity/MIME description followed by its text. |
+| Embedded blob resource | Embedded bytes; an absent MIME type becomes `application/octet-stream`. Declared text, JSON, and XML blobs are decoded using their charset (UTF-8 by default), with decoding errors reported explicitly. |
+| `resource_link` | Resource identity, name/title, description, MIME, and size when provided, followed by content fetched through the **originating MCP server's** standard `resources/read` API. |
+
+Links are materialized before completing the AHP client tool call. Current
+Copilot Agent Hosts consume text and embedded bytes from client-tool results,
+not lazy AHP `Resource` result blocks. This also lets a plugin-owned reference
+work without a shared filesystem. The bridge does not fetch HTTP URLs itself,
+open `file:` links itself, enumerate MCP resources, or recursively follow
+content. A server must support `resources/read` for its returned links.
+Missing, denied, empty, malformed, oversized, or timed-out resource reads
+produce an explicit failed tool result, not a successful URI-only fallback.
+Other successfully translated content and the plugin's tool-error text remain
+visible. Structured output is preserved within the same content budget.
+
+Materialized tool content (decoded bytes, retained MIME metadata, text including
+resource descriptions, and structured output) is limited to **8 MiB per call**,
+with at most **16 resource links** and a **10-second total resource-read deadline**.
+Size hints are checked before reading, and actual content is checked
+regardless of the hint. Base64 and MIME/charset validation rejects corrupt
+content. The stdio wire buffer allows JSON/base64 expansion, bounded at
+48 MiB + 64 KiB. Diagnostics have separate bounds: **1 KiB per entry**,
+**16 KiB of diagnostic content per call**, and a **16 KiB error summary**.
+Truncated error details and omitted diagnostics are explicitly marked; rejected data is not echoed
+back without bounds. A plugin's admitted error text remains in the content
+even when its error summary is shortened.
+These limits are not plugin configuration or test overrides.
+
+Files going back to a human use the plugin's ordinary discovered tools and
+their complete, plugin-defined schemas. There is no special bridge reply/file
+schema. The existing **1 MiB tool-argument limit** applies to both inline and
+referenced arguments, independently of a plugin's own file-upload limits.
+If a plugin accepts absolute file paths, those files must exist on the
+**plugin machine**. Likewise, plugins that describe incoming uploads only as
+local paths need host access to that filesystem, or a plugin tool that returns
+the content. The bridge neither copies arbitrary host files nor expands its
+read-only, plugin-root-scoped reverse resource handlers to cover uploads.
+
+Rendering or understanding a particular image, audio, or document format is
+provider/model-dependent. MCP display annotations, icons, and opaque `_meta`
+are not interpreted as file access or new AHP attachment fields.
+
 ## Status
 
 The compatibility bridge and durable daemon control milestones are complete.
@@ -263,8 +321,9 @@ permission support and does not enable session-wide "allow all" permissions.
 Only run channel plugins whose contributed tools you trust.
 Pending calls for tools the channel no longer advertises are denied explicitly;
 already-running unavailable calls report a failure instead of leaving the turn
-waiting. Cancellation stops pending argument reads and prevents a new channel
-tool invocation afterward. It cannot undo effects of a tool that already began.
+waiting. Cancellation stops pending argument reads and propagates to MCP tool
+calls and resource reads, preventing subsequent resource reads or new channel
+tool invocations. It cannot undo effects of a tool that already began.
 
 Channel plugins that advertise `claude/channel/permission: {}` can relay tool
 approval requests for other tools in their bound AHP chat. Missing or `false`
@@ -349,6 +408,7 @@ npm run e2e:local
 npm run e2e:daemon
 npm run e2e:fakechat
 npm run e2e:permissions
+npm run e2e:attachments
 ```
 
 ### Official fakechat E2E
@@ -377,6 +437,11 @@ credentials or external messaging service, and removes its temporary
 `AHP_CHANNELS_HOME`, plugin home, Bun cache, channel, daemon, and AHP session on
 both success and failure.
 
+The daemon home uses a short OS-temporary path so Unix socket addresses do not
+depend on checkout depth. The agent receives a separate temporary working
+directory containing the plugin's upload state; permission-test targets remain
+outside that working directory.
+
 ### Permission relay E2E
 
 `npm run e2e:permissions` uses the same harness and a test-only native-permission
@@ -402,6 +467,40 @@ For browser-driven testing, add `-- --interactive`. The harness prints its UI
 URL, message to send, and expected verdict for each case. The fixture-only
 `/permissions` command displays outstanding cards after the browser reconnects;
 it models the message history a real chat platform keeps.
+
+### Attachment and resource-reference E2E
+
+`npm run e2e:attachments` uses a clearly labeled attachment fixture around the
+unmodified official fakechat server. It is separate from both the default
+official-fakechat smoke test and the native-permission fixture.
+
+The attachment fixture exposes uploaded files through opaque MCP resource
+references and discovered tools, without forwarding a local file path that a
+model could read instead. Its outbound tool uses a resource identifier rather
+than assuming a universal `files` argument. The fixture delegates actual
+upload, response, and downloadable-file delivery to official fakechat.
+
+The harness checks text and PNG contents at the AHP tool boundary and compares
+returned downloads with the uploaded bytes. The deterministic-host run also
+verifies read-only, scoped reverse resource access and a separate
+shared-filesystem upload/read/reply case. CI uses that deterministic host;
+this checks protocol and byte fidelity, **not model vision**. Selecting a real
+host exercises its actual agent/provider for referenced uploads, including
+image-content assertions, without requiring a host file-read permission.
+
+```powershell
+$env:AHP_CHANNELS_E2E_USE_FIXTURE_HOST = '1'
+npm run e2e:attachments
+```
+
+Without `--interactive`, the runner uses fakechat's browser-facing HTTP and
+WebSocket APIs. This is automated protocol E2E, not browser UI automation.
+For a real browser-driven run, remove the fixture-host setting, select the
+intended host using `AHP_CHANNELS_E2E_HOST`, and add `-- --interactive`. The
+runner prints the UI URL, disposable files, and prompts, then observes the
+browser-originated turns and plugin responses rather than injecting AHP
+turns or permission verdicts. A browser must be able to reach that UI and
+upload the disposable files.
 
 See [SHIPPING.md](./SHIPPING.md) for the npm prerelease gates and
 [PUBLISHING.md](./PUBLISHING.md) for the tag-driven release process.
