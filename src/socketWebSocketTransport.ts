@@ -13,10 +13,16 @@ export class SocketWebSocketTransport implements AhpTransport {
 	private error: TransportError | undefined;
 	private closed = false;
 
-	static connect(socketPath: string, connectionToken: string): Promise<SocketWebSocketTransport> {
+	static connect(
+		socketPath: string,
+		connectionToken?: string,
+		connectionTokenQueryParameter = 'tkn',
+	): Promise<SocketWebSocketTransport> {
 		return new Promise((resolve, reject) => {
 			const url = new URL('ws://localhost/');
-			url.searchParams.set('tkn', connectionToken);
+			if (connectionToken !== undefined) {
+				url.searchParams.set(connectionTokenQueryParameter, connectionToken);
+			}
 			const socket = new WebSocket(url, {
 				createConnection: () => createConnection(socketPath),
 				handshakeTimeout: 10_000,

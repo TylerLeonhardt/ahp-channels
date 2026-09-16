@@ -16,12 +16,47 @@ describe('ConfigStore', () => {
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
 		temporaryDirectories.push(home);
 		await writeFile(join(home, 'config.json'), JSON.stringify({
-			version: CONFIG_VERSION - 1,
+			version: CONFIG_VERSION - 2,
 			marketplaces: {},
 			plugins: {},
 		}));
 
 		await assert.rejects(new ConfigStore(home).read(), /Unsupported ahp-channels config version/);
+	});
+
+	it('migrates version 3 configuration without changing channel bindings', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
+		temporaryDirectories.push(home);
+		await writeFile(join(home, 'config.json'), JSON.stringify({
+			version: 3,
+			marketplaces: {},
+			plugins: {},
+			channels: {
+				personal: {
+					plugin: 'fake',
+					session: 'ahp-session:/one',
+					chat: 'ahp-chat:/one',
+					host: 'standalone:123:legacy',
+					enabled: false,
+				},
+			},
+		}));
+
+		assert.deepEqual(await new ConfigStore(home).read(), {
+			version: CONFIG_VERSION,
+			marketplaces: {},
+			plugins: {},
+			hostAliases: {},
+			channels: {
+				personal: {
+					plugin: 'fake',
+					session: 'ahp-session:/one',
+					chat: 'ahp-chat:/one',
+					host: 'standalone:123:legacy',
+					enabled: false,
+				},
+			},
+		});
 	});
 
 	it('serializes concurrent updates through a lock', async () => {
@@ -100,6 +135,7 @@ describe('ConfigStore', () => {
 					},
 				},
 			},
+			hostAliases: {},
 			channels: {
 				personal: {
 					plugin: 'fake',
@@ -180,6 +216,7 @@ describe('ConfigStore', () => {
 			version: CONFIG_VERSION,
 			marketplaces: {},
 			plugins: {},
+			hostAliases: {},
 			channels: {},
 		});
 
@@ -222,5 +259,82 @@ describe('ConfigStore', () => {
 		}));
 
 		await assert.rejects(new ConfigStore(home).read(), /differs only by case/);
+	});
+
+	it('validates host aliases and channel references without accepting embedded secrets', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await writeFile(join(home, 'config.json'), JSON.stringify({
+			version: CONFIG_VERSION,
+			marketplaces: {},
+			plugins: {},
+			hostAliases: {
+				Local: {
+					kind: 'websocket',
+					url: 'ws://127.0.0.1:1234/?tkn=super-secret',
+					withoutAuthentication: true,
+				},
+			},
+			channels: {},
+		}));
+
+		await assert.rejects(
+			store.read(),
+			(error: unknown) => error instanceof Error
+				&& /Invalid local WebSocket host alias URL/.test(error.message)
+				&& !error.message.includes('super-secret'),
+		);
+
+		await writeFile(join(home, 'config.json'), JSON.stringify({
+			version: CONFIG_VERSION,
+			marketplaces: {},
+			plugins: {},
+			hostAliases: {
+				Local: {
+					kind: 'websocket',
+					url: 'ws://127.0.0.1:1234/',
+					tokenFile: join(home, 'host.token'),
+				},
+			},
+			channels: {},
+		}));
+		await assert.rejects(store.read(), /token query parameter/);
+
+		await writeFile(join(home, 'config.json'), JSON.stringify({
+			version: CONFIG_VERSION,
+			marketplaces: {},
+			plugins: {},
+			hostAliases: {
+				Local: {
+					kind: 'socket',
+					path: join(home, 'host.sock'),
+					withoutAuthentication: true,
+				},
+				local: {
+					kind: 'socket',
+					path: join(home, 'other.sock'),
+					withoutAuthentication: true,
+				},
+			},
+			channels: {},
+		}));
+		await assert.rejects(store.read(), /Duplicate host alias name/);
+
+		await writeFile(join(home, 'config.json'), JSON.stringify({
+			version: CONFIG_VERSION,
+			marketplaces: {},
+			plugins: {},
+			hostAliases: {},
+			channels: {
+				personal: {
+					plugin: 'fake',
+					session: 'ahp-session:/one',
+					host: '@missing',
+					enabled: false,
+				},
+			},
+		}));
+		await assert.rejects(store.read(), /references unknown host alias '@missing'/);
 	});
 });

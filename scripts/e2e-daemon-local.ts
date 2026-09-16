@@ -15,6 +15,7 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { AgentHostService } from '../src/agentHosts.js';
 import { connectAgentHost, resolveChat } from '../src/ahp.js';
 import { ConfigStore } from '../src/config.js';
 import { ensureDaemonStarted, requestDaemon, stopDaemon } from '../src/daemonClient.js';
@@ -33,6 +34,12 @@ const endpoints = await discoverLocalAgentHosts();
 const endpoint = process.env['AHP_CHANNELS_E2E_HOST']
 	? selectAgentHost(endpoints, process.env['AHP_CHANNELS_E2E_HOST'])
 	: endpoints.find(candidate => candidate.type === 'standalone') ?? selectAgentHost(endpoints);
+const configStore = new ConfigStore(testRoot);
+const agentHosts = new AgentHostService(configStore, {
+	...process.env,
+	AHP_CHANNELS_ENDPOINT_REGISTRY: dirname(endpoint.registryFile),
+});
+await agentHosts.addDiscoveredAlias('daemon-e2e', endpoint.id);
 const connection = await connectAgentHost(endpoint);
 const client = connection.client;
 const sessions = [`ahp-session:/${randomUUID()}`, `ahp-session:/${randomUUID()}`] as const;
@@ -48,7 +55,7 @@ try {
 			{ name: 'setup-channel', source: './plugins/setup-channel' },
 		],
 	}));
-	const pluginManager = new PluginManager(new ConfigStore(testRoot));
+	const pluginManager = new PluginManager(configStore);
 	await pluginManager.addMarketplace('test', marketplaceRoot);
 	const installed = await pluginManager.install('fake-channel@test');
 	const setupInstalled = await pluginManager.install('setup-channel@test');
@@ -95,12 +102,31 @@ try {
 			installation: installed.installation,
 			session: sessions[0],
 			enabled: false,
-			host: endpoint.id,
+			host: '@daemon-e2e',
 		},
 		start: true,
 	});
 	await firstTurn;
 	await waitForReplyCount(1);
+
+	await stopDaemon(testRoot);
+	daemonStarted = false;
+	const restartTurn = observeChannelTurn(
+		firstChat.result.snapshot.state as ChatState,
+		firstChat.subscription,
+		marker,
+	);
+	await ensureDaemonStarted(testRoot);
+	daemonStarted = true;
+	const restored = await requestDaemon(testRoot, { command: 'status' });
+	const restoredChannel = restored.channels.find(candidate => candidate.name === 'switch-test');
+	if (restoredChannel?.definition.host !== '@daemon-e2e'
+		|| restoredChannel.runtime?.session !== sessions[0]) {
+		throw new Error(`Daemon did not restore the aliased host binding: ${JSON.stringify(restoredChannel)}`);
+	}
+	await restartTurn;
+	await waitForReplyCount(2);
+	console.log('Daemon E2E passed: restored the aliased host and URI binding after restart');
 
 	const secondTurn = observeChannelTurn(
 		secondChat.result.snapshot.state as ChatState,
@@ -113,24 +139,24 @@ try {
 		session: sessions[1],
 	});
 	await secondTurn;
-	await waitForReplyCount(2);
+	await waitForReplyCount(3);
 
 	const channel = switched.channels.find(candidate => candidate.name === 'switch-test');
 	if (channel?.runtime?.session !== sessions[1]) {
 		throw new Error(`Daemon did not switch to ${sessions[1]}`);
 	}
 	const replies = (await readFile(outputFile, 'utf8')).trim().split(/\r?\n/);
-	if (replies.length !== 2 || replies.some(reply => reply !== 'PONG')) {
-		throw new Error(`Expected two PONG replies, received ${JSON.stringify(replies)}`);
+	if (replies.length !== 3 || replies.some(reply => reply !== 'PONG')) {
+		throw new Error(`Expected three PONG replies, received ${JSON.stringify(replies)}`);
 	}
 	const journal = JSON.parse(await readFile(join(testRoot, 'instances', 'switch-test', 'events.json'), 'utf8')) as {
 		readonly pending?: unknown[];
 		readonly delivered?: unknown[];
 	};
-	if (journal.pending?.length !== 0 || journal.delivered?.length !== 2) {
-		throw new Error(`Expected two durably delivered events, received ${JSON.stringify(journal)}`);
+	if (journal.pending?.length !== 0 || journal.delivered?.length !== 3) {
+		throw new Error(`Expected three durably delivered events, received ${JSON.stringify(journal)}`);
 	}
-	console.log(`Daemon E2E passed: routed ${marker} through ${sessions[0]} and then ${sessions[1]}`);
+	console.log(`Daemon E2E passed: routed ${marker} before and after restart, then through ${sessions[1]}`);
 
 	await requestDaemon(testRoot, { command: 'channel.stop', name: 'switch-test' });
 	await requestDaemon(testRoot, { command: 'channel.delete', name: 'switch-test' });
@@ -143,7 +169,7 @@ try {
 			installation: setupInstalled.installation,
 			session: sessions[0],
 			enabled: false,
-			host: endpoint.id,
+			host: '@daemon-e2e',
 		},
 		start: true,
 	});

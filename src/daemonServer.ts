@@ -10,7 +10,14 @@ import {
 	type ChannelHealth,
 	type PersistedChannelHealth,
 } from './channelHealth.js';
-import { ConfigStore, isValidChannelInstanceName, retargetChannelInstance, type AppConfig, type ChannelInstanceConfig } from './config.js';
+import {
+	ConfigStore,
+	isValidChannelInstanceName,
+	retargetChannelInstance,
+	validateAppConfig,
+	type AppConfig,
+	type ChannelInstanceConfig,
+} from './config.js';
 import { ConsoleDaemonLogger, type DaemonLogger } from './daemonLog.js';
 import { getDaemonPaths } from './daemonPaths.js';
 import {
@@ -306,6 +313,8 @@ export class DaemonServer {
 				});
 			case 'channel.switch':
 				return this.enqueue(async () => this.switchOne(request.name, request.session, request.chat));
+			case 'channel.rehost':
+				return this.enqueue(async () => this.rehostOne(request.name, request.host));
 			case 'channel.repin':
 				return this.enqueue(async () => this.repinOne(request.name, request.installation));
 			case 'channel.delete':
@@ -457,6 +466,14 @@ export class DaemonServer {
 		await this.replaceOne(name, previous, next);
 	}
 
+	private async rehostOne(name: string, host: string): Promise<void> {
+		const previous = await this.getDefinition(name);
+		if (previous.host === host) {
+			return;
+		}
+		await this.replaceOne(name, previous, { ...previous, host });
+	}
+
 	private async repinOne(name: string, installation: string): Promise<void> {
 		const previous = await this.getDefinition(name);
 		if (previous.installation === installation) {
@@ -472,6 +489,7 @@ export class DaemonServer {
 	): Promise<void> {
 		const runtime = this.runtimes.get(name);
 		await this.runtimeFactory.validate(next);
+		validateAppConfig(withChannel(await this.configStore.read(), name, next));
 		if (runtime && !await runtime.quiesce()) {
 			throw new DaemonProtocolError('CHANNEL_BUSY', `Channel '${name}' is processing a turn`);
 		}
@@ -490,15 +508,19 @@ export class DaemonServer {
 			}
 			throw error;
 		}
-		await this.configStore.update(current => withChannel(current, name, next));
+		let configUpdated = false;
 		try {
+			await this.configStore.update(current => withChannel(current, name, next));
+			configUpdated = true;
 			if (next.enabled) {
 				this.restartAttempts.delete(name);
 				await this.startOne(name, next);
 			}
 		} catch (switchError) {
 			const errors = [toError('new binding', switchError)];
-			await this.configStore.update(current => withChannel(current, name, previous));
+			if (configUpdated) {
+				await this.configStore.update(current => withChannel(current, name, previous));
+			}
 			if (wasRunning || previous.enabled) {
 				try {
 					await this.startOne(name, previous);

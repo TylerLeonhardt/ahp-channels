@@ -157,6 +157,35 @@ describe('DaemonServer', () => {
 			assert.equal(status.channels[0]?.runtime?.session, 'ahp-session:/two');
 			assert.equal(factory.runtimes[0].closed, true);
 
+			await store.update(config => ({
+				...config,
+				hostAliases: {
+					local: {
+						kind: 'socket',
+						path: join(home, 'agent-host.sock'),
+						withoutAuthentication: true,
+					},
+				},
+			}));
+			status = await requestDaemon(home, {
+				command: 'channel.rehost',
+				name: 'personal',
+				host: '@local',
+			});
+			assert.equal(status.channels[0]?.definition.host, '@local');
+			assert.equal(status.channels[0]?.definition.session, 'ahp-session:/two');
+			const currentRuntime = factory.runtimes.at(-1);
+			await assert.rejects(
+				requestDaemon(home, {
+					command: 'channel.rehost',
+					name: 'personal',
+					host: '@missing',
+				}),
+				/references unknown host alias '@missing'/,
+			);
+			assert.equal((await store.read()).channels['personal'].host, '@local');
+			assert.equal(currentRuntime?.closed, false);
+
 			const installation = 'a'.repeat(64);
 			await store.update(config => ({
 				...config,
@@ -466,6 +495,55 @@ describe('DaemonServer', () => {
 			});
 		} finally {
 			await server.close();
+		}
+	});
+
+	it('preserves alias and URI bindings across daemon restoration', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await store.update(config => ({
+			...config,
+			hostAliases: {
+				local: {
+					kind: 'socket',
+					path: join(home, 'agent-host.sock'),
+					withoutAuthentication: true,
+				},
+			},
+			channels: {
+				remembered: {
+					plugin: 'fake',
+					session: 'ahp-session:/remembered',
+					chat: 'ahp-chat:/remembered',
+					host: '@local',
+					enabled: true,
+				},
+			},
+		}));
+
+		const firstFactory = new TestRuntimeFactory();
+		const first = new DaemonServer(home, await getOrCreateDaemonToken(home), store, firstFactory);
+		await first.start();
+		assert.equal(firstFactory.runtimes[0]?.definition.host, '@local');
+		await first.close();
+
+		const secondFactory = new TestRuntimeFactory();
+		const second = new DaemonServer(home, await getOrCreateDaemonToken(home), store, secondFactory);
+		await second.start();
+		try {
+			const restored = secondFactory.runtimes[0]?.definition;
+			assert.deepEqual({
+				host: restored?.host,
+				session: restored?.session,
+				chat: restored?.chat,
+			}, {
+				host: '@local',
+				session: 'ahp-session:/remembered',
+				chat: 'ahp-chat:/remembered',
+			});
+		} finally {
+			await second.close();
 		}
 	});
 

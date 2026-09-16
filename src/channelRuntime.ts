@@ -1,15 +1,21 @@
 import type { ChatState, ListSessionsResult, ResourceReadParams, ResourceReadResult, SessionState, StateAction, SubscribeResult } from '@microsoft/agent-host-protocol';
 import type { DispatchHandle, ResourceRequestHandlers, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
+import {
+	AgentHostService,
+	HostAliasResolutionError,
+	isHostAliasSelector,
+} from './agentHosts.js';
 import { connectAgentHost, createChannelClientId, resolveChat } from './ahp.js';
 import { ChannelBridge, publishActiveClient } from './bridge.js';
 import {
 	ChannelOperationError,
 	recoveryGuidance,
+	sanitizeErrorSummary,
 	type ChannelFailureStage,
 } from './channelHealth.js';
 import type { ChannelInstanceConfig } from './config.js';
 import type { LogWriter } from './daemonLog.js';
-import { discoverLocalAgentHosts, selectAgentHost, type AgentHostEndpoint } from './endpoints.js';
+import type { AgentHostConnectionTarget, AgentHostEndpoint } from './endpoints.js';
 import { FileChannelEventJournal, type ChannelEventJournal } from './eventJournal.js';
 import { McpChannelProcess, type McpChannelClient, type StartedMcpChannel } from './mcpChannel.js';
 import { createPluginResourceRequestHandlers } from './pluginResources.js';
@@ -39,7 +45,8 @@ export interface ChannelRuntimeSnapshot {
 export interface ChannelRuntimeServices {
 	resolvePlugin(nameOrPath: string, installation?: string): Promise<ClaudePlugin>;
 	discoverAgentHosts(): Promise<readonly AgentHostEndpoint[]>;
-	connectAgentHost(endpoint: AgentHostEndpoint, clientId: string): Promise<ChannelHostConnection>;
+	resolveAgentHost(selector: string): Promise<AgentHostConnectionTarget>;
+	connectAgentHost(target: AgentHostConnectionTarget, clientId: string): Promise<ChannelHostConnection>;
 	createMcpChannel(config: StdioMcpServerConfig): McpChannelClient;
 	createEventJournal?(name: string): ChannelEventJournal;
 }
@@ -74,13 +81,15 @@ export interface ChannelRuntimeServiceOptions {
 
 export function createChannelRuntimeServices(
 	plugins: PluginManager,
+	agentHosts: AgentHostService,
 	options: ChannelRuntimeServiceOptions = {},
 ): ChannelRuntimeServices {
 	const { home, stderr } = options;
 	return {
 		resolvePlugin: (nameOrPath, installation) => plugins.resolvePlugin(nameOrPath, installation),
-		discoverAgentHosts: () => discoverLocalAgentHosts(),
-		connectAgentHost: async (endpoint, clientId) => connectAgentHost(endpoint, clientId),
+		discoverAgentHosts: () => agentHosts.discover(),
+		resolveAgentHost: selector => agentHosts.resolve(selector),
+		connectAgentHost: async (target, clientId) => connectAgentHost(target, clientId),
 		createMcpChannel: config => new McpChannelProcess(config, stderr),
 		...(home ? { createEventJournal: (name: string) => new FileChannelEventJournal(home, name) } : {}),
 	};
@@ -101,7 +110,7 @@ export class ChannelRuntime {
 		private readonly sessionSubscription: ChannelSubscription,
 		private readonly bridge: ChannelBridge,
 		private readonly mcpWhenStopped: Promise<void>,
-		private readonly endpoint: AgentHostEndpoint,
+		private readonly hostTarget: AgentHostConnectionTarget,
 		private readonly channelInfo: StartedMcpChannel,
 		private readonly chat: string,
 		private readonly startedAt: string,
@@ -133,22 +142,20 @@ export class ChannelRuntime {
 				throw operationError('plugin-loading', error);
 			}
 			const clientId = definition.clientId ?? createChannelClientId(name, definition.session);
-			let endpoints: readonly AgentHostEndpoint[];
+			let candidates: readonly HostCandidate[];
 			try {
-				endpoints = await services.discoverAgentHosts();
+				candidates = await resolveHostCandidates(services, definition, onStatus);
 			} catch (error) {
 				throw operationError('agent-host-discovery', error);
-			}
-			if (endpoints.length === 0) {
-				throw operationError('agent-host-discovery', new Error('No running local Agent Host endpoints were discovered'));
 			}
 			let connected: Awaited<ReturnType<typeof connectOwningHost>>;
 			try {
 				connected = await connectOwningHost(
 					services,
-					endpoints,
+					candidates,
 					definition,
 					clientId,
+					onStatus,
 				);
 			} catch (error) {
 				throw operationError('agent-host-connection', error);
@@ -162,7 +169,7 @@ export class ChannelRuntime {
 				throw operationError('plugin-loading', error);
 			}
 			sessionSubscription = connected.subscription;
-			const endpoint = connected.endpoint;
+			const hostTarget = connected.target;
 			let chat: string;
 			try {
 				chat = resolveChat(connected.state, definition.chat, definition.session);
@@ -228,7 +235,7 @@ export class ChannelRuntime {
 				sessionSubscription,
 				bridge,
 				mcp.whenStopped,
-				endpoint,
+				hostTarget,
 				channelInfo,
 				chat,
 				new Date().toISOString(),
@@ -264,7 +271,7 @@ export class ChannelRuntime {
 			plugin: this.definition.plugin,
 			session: this.definition.session,
 			chat: this.chat,
-			host: this.endpoint.id,
+			host: this.hostTarget.id,
 			clientId: this.connection.clientId,
 			channelName: this.channelInfo.name,
 			startedAt: this.startedAt,
@@ -320,36 +327,110 @@ class CustomizationOnlyChannel implements McpChannelClient {
 	}
 }
 
+interface HostCandidate {
+	readonly target: AgentHostConnectionTarget;
+	readonly fallback: boolean;
+	readonly verifySessionCatalog: boolean;
+}
+
+async function resolveHostCandidates(
+	services: ChannelRuntimeServices,
+	definition: ChannelInstanceConfig,
+	onStatus?: (message: string) => void,
+): Promise<readonly HostCandidate[]> {
+	if (!definition.host) {
+		const endpoints = await services.discoverAgentHosts();
+		if (endpoints.length === 0) {
+			throw new Error('No running local Agent Host endpoints were discovered');
+		}
+		return endpoints.map(target => ({
+			target,
+			fallback: false,
+			verifySessionCatalog: true,
+		}));
+	}
+
+	if (!isHostAliasSelector(definition.host)) {
+		return [{
+			target: await services.resolveAgentHost(definition.host),
+			fallback: false,
+			verifySessionCatalog: false,
+		}];
+	}
+
+	let preferred: AgentHostConnectionTarget | undefined;
+	try {
+		preferred = await services.resolveAgentHost(definition.host);
+	} catch (error) {
+		if (!(error instanceof HostAliasResolutionError) || error.code !== 'unavailable') {
+			throw error;
+		}
+		onStatus?.(`${error.message}; searching other local Agent Hosts for the bound session`);
+	}
+
+	let fallbackEndpoints: readonly AgentHostEndpoint[] = [];
+	try {
+		fallbackEndpoints = await services.discoverAgentHosts();
+	} catch (error) {
+		if (!preferred) {
+			throw error;
+		}
+		onStatus?.(`Local Agent Host fallback discovery failed: ${sanitizeErrorSummary(errorMessage(error))}`);
+	}
+
+	const candidates: HostCandidate[] = [];
+	if (preferred) {
+		candidates.push({
+			target: preferred,
+			fallback: false,
+			verifySessionCatalog: false,
+		});
+	}
+	for (const target of fallbackEndpoints) {
+		if (target.id === preferred?.id) {
+			continue;
+		}
+		candidates.push({
+			target,
+			fallback: true,
+			verifySessionCatalog: true,
+		});
+	}
+	if (candidates.length === 0) {
+		throw new Error(`Host alias '${definition.host}' is unavailable and no fallback Agent Hosts were discovered`);
+	}
+	return candidates;
+}
+
 async function connectOwningHost(
 	services: ChannelRuntimeServices,
-	endpoints: readonly AgentHostEndpoint[],
+	candidates: readonly HostCandidate[],
 	definition: ChannelInstanceConfig,
 	clientId: string,
+	onStatus?: (message: string) => void,
 ): Promise<{
-	readonly endpoint: AgentHostEndpoint;
+	readonly target: AgentHostConnectionTarget;
 	readonly connection: ChannelHostConnection;
 	readonly subscription: ChannelSubscription;
 	readonly state: SessionState;
 }> {
-	const candidates = definition.host
-		? [selectAgentHost(endpoints, definition.host)]
-		: endpoints;
 	if (candidates.length === 0) {
-		throw new Error('No running local Agent Host endpoints were discovered');
+		throw new Error('No Agent Host connection candidates were resolved');
 	}
 	const errors: Error[] = [];
 	let failureStage: ChannelFailureStage = 'agent-host-connection';
-	for (const endpoint of candidates) {
+	for (const candidate of candidates) {
+		const { target } = candidate;
 		let connection: ChannelHostConnection | undefined;
 		let subscription: ChannelSubscription | undefined;
 		try {
 			try {
-				connection = await services.connectAgentHost(endpoint, clientId);
+				connection = await services.connectAgentHost(target, clientId);
 			} catch (error) {
 				throw operationError('agent-host-connection', error);
 			}
 			try {
-				if (!definition.host && !await hostHasSession(connection.client, definition.session)) {
+				if (candidate.verifySessionCatalog && !await hostHasSession(connection.client, definition.session)) {
 					throw new Error('Session is not present in this Agent Host catalog');
 				}
 				const subscribed = await connection.client.subscribe(definition.session);
@@ -357,8 +438,11 @@ async function connectOwningHost(
 				if (!subscribed.result.snapshot) {
 					throw new Error('Agent Host returned no session state snapshot');
 				}
+				if (candidate.fallback && definition.host) {
+					onStatus?.(`Host alias '${definition.host}' did not connect; using local fallback ${target.id} for ${definition.session}`);
+				}
 				return {
-					endpoint,
+					target,
 					connection,
 					subscription,
 					state: subscribed.result.snapshot.state as SessionState,
@@ -366,45 +450,45 @@ async function connectOwningHost(
 			} catch (error) {
 				throw operationError('session-resolution', error);
 			}
-
-			async function hostHasSession(client: ChannelHostClient, session: string): Promise<boolean> {
-				const seenCursors = new Set<string>();
-				let cursor: string | undefined;
-				for (let page = 0; page < 100; page++) {
-					const result = await client.request('listSessions', {
-						channel: 'ahp-root://',
-						limit: 100,
-						...(cursor ? { cursor } : {}),
-					});
-					if (result.items.some(candidate => candidate.resource === session)) {
-						return true;
-					}
-					if (!result.nextCursor) {
-						return false;
-					}
-					if (seenCursors.has(result.nextCursor)) {
-						throw new Error('Agent Host returned a repeated session cursor');
-					}
-					seenCursors.add(result.nextCursor);
-					cursor = result.nextCursor;
-				}
-				throw new Error('Agent Host session catalog exceeded 100 pages');
-			}
 		} catch (error) {
 			if (error instanceof ChannelOperationError && error.stage === 'session-resolution') {
 				failureStage = 'session-resolution';
 			}
-			errors.push(toError(endpoint.id, error));
-			await cleanup(endpoint.id, () => subscription?.close(), errors);
-			await cleanup(endpoint.id, () => connection?.client.shutdown(), errors);
+			errors.push(toError(target.id, error));
+			await cleanup(target.id, () => subscription?.close(), errors);
+			await cleanup(target.id, () => connection?.client.shutdown(), errors);
 		}
 	}
 	throw new ChannelOperationError(
 		failureStage,
-		`No discovered Agent Host owns session ${definition.session}: ${errors.map(error => error.message).join('; ')}`,
+		`No Agent Host candidate owns session ${definition.session}: ${errors.map(error => error.message).join('; ')}`,
 		recoveryGuidance(failureStage),
 		{ cause: new AggregateError(errors) },
 	);
+}
+
+async function hostHasSession(client: ChannelHostClient, session: string): Promise<boolean> {
+	const seenCursors = new Set<string>();
+	let cursor: string | undefined;
+	for (let page = 0; page < 100; page++) {
+		const result = await client.request('listSessions', {
+			channel: 'ahp-root://',
+			limit: 100,
+			...(cursor ? { cursor } : {}),
+		});
+		if (result.items.some(candidate => candidate.resource === session)) {
+			return true;
+		}
+		if (!result.nextCursor) {
+			return false;
+		}
+		if (seenCursors.has(result.nextCursor)) {
+			throw new Error('Agent Host returned a repeated session cursor');
+		}
+		seenCursors.add(result.nextCursor);
+		cursor = result.nextCursor;
+	}
+	throw new Error('Agent Host session catalog exceeded 100 pages');
 }
 
 function operationError(stage: ChannelFailureStage, error: unknown): ChannelOperationError {
@@ -428,5 +512,9 @@ async function cleanup(label: string, operation: () => Promise<unknown> | undefi
 }
 
 function toError(label: string, error: unknown): Error {
-	return new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	return new Error(`${label}: ${sanitizeErrorSummary(errorMessage(error))}`, { cause: error });
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }

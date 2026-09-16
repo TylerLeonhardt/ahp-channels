@@ -1,6 +1,6 @@
 # ahp-channels
 
-Run Claude Code channel plugins against any Agent Host Protocol server.
+Run Claude Code channel plugins against local Agent Host Protocol servers.
 
 `ahp-channels` is an experimental compatibility adapter. It launches a
 Claude-style MCP channel plugin, forwards inbound channel notifications to an
@@ -16,8 +16,9 @@ npm run build
 
 node .\dist\cli.js plugin install fakechat@claude-plugins-official
 node .\dist\cli.js host discover
+node .\dist\cli.js host alias add local --host 0
 node .\dist\cli.js session list
-node .\dist\cli.js channel create fakechat --plugin fakechat --session <session-uri>
+node .\dist\cli.js channel create fakechat --plugin fakechat --session <session-uri> --host @local
 node .\dist\cli.js channel start fakechat
 ```
 
@@ -33,6 +34,104 @@ directories are not copied.
 The official preview plugins currently require Bun. The adapter
 supports standalone TCP hosts and normal editor Agent Hosts over Windows named
 pipes or Unix domain sockets.
+
+## Select a local Agent Host
+
+AHP defines the protocol after a client transport is open; it does not define
+host discovery, a registry, or credential storage. `ahp-channels` supports two
+local connection providers:
+
+1. VS Code editor and standalone hosts published in VS Code's owner-only local
+   endpoint registry.
+2. Other local AHP implementations at an explicitly configured fixed
+   loopback WebSocket URL, Unix socket, or Windows named pipe.
+
+Discover VS Code-published endpoints and create an alias from a current
+selection:
+
+```powershell
+ahp-channels host discover
+ahp-channels host alias add work --host 0
+ahp-channels host alias list
+ahp-channels host alias inspect work
+ahp-channels session list --host @work
+```
+
+A VS Code alias stores the endpoint registry directory, endpoint kind
+(`editor` or `standalone`), and advertised product quality when present. It
+does not store the endpoint ID, PID, registry filename, socket or port, or
+connection token. Every use rereads the registry, so a restarted host can
+publish a new transient endpoint and token under the same alias target.
+Advertised protocol versions are diagnostic metadata only; the client always
+performs normal AHP negotiation after connecting.
+
+The VS Code registry has no durable per-window host ID. Alias creation and
+direct alias resolution therefore require exactly one live endpoint matching
+the configured registry scope, kind, and quality. A second indistinguishable
+endpoint makes the alias ambiguous instead of selecting one silently. A
+dedicated VS Code `--user-data-dir` gives a standalone host the strongest
+registry boundary.
+
+Configure a non-VS-Code local host with a stable address:
+
+```powershell
+ahp-channels host alias add custom `
+  --url ws://127.0.0.1:4317/ `
+  --token-file C:\path\to\agent-host.token `
+  --token-query-parameter tkn
+
+ahp-channels host alias add socket-host `
+  --socket \\.\pipe\agent-host `
+  --without-authentication
+```
+
+On macOS or Linux, `--socket` accepts an absolute Unix socket path. Relative
+socket and token-file paths are made absolute by the CLI. WebSocket aliases
+accept only loopback `ws://` or `wss://` URLs. User information, fragments, and
+recognizable credential query parameters are rejected; put the token in an
+owner-protected file instead. Because AHP does not define authentication,
+`--token-file` also requires the host's documented
+`--token-query-parameter`; `tkn` is the convention used by VS Code. The token
+file is read on every connection attempt and its contents are never persisted
+or included in alias inspection. WebSocket subprotocol and header
+authentication are not currently supported. Use `--without-authentication`
+only when the local host intentionally requires no connection token.
+
+Generic aliases require a fixed URL or socket across host restarts. A generic
+host with only a transient address must publish its own stable resolver or
+registry before it can be restart-stable; AHP itself does not provide one.
+Remote URLs, SSH/tunnel provisioning, and remote credential management are not
+supported.
+
+Use aliases anywhere a host selector is accepted:
+
+```powershell
+ahp-channels channel create telegram --plugin telegram --session <session-uri> --host @work
+ahp-channels channel run telegram --session <session-uri> --host @work
+ahp-channels channel select-host telegram --host @custom
+```
+
+Legacy endpoint indices and ID prefixes remain supported. Configuration
+version 3 is loaded as version 4 with no aliases; its existing channel,
+session, chat, and legacy host selectors are unchanged. The next configuration
+write persists version 4.
+
+For a persisted channel, an alias is the preferred target. If that target is
+temporarily unavailable or fails to connect, the runtime reports the fallback
+and tries other discovered local hosts that own the channel's existing session
+URI; it still validates the configured chat URI. An ambiguous alias is an
+error, not a fallback trigger. The daemon's existing bounded exponential retry
+loop rediscovers endpoints and rereads token files after connection loss and
+across daemon restarts. Foreground `channel run` reports failure when no
+suitable target is available.
+
+Removing an alias referenced by any channel is rejected. Select a different
+host first, then remove it:
+
+```powershell
+ahp-channels channel select-host telegram --host @custom
+ahp-channels host alias remove work
+```
 
 ## Ownership boundary
 
@@ -79,6 +178,7 @@ distribution work.
 ahp-channels channel status telegram
 ahp-channels channel upgrade telegram
 ahp-channels channel switch telegram --session <new-session-uri>
+ahp-channels channel select-host telegram --host @work
 ahp-channels channel stop telegram
 ahp-channels channel start telegram
 ahp-channels channel delete telegram

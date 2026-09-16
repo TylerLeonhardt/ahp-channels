@@ -77,9 +77,22 @@ files.
 - Runtime rotation caps daemon and channel-process logs at 1 MiB each while
   retaining the three most recent files for failure context.
 
+## Completed: Stable local Agent Host aliases
+
+- Explicit alias creation, inspection, listing, removal, and persisted-channel
+  host switching.
+- VS Code local-registry targets that refresh transient endpoint addresses and
+  credentials after host restart without treating discovery protocol metadata
+  as negotiated compatibility.
+- Generic local loopback WebSocket and socket targets with credentials read
+  from owner-managed token files on every connection attempt.
+- URI-preserving local fallback, daemon restoration, strict ambiguity and
+  invalid-configuration errors, and secret-safe diagnostics.
+
 ## Next: Host selection and release validation
 
-- Add stable aliases for explicitly selected remote Agent Hosts.
+- Define a standard-backed stable identity and credential resolver before
+  adding aliases for remote Agent Hosts.
 - Improve host, session, and chat selection without replacing URI-based
   bindings.
 - Run a fresh macOS or Linux Telegram setup from the published prerelease

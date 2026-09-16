@@ -1,12 +1,23 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 export type AgentHostEndpointAddress =
 	| { readonly type: 'tcp'; readonly host: string; readonly port: number }
 	| { readonly type: 'socket'; readonly path: string };
 
-export interface AgentHostEndpoint {
+export type AgentHostConnectionAddress =
+	| AgentHostEndpointAddress
+	| { readonly type: 'websocket'; readonly url: string };
+
+export interface AgentHostConnectionTarget {
+	readonly id: string;
+	readonly connectionToken?: string;
+	readonly connectionTokenQueryParameter?: string;
+	readonly endpoint: AgentHostConnectionAddress;
+}
+
+export interface AgentHostEndpoint extends AgentHostConnectionTarget {
 	readonly id: string;
 	readonly type: 'editor' | 'standalone';
 	readonly pid: number;
@@ -20,8 +31,14 @@ export interface AgentHostEndpoint {
 }
 
 export async function discoverLocalAgentHosts(env: NodeJS.ProcessEnv = process.env): Promise<readonly AgentHostEndpoint[]> {
+	return discoverAgentHostsInRegistryDirectories(agentHostRegistryDirectories(env));
+}
+
+export async function discoverAgentHostsInRegistryDirectories(
+	directories: readonly string[],
+): Promise<readonly AgentHostEndpoint[]> {
 	const entries: AgentHostEndpoint[] = [];
-	for (const directory of registryDirectories(env)) {
+	for (const directory of directories) {
 		let names: string[];
 		try {
 			names = await readdir(directory);
@@ -83,12 +100,13 @@ export function describeEndpoint(endpoint: AgentHostEndpoint, index?: number): R
 		endpoint: endpoint.endpoint.type === 'tcp'
 			? `${endpoint.endpoint.host}:${endpoint.endpoint.port}`
 			: endpoint.endpoint.path,
+		registry: dirname(endpoint.registryFile),
 		...(endpoint.quality ? { quality: endpoint.quality } : {}),
 		...(endpoint.tunnelName ? { tunnelName: endpoint.tunnelName } : {}),
 	};
 }
 
-function registryDirectories(env: NodeJS.ProcessEnv): readonly string[] {
+export function agentHostRegistryDirectories(env: NodeJS.ProcessEnv = process.env): readonly string[] {
 	if (env['AHP_CHANNELS_ENDPOINT_REGISTRY']) {
 		return [env['AHP_CHANNELS_ENDPOINT_REGISTRY']];
 	}

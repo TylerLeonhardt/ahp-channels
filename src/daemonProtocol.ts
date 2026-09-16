@@ -3,7 +3,7 @@ import { ChannelFailureStageSchema, type ChannelHealth } from './channelHealth.j
 import type { ChannelInstanceConfig } from './config.js';
 import type { ChannelRuntimeSnapshot } from './channelRuntime.js';
 
-export const DAEMON_PROTOCOL_VERSION = 4;
+export const DAEMON_PROTOCOL_VERSION = 5;
 export const MAX_DAEMON_MESSAGE_BYTES = 1024 * 1024;
 
 const ChannelInstanceSchema = z.strictObject({
@@ -44,6 +44,11 @@ const RequestBodySchema = z.discriminatedUnion('command', [
 		name: z.string().min(1),
 		session: z.string().min(1),
 		chat: z.string().min(1).optional(),
+	}),
+	z.strictObject({
+		command: z.literal('channel.rehost'),
+		name: z.string().min(1),
+		host: z.string().min(1),
 	}),
 	z.strictObject({
 		command: z.literal('channel.repin'),
