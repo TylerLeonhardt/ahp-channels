@@ -7,7 +7,6 @@ import {
 	McpServerStatus,
 	SessionLifecycle,
 	SessionStatus,
-	ToolCallConfirmationReason,
 	ToolCallContributorKind,
 	ToolCallStatus,
 	ResponsePartKind,
@@ -589,7 +588,6 @@ export class DeterministicAgentHost {
 			contributor,
 			invocationMessage: `Send ${expected} to fakechat`,
 			toolInput: JSON.stringify({ text: expected }),
-			confirmed: ToolCallConfirmationReason.NotNeeded,
 		});
 	}
 

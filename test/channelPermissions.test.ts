@@ -7,9 +7,12 @@ import {
 	SessionStatus,
 	ToolCallCancellationReason,
 	ToolCallConfirmationReason,
+	ToolCallContributorKind,
 	ToolCallStatus,
 	type ActionEnvelope,
 	type ChatState,
+	type ChatToolCallStartAction,
+	type ResponsePart,
 	type ResourceReadParams,
 	type ResourceReadResult,
 	type StateAction,
@@ -59,10 +62,13 @@ class TestHost implements PermissionHost {
 	}
 }
 
-function createRelay(context: TestContext, initial: ChatState = emptyState()) {
+function createRelay(context: TestContext, initial: ChatState = emptyState(), nativePermissions = true) {
 	const host = new TestHost();
 	const transport = new TestTransport();
-	const relay = new ChannelPermissionRelay(host, 'channel-client', chat, transport, initial);
+	const relay = new ChannelPermissionRelay(
+		host, 'channel-client', chat, nativePermissions ? transport : undefined, initial,
+		[{ name: 'reply' }, { name: 'edit_message' }],
+	);
 	const failures: Error[] = [];
 	const statuses: string[] = [];
 	relay.events.on('failure', error => failures.push(error));
@@ -77,14 +83,17 @@ function createRelay(context: TestContext, initial: ChatState = emptyState()) {
 		origin: undefined,
 		...extra,
 	});
-	const beginTool = (input: string | { uri: string } = '{"command":"echo hello"}') => {
+	const beginTool = (
+		input: string | { uri: string } = '{"command":"echo hello"}',
+		tool: Pick<ChatToolCallStartAction, 'toolName' | 'displayName' | 'contributor' | 'intention'> = { toolName: 'shell', displayName: 'Shell' },
+	) => {
 		observe({
 			type: ActionType.ChatTurnStarted,
 			turnId,
 			startedAt: new Date().toISOString(),
 			message: { text: 'use the tool', origin: { kind: MessageKind.User } },
 		});
-		observe({ type: ActionType.ChatToolCallStart, turnId, toolCallId, toolName: 'shell', displayName: 'Shell' });
+		observe({ type: ActionType.ChatToolCallStart, turnId, toolCallId, ...tool });
 		observe({
 			type: ActionType.ChatToolCallReady, turnId, toolCallId,
 			invocationMessage: { markdown: 'Run the requested command' },
@@ -95,6 +104,137 @@ function createRelay(context: TestContext, initial: ChatState = emptyState()) {
 }
 
 describe('channel permission relay', () => {
+	for (const nativePermissions of [true, false]) {
+		for (const toolName of ['reply', 'edit_message']) {
+			it(`automatically approves contributed ${toolName} ${nativePermissions ? 'with' : 'without'} native permissions`, context => {
+				const { host, transport, relay, beginTool } = createRelay(context, emptyState(), nativePermissions);
+				beginTool('{"text":"hello"}', {
+					toolName, displayName: toolName,
+					contributor: { kind: ToolCallContributorKind.Client, clientId: 'channel-client' },
+				});
+				assert.deepEqual(host.dispatched, [{
+					channel: chat,
+					action: {
+						type: ActionType.ChatToolCallConfirmed, turnId, toolCallId,
+						approved: true, confirmed: ToolCallConfirmationReason.NotNeeded,
+					},
+				}]);
+				assert.deepEqual(transport.requests, []);
+				relay.start();
+				assert.equal(host.dispatched.length, 1);
+			});
+		}
+	}
+
+	for (const tool of [
+		{ toolName: 'reply', displayName: 'Reply' },
+		{
+			toolName: 'reply', displayName: 'Reply',
+			contributor: { kind: ToolCallContributorKind.Client, clientId: 'other-client' },
+		},
+	] satisfies ReadonlyArray<Pick<ChatToolCallStartAction, 'toolName' | 'displayName' | 'contributor'>>) {
+		it(`does not auto-approve ${tool.toolName} from ${tool.contributor?.clientId ?? 'the host'}`, async context => {
+			const { host, transport, beginTool } = createRelay(context);
+			beginTool('{}', tool);
+			await waitFor(() => transport.requests.length === 1);
+			assert.deepEqual(host.dispatched, []);
+		});
+	}
+
+	for (const nativePermissions of [true, false]) {
+		it(`denies an unavailable owned tool ${nativePermissions ? 'with' : 'without'} native permissions`, context => {
+			const { host, transport, statuses, beginTool } = createRelay(context, emptyState(), nativePermissions);
+			beginTool('{}', {
+				toolName: 'unadvertised', displayName: 'Unadvertised',
+				contributor: { kind: ToolCallContributorKind.Client, clientId: 'channel-client' },
+			});
+			const action = host.dispatched[0]?.action;
+			assert.ok(action?.type === ActionType.ChatToolCallConfirmed && !action.approved);
+			assert.equal(action.reason, ToolCallCancellationReason.Denied);
+			assert.match(String(action.reasonMessage), /unadvertised.*no longer available/);
+			assert.deepEqual(transport.requests, []);
+			assert.ok(statuses.some(message => message.includes('no longer available')));
+		});
+	}
+
+	it('shows the current permission request when a running tool needs re-confirmation', async context => {
+		const { host, transport, beginTool, observe } = createRelay(context);
+		beginTool('{}', { toolName: 'shell', displayName: 'Shell', intention: 'Inspect project' });
+		await waitFor(() => transport.requests.length === 1);
+		observe({
+			type: ActionType.ChatToolCallConfirmed, turnId, toolCallId,
+			approved: true, confirmed: ToolCallConfirmationReason.UserAction,
+		});
+		observe({
+			type: ActionType.ChatToolCallReady, turnId, toolCallId,
+			invocationMessage: { markdown: 'Allow access outside the workspace' },
+			toolInput: '{}',
+		});
+		await waitFor(() => transport.requests.length === 2);
+		assert.match(transport.requests[1].description, /Allow access outside the workspace/);
+		assert.match(transport.requests[1].description, /Inspect project/);
+		assert.deepEqual(host.dispatched, []);
+	});
+
+	it('leaves host permissions in the host UI when there is no native transport', context => {
+		const { host, transport, beginTool } = createRelay(context, emptyState(), false);
+		beginTool();
+		assert.deepEqual(host.dispatched, []);
+		assert.deepEqual(transport.requests, []);
+	});
+
+	it('surfaces rejected automatic approvals without offering a channel prompt', context => {
+		const { host, transport, failures, observe, beginTool } = createRelay(context);
+		beginTool('{}', {
+			toolName: 'reply', displayName: 'Reply',
+			contributor: { kind: ToolCallContributorKind.Client, clientId: 'channel-client' },
+		});
+		assert.equal(host.dispatched.length, 1);
+		observe(host.dispatched[0].action, {
+			rejectionReason: 'read only',
+			origin: { clientId: 'channel-client', clientSeq: 1 },
+		});
+		assert.match(failures[0]?.message ?? '', /rejected.*automatic.*read only/);
+		assert.deepEqual(transport.requests, []);
+	});
+
+	it('still approves channel tools when the native prompt capacity is exhausted', async context => {
+		const state = emptyState();
+		state.activeTurn = {
+			id: turnId,
+			startedAt: new Date().toISOString(),
+			message: { text: 'many pending tools', origin: { kind: MessageKind.User } },
+			usage: undefined,
+			responseParts: [
+				...Array.from({ length: 129 }, (_, index) => ({
+					kind: ResponsePartKind.ToolCall,
+					toolCall: {
+						toolCallId: `host-${index}`, toolName: 'shell', displayName: 'Shell',
+						status: ToolCallStatus.PendingConfirmation,
+						invocationMessage: 'Run command', toolInput: '{}',
+					},
+				} satisfies ResponsePart)),
+				{
+					kind: ResponsePartKind.ToolCall,
+					toolCall: {
+						toolCallId, toolName: 'reply', displayName: 'Reply',
+						contributor: { kind: ToolCallContributorKind.Client, clientId: 'channel-client' },
+						status: ToolCallStatus.PendingConfirmation,
+						invocationMessage: 'Reply', toolInput: '{}',
+					},
+				},
+			],
+		};
+		const { host, transport, statuses } = createRelay(context, state);
+		await waitFor(() => transport.requests.length === 128);
+		assert.equal(host.dispatched.length, 1);
+		assert.deepEqual(host.dispatched[0].action, {
+			type: ActionType.ChatToolCallConfirmed, turnId, toolCallId,
+			approved: true, confirmed: ToolCallConfirmationReason.NotNeeded,
+		});
+		assert.equal(statuses.filter(message => message.includes('capacity reached')).length, 1);
+	});
+
 	for (const behavior of ['allow', 'deny'] as const) {
 		it(`relays ${behavior} only after a valid channel verdict`, async context => {
 			const { host, transport, beginTool } = createRelay(context);

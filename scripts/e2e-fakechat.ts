@@ -1,13 +1,12 @@
 import {
 	ActionType,
-	ConfirmationOptionKind,
 	CustomizationLoadStatus,
 	CustomizationType,
 	SessionLifecycle,
 	ToolCallConfirmationReason,
+	ToolCallContributorKind,
 	sessionReducer,
 	type ChatState,
-	type ChatToolCallReadyAction,
 	type RootState,
 	type SessionAction,
 	type SessionState,
@@ -178,7 +177,6 @@ try {
 		pendingRestart = { marker, requestId: (await prompt).id, finished };
 	} else {
 		await runRoundTrip(
-			client,
 			socket,
 			initialChatState,
 			chatSubscription,
@@ -220,7 +218,6 @@ try {
 		}
 	} else {
 		await runRoundTrip(
-			client,
 			socket,
 			initialChatState,
 			chatSubscription,
@@ -480,6 +477,7 @@ async function observePermissionTurn(
 ): Promise<void> {
 	let activeTurnId: string | undefined;
 	const pendingTools = new Set<string>();
+	const channelTools = new Set<string>();
 	const decided = new Set<string>();
 	const deadline = Date.now() + 120_000;
 	while (Date.now() < deadline) {
@@ -492,8 +490,21 @@ async function observePermissionTurn(
 			activeTurnId = action.turnId;
 		}
 		if ('turnId' in action && action.turnId === activeTurnId) {
-			if (action.type === ActionType.ChatToolCallReady && action.confirmed === undefined) {
+			if (action.type === ActionType.ChatToolCallStart
+				&& action.contributor?.kind === ToolCallContributorKind.Client
+				&& action.contributor.clientId === clientId) {
+				channelTools.add(action.toolCallId);
+			}
+			if (action.type === ActionType.ChatToolCallReady
+				&& action.confirmed === undefined
+				&& !channelTools.has(action.toolCallId)) {
 				pendingTools.add(action.toolCallId);
+			}
+			if (action.type === ActionType.ChatToolCallConfirmed && channelTools.has(action.toolCallId)) {
+				assert.equal(action.approved, true, 'Contributed channel tools must be automatically approved');
+				assert.equal(action.confirmed, ToolCallConfirmationReason.NotNeeded);
+				assert.equal(action.selectedOptionId, undefined, 'Automatic approval must not change session policy');
+				assert.equal(event.params.origin?.clientId, clientId, 'The bridge must approve its own tools');
 			}
 			if (action.type === ActionType.ChatToolCallConfirmed && pendingTools.has(action.toolCallId)) {
 				assert.equal(action.approved, allowed, 'Tool decision must match the fakechat verdict');
@@ -641,7 +652,6 @@ async function connectFakechat(port: number): Promise<WebSocket> {
 }
 
 async function runRoundTrip(
-	client: ConnectedAgentHost['client'],
 	socket: WebSocket,
 	initialChatState: ChatState,
 	subscription: Subscription,
@@ -653,7 +663,7 @@ async function runRoundTrip(
 		'Do not include quotes, punctuation, formatting, or any other text.',
 	].join(' ');
 	const messageId = `e2e-${randomUUID()}`;
-	const turn = approveChannelTurn(client, initialChatState, subscription, expectedReply);
+	const turn = observeChannelTurn(initialChatState, subscription, expectedReply);
 	const reply = waitForExactReply(socket, expectedReply);
 	try {
 		socket.send(JSON.stringify({ id: messageId, text: prompt }));
@@ -706,8 +716,7 @@ function waitForExactReply(socket: WebSocket, expected: string): Promise<void> {
 	});
 }
 
-async function approveChannelTurn(
-	client: ConnectedAgentHost['client'],
+async function observeChannelTurn(
 	initial: ChatState,
 	subscription: Subscription,
 	expectedMarker: string,
@@ -726,12 +735,6 @@ async function approveChannelTurn(
 			activeTurnId = action.turnId;
 			continue;
 		}
-		if (action.type === ActionType.ChatToolCallReady
-			&& action.turnId === activeTurnId
-			&& action.confirmed === undefined) {
-			approveTool(client, subscription.uri, action);
-			continue;
-		}
 		if ((action.type === ActionType.ChatTurnComplete
 			|| action.type === ActionType.ChatTurnCancelled
 			|| action.type === ActionType.ChatError)
@@ -743,24 +746,6 @@ async function approveChannelTurn(
 		}
 	}
 	throw new Error(`Timed out waiting for fakechat turn containing ${expectedMarker}`);
-}
-
-function approveTool(
-	client: ConnectedAgentHost['client'],
-	chat: string,
-	action: ChatToolCallReadyAction,
-): void {
-	const selectedOptionId = action.options?.find(option =>
-		option.kind === ConfirmationOptionKind.Approve && /once/i.test(option.id)
-	)?.id ?? action.options?.find(option => option.kind === ConfirmationOptionKind.Approve)?.id;
-	client.dispatch(chat, {
-		type: ActionType.ChatToolCallConfirmed,
-		turnId: action.turnId,
-		toolCallId: action.toolCallId,
-		approved: true,
-		confirmed: ToolCallConfirmationReason.UserAction,
-		...(selectedOptionId ? { selectedOptionId } : {}),
-	});
 }
 
 async function waitForSessionChat(initial: SessionState, subscription: Subscription): Promise<SessionState> {

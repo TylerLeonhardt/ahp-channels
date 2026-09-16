@@ -1,13 +1,10 @@
 import {
 	ActionType,
-	ConfirmationOptionKind,
 	CustomizationLoadStatus,
 	CustomizationType,
 	SessionLifecycle,
-	ToolCallConfirmationReason,
 	sessionReducer,
 	type ChatState,
-	type ChatToolCallReadyAction,
 	type RootState,
 	type SessionAction,
 	type SessionState,
@@ -85,7 +82,7 @@ try {
 
 	await ensureDaemonStarted(testRoot);
 	daemonStarted = true;
-	const firstTurn = approveChannelTurn(
+	const firstTurn = observeChannelTurn(
 		firstChat.result.snapshot.state as ChatState,
 		firstChat.subscription,
 		marker,
@@ -105,7 +102,7 @@ try {
 	await firstTurn;
 	await waitForReplyCount(1);
 
-	const secondTurn = approveChannelTurn(
+	const secondTurn = observeChannelTurn(
 		secondChat.result.snapshot.state as ChatState,
 		secondChat.subscription,
 		marker,
@@ -280,7 +277,7 @@ async function waitForPluginSkill(
 	throw new Error(`Timed out waiting for ${pluginName}:${skillName}`);
 }
 
-async function approveChannelTurn(initial: ChatState, subscription: Subscription, expectedMarker: string): Promise<void> {
+async function observeChannelTurn(initial: ChatState, subscription: Subscription, expectedMarker: string): Promise<void> {
 	let activeTurnId = initial.activeTurn?.message.text.includes(expectedMarker) ? initial.activeTurn.id : undefined;
 	const deadline = Date.now() + 120_000;
 	while (Date.now() < deadline) {
@@ -291,10 +288,6 @@ async function approveChannelTurn(initial: ChatState, subscription: Subscription
 		const action = event.params.action;
 		if (action.type === ActionType.ChatTurnStarted && action.message.text.includes(expectedMarker)) {
 			activeTurnId = action.turnId;
-			continue;
-		}
-		if (action.type === ActionType.ChatToolCallReady && action.turnId === activeTurnId && action.confirmed === undefined) {
-			approveTool(subscription.uri, action);
 			continue;
 		}
 		if ((action.type === ActionType.ChatTurnComplete
@@ -308,20 +301,6 @@ async function approveChannelTurn(initial: ChatState, subscription: Subscription
 		}
 	}
 	throw new Error(`Timed out waiting for channel turn containing ${expectedMarker}`);
-}
-
-function approveTool(chat: string, action: ChatToolCallReadyAction): void {
-	const selectedOptionId = action.options?.find(option =>
-		option.kind === ConfirmationOptionKind.Approve && /once/i.test(option.id)
-	)?.id ?? action.options?.find(option => option.kind === ConfirmationOptionKind.Approve)?.id;
-	client.dispatch(chat, {
-		type: ActionType.ChatToolCallConfirmed,
-		turnId: action.turnId,
-		toolCallId: action.toolCallId,
-		approved: true,
-		confirmed: ToolCallConfirmationReason.UserAction,
-		...(selectedOptionId ? { selectedOptionId } : {}),
-	});
 }
 
 async function waitForSessionChat(initial: SessionState, subscription: Subscription): Promise<SessionState> {

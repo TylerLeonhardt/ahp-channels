@@ -154,13 +154,25 @@ heartbeat-backed cross-process lock.
 
 ### Approve tools from a channel
 
+Tools contributed by a channel, such as its `reply` tool, are automatically
+approved for that channel's client. Trust requires both the exact client
+identity and a tool name in its published tool list; a host tool or another
+client's tool named `reply` is not trusted by name alone. Execution still waits
+for the Agent Host to accept the approval. This works even without native
+permission support and does not enable session-wide "allow all" permissions.
+Only run channel plugins whose contributed tools you trust.
+Pending calls for tools the channel no longer advertises are denied explicitly;
+already-running unavailable calls report a failure instead of leaving the turn
+waiting. Cancellation stops pending argument reads and prevents a new channel
+tool invocation afterward. It cannot undo effects of a tool that already began.
+
 Channel plugins that advertise `claude/channel/permission: {}` can relay tool
-approval requests for their bound AHP chat. Missing or `false` capabilities
-leave approval in the Agent Host UI. The bridge uses the native
+approval requests for other tools in their bound AHP chat. Missing or `false`
+capabilities leave those approvals in the Agent Host UI. The bridge uses the native
 [`permission_request` / `permission` notifications](https://code.claude.com/docs/en/channels-reference#relay-permission-prompts),
 not plugin-specific reply tools or model-parsed chat commands.
 
-When a tool needs confirmation, the plugin receives its name, a sanitized
+When another tool needs confirmation, the plugin receives its name, a sanitized
 description and argument preview, and a short request ID. Use the plugin's
 approval controls, such as Telegram's Allow/Deny buttons or `yes abcde` /
 `no abcde` replies. A verdict applies only to that pending call; it never
@@ -192,6 +204,8 @@ including turns started from the editor.
 Tool-use and mid-execution re-confirmations are supported. Project trust,
 MCP authentication/consent, result-review confirmations, and arbitrary user
 questions remain in the Agent Host UI.
+Re-confirmation previews include the current permission request, with the
+original tool intention shown only as additional context.
 
 ## Manage plugin versions
 
@@ -249,6 +263,10 @@ deterministic AHP host. That host drives the same session, reverse resource,
 customization, and client-tool protocol used by a full agent provider, but
 needs no model credentials. The default local mode remains available for
 validating against a real installed Agent Host.
+
+The deterministic host also requires confirmation for the contributed `reply`
+tool. The bridge must automatically approve it before execution; the E2E
+harnesses observe the flow without injecting approval decisions.
 
 The test installs the real `fakechat@claude-plugins-official` plugin through the
 built CLI, creates a temporary AHP session and named channel, and exchanges an

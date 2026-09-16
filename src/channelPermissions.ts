@@ -3,13 +3,16 @@ import {
 	ResponsePartKind,
 	ToolCallCancellationReason,
 	ToolCallConfirmationReason,
+	ToolCallContributorKind,
 	ToolCallStatus,
 	chatReducer,
 	type ActionEnvelope,
 	type ChatAction,
 	type ChatState,
+	type ChatToolCallStartAction,
 	type StateAction,
 	type ToolCallPendingConfirmationState,
+	type ToolDefinition,
 } from '@microsoft/agent-host-protocol';
 import type { DispatchHandle } from '@microsoft/agent-host-protocol/client';
 import { randomInt } from 'node:crypto';
@@ -48,6 +51,23 @@ export interface PermissionHost extends Partial<ToolInputReader> {
 	dispatch(channel: string, action: StateAction): DispatchHandle;
 }
 
+export function isChannelToolCall(
+	tool: Pick<ChatToolCallStartAction, 'toolName' | 'contributor'>,
+	clientId: string,
+	tools: readonly ToolDefinition[],
+): boolean {
+	return isChannelToolContributor(tool, clientId)
+		&& tools.some(definition => definition.name === tool.toolName);
+}
+
+export function isChannelToolContributor(
+	tool: Pick<ChatToolCallStartAction, 'contributor'>,
+	clientId: string,
+): boolean {
+	return tool.contributor?.kind === ToolCallContributorKind.Client
+		&& tool.contributor.clientId === clientId;
+}
+
 interface PendingPermission {
 	readonly id: string;
 	readonly turnId: string;
@@ -81,18 +101,21 @@ export class ChannelPermissionRelay {
 		private readonly host: PermissionHost,
 		private readonly clientId: string,
 		private readonly chat: string,
-		private readonly transport: ChannelPermissionTransport,
+		private readonly transport: ChannelPermissionTransport | undefined,
 		private state: ChatState,
+		private readonly channelTools: readonly ToolDefinition[],
 	) {
 		if (state.resource !== chat) {
 			throw new Error('Permission relay snapshot does not match its bound chat');
 		}
-		transport.events.on('verdict', this.onVerdict);
+		transport?.events.on('verdict', this.onVerdict);
 	}
 
 	start(): void {
 		this.reconcile();
-		this.events.emit('status', 'tool permission relay enabled for this chat; sender authorization is owned by the channel plugin');
+		if (this.transport) {
+			this.events.emit('status', 'tool permission relay enabled for this chat; sender authorization is owned by the channel plugin');
+		}
 	}
 
 	observe(envelope: ActionEnvelope): void {
@@ -108,6 +131,18 @@ export class ChannelPermissionRelay {
 			if (rejected) {
 				this.invalidate(rejected);
 				this.events.emit('failure', new Error(`Agent Host rejected the permission decision: ${envelope.rejectionReason}`));
+			} else {
+				const action = envelope.action;
+				if (action.type === ActionType.ChatToolCallConfirmed
+					&& envelope.origin?.clientId === this.clientId
+					&& action.turnId === this.state.activeTurn?.id
+					&& this.pendingTools().some(tool =>
+						tool.toolCallId === action.toolCallId
+						&& this.offered.has(tool)
+						&& isChannelToolContributor(tool, this.clientId)
+					)) {
+					this.events.emit('failure', new Error(`Agent Host rejected automatic channel tool decision: ${envelope.rejectionReason}`));
+				}
 			}
 			return;
 		}
@@ -117,7 +152,7 @@ export class ChannelPermissionRelay {
 
 	async close(): Promise<void> {
 		this.lifetime.abort();
-		this.transport.events.off('verdict', this.onVerdict);
+		this.transport?.events.off('verdict', this.onVerdict);
 		for (const request of this.requests.values()) {
 			this.invalidate(request);
 		}
@@ -146,13 +181,43 @@ export class ChannelPermissionRelay {
 		if (!turn) {
 			return;
 		}
+		let reportedCapacity = false;
 		for (const tool of this.pendingTools()) {
 			if (this.offered.has(tool)) {
 				continue;
 			}
+			if (isChannelToolContributor(tool, this.clientId)) {
+				this.offered.add(tool);
+				const available = isChannelToolCall(tool, this.clientId, this.channelTools);
+				const reasonMessage = `Channel tool '${sanitizePermissionText(tool.toolName)}' is no longer available`;
+				this.host.dispatch(this.chat, available ? {
+					type: ActionType.ChatToolCallConfirmed,
+					turnId: turn.id,
+					toolCallId: tool.toolCallId,
+					approved: true,
+					confirmed: ToolCallConfirmationReason.NotNeeded,
+				} : {
+					type: ActionType.ChatToolCallConfirmed,
+					turnId: turn.id,
+					toolCallId: tool.toolCallId,
+					approved: false,
+					reason: ToolCallCancellationReason.Denied,
+					reasonMessage,
+				});
+				this.events.emit('status', available
+					? `requested automatic approval for channel tool ${sanitizePermissionText(tool.toolName)}; awaiting Agent Host confirmation`
+					: `${reasonMessage}; requested denial from the Agent Host`);
+				continue;
+			}
+			if (!this.transport) {
+				continue;
+			}
 			if (this.requests.size >= MAX_PENDING_REQUESTS || this.issuedIds.size >= MAX_ISSUED_REQUESTS) {
-				this.events.emit('status', 'permission relay capacity reached; use Agent Host approval or restart the channel');
-				return;
+				if (!reportedCapacity) {
+					this.events.emit('status', 'permission relay capacity reached; use Agent Host approval or restart the channel');
+					reportedCapacity = true;
+				}
+				continue;
 			}
 			const id = this.createRequestId();
 			this.offered.add(tool);
@@ -175,11 +240,11 @@ export class ChannelPermissionRelay {
 				phase: 'preparing',
 			};
 			this.requests.set(id, pending);
-			this.track(this.prepare(pending), pending);
+			this.track(this.prepare(pending, this.transport), pending);
 		}
 	}
 
-	private async prepare(pending: PendingPermission): Promise<void> {
+	private async prepare(pending: PendingPermission, transport: ChannelPermissionTransport): Promise<void> {
 		let input: string | undefined;
 		try {
 			input = await readToolInput(this.host, pending.tool.toolInput, pending.abort.signal);
@@ -194,20 +259,21 @@ export class ChannelPermissionRelay {
 			return;
 		}
 		pending.input = input;
-		const invocation = pending.tool.intention ?? (
-			typeof pending.tool.invocationMessage === 'string'
-				? pending.tool.invocationMessage
-				: pending.tool.invocationMessage.markdown
-		);
+		const invocation = typeof pending.tool.invocationMessage === 'string'
+			? pending.tool.invocationMessage
+			: pending.tool.invocationMessage.markdown;
+		const context = pending.tool.intention && pending.tool.intention !== invocation
+			? `\nContext: ${pending.tool.intention}`
+			: '';
 		const preview = formatPermissionInput(input);
 		const edits = pending.tool.edits
 			? `\nEdits: ${formatPermissionInput(JSON.stringify(pending.tool.edits))}`
 			: '';
 		pending.phase = 'awaiting';
-		await raceAbort(this.transport.sendRequest({
+		await raceAbort(transport.sendRequest({
 			request_id: pending.id,
 			tool_name: sanitizePermissionText(pending.tool.toolName),
-			description: sanitizePermissionText(`${invocation} (Approve this call only; expires ${new Date(pending.expiresAt).toISOString()})`),
+			description: sanitizePermissionText(`${invocation}${context} (Approve this call only; expires ${new Date(pending.expiresAt).toISOString()})`),
 			input_preview: `${preview}${edits}`,
 		}), pending.abort.signal);
 		this.events.emit('status', 'sent a tool permission request to the channel');
