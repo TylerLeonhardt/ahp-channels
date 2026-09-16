@@ -99,8 +99,6 @@ files.
   using plugin-owned configuration.
 - Soak fakechat, Telegram, and Discord through daemon restarts and plugin
   upgrades.
-- Resolve alpha feedback and document protocol, host, and plugin compatibility
-  limits.
 
 ## Completed: Tool permission relay
 

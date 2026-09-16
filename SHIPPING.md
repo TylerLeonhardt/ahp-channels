@@ -40,8 +40,6 @@
 - [x] Add log rotation.
 - [x] Relay tool confirmations through permission-capable channels and verify
       approval and denial with fakechat.
-- [ ] Document credential injection and restart requirements for plugins that
-      accept credentials only through their environment.
-- [ ] Resolve alpha feedback and document host, protocol, and plugin
-      compatibility limits.
+- [x] Document plugin process environments and restart requirements for
+      environment-only configuration.
 - [ ] Publish `0.1.0` through OIDC and verify its registry provenance.
