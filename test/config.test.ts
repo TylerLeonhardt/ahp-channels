@@ -3,7 +3,10 @@ import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
+import { setTimeout } from 'node:timers/promises';
+import { lock } from 'proper-lockfile';
 import { CONFIG_VERSION, ConfigStore, isValidChannelInstanceName } from '../src/config.js';
+import { FILE_LOCK_OPTIONS } from '../src/lockedFile.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -85,6 +88,61 @@ describe('ConfigStore', () => {
 		assert.deepEqual(Object.keys((await first.read()).channels).sort(), ['first', 'second']);
 		await assert.rejects(access(join(home, 'config.json.lock')), (error: unknown) =>
 			error instanceof Error && 'code' in error && error.code === 'ENOENT'
+		);
+	});
+
+	for (const operation of ['read', 'write'] as const) {
+		it(`waits for file-I/O ownership before a config ${operation}`, async () => {
+			const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
+			temporaryDirectories.push(home);
+			const store = new ConfigStore(home);
+			const initial = await store.read();
+			await store.write(initial);
+			const release = await lock(`${store.configPath}.io`, FILE_LOCK_OPTIONS);
+			const operationResult = operation === 'read' ? store.read() : store.write(initial);
+			try {
+				assert.equal(await Promise.race([
+					operationResult.then(() => 'completed'),
+					setTimeout(100, 'locked'),
+				]), 'locked');
+			} finally {
+				await release();
+				await operationResult;
+			}
+			assert.deepEqual(await store.read(), initial);
+		});
+	}
+
+	it('preserves complete snapshots while reads overlap transaction updates', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-config-'));
+		temporaryDirectories.push(home);
+		const writer = new ConfigStore(home);
+		await writer.update(config => ({
+			...config,
+			channels: { personal: { plugin: 'fake', session: 'ahp-session:/0', enabled: false } },
+		}));
+		const reader = new ConfigStore(home);
+		const updating = async () => {
+			for (let index = 1; index <= 50; index++) {
+				await writer.update(config => ({
+					...config,
+					channels: {
+						personal: { ...config.channels['personal'], session: `ahp-session:/${index}` },
+					},
+				}));
+			}
+		};
+		const reading = async () => {
+			for (let index = 0; index < 50; index++) {
+				const config = await reader.read();
+				assert.equal(config.version, CONFIG_VERSION);
+				assert.match(config.channels['personal'].session, /^ahp-session:\/\d+$/);
+			}
+		};
+		await Promise.all([updating(), reading(), reading(), reading(), reading()]);
+		assert.equal((await reader.read()).channels['personal'].session, 'ahp-session:/50');
+		await assert.rejects(access(`${writer.configPath}.io.lock`), (error: unknown) =>
+			error instanceof Error && 'code' in error && error.code === 'ENOENT',
 		);
 	});
 

@@ -1,5 +1,5 @@
 import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { lock } from 'proper-lockfile';
 
 export const FILE_LOCK_OPTIONS = {
@@ -19,13 +19,31 @@ const LOCK_OPTIONS = {
 	},
 } as const;
 
+const pendingOperations = new Map<string, Promise<unknown>>();
+
 export async function withFileLock<T>(path: string, operation: () => Promise<T>): Promise<T> {
-	await mkdir(dirname(path), { recursive: true });
-	const release = await lock(path, LOCK_OPTIONS);
+	const key = resolve(path);
+	const preceding = pendingOperations.get(key) ?? Promise.resolve();
+	// Local contenders can wait for ownership directly instead of racing through
+	// timer-based retries. The filesystem lock still protects other processes.
+	const current = preceding.then(acquire, acquire);
+	pendingOperations.set(key, current);
 	try {
-		return await operation();
+		return await current;
 	} finally {
-		await release();
+		if (pendingOperations.get(key) === current) {
+			pendingOperations.delete(key);
+		}
+	}
+
+	async function acquire(): Promise<T> {
+		await mkdir(dirname(key), { recursive: true });
+		const release = await lock(key, LOCK_OPTIONS);
+		try {
+			return await operation();
+		} finally {
+			await release();
+		}
 	}
 }
 

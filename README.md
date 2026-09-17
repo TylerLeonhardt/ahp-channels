@@ -9,7 +9,7 @@ Plugin customizations to that conversation. The Agent Host supplies the agent
 provider and its permission controls; the plugin owns credentials, pairing,
 and platform-specific behavior.
 
-Version **0.1.0** includes:
+The **0.1** release series includes:
 
 - Named channels managed by a background daemon.
 - Local host aliases and discovery of existing sessions and chats.
@@ -369,7 +369,7 @@ are not interpreted as file access or new AHP attachment fields.
 
 ## Compatibility and limits
 
-| Area | 0.1.0 scope |
+| Area | 0.1 scope |
 | --- | --- |
 | Platforms | Windows, macOS, and Linux CLI/package CI. Published-prerelease Telegram onboarding verified on macOS and user-confirmed on Linux. |
 | Agent Hosts | Local VS Code registry endpoints and explicitly configured loopback WebSocket/socket hosts. AHP 0.9 hosts are tested; the client negotiates protocol compatibility. |
@@ -380,7 +380,7 @@ are not interpreted as file access or new AHP attachment fields.
 | Editor integration | The authenticated daemon contract can serve a future extension. No VS Code extension or private editor-chat integration is included. |
 | Remote hosts | Remote URLs, SSH/tunnel provisioning, and remote credential/identity management are not supported. |
 
-A `0.1.0` package release is not a guarantee that every host/provider/plugin
+A `0.1` package release is not a guarantee that every host/provider/plugin
 combination has been tested. Automated coverage includes the official fakechat
 smoke test and separate permission, attachment, and handoff fixtures. Longer
 multi-plugin soak testing is an explicitly deferred follow-up, not completed
@@ -570,7 +570,11 @@ ahp-channels daemon start
 Control traffic uses a per-install random token over a local named pipe on
 Windows or a mode-`0600` Unix socket. Token creation is locked and atomic so
 concurrent startup probes cannot observe a partially written token.
-Configuration writes are atomic and use a heartbeat-backed cross-process lock.
+Configuration reads and atomic file replacements share an I/O lock, separate
+from the heartbeat-backed transaction lock. Local contenders queue without
+timer-based lock retries; other processes still use the filesystem lock.
+This prevents Windows status reads from colliding with a handoff's atomic
+configuration replacement.
 
 ### Approve tools from a channel
 
@@ -629,6 +633,10 @@ Re-confirmation previews include the current permission request, with the
 original tool intention shown only as additional context.
 
 ## Upgrade the bridge
+
+Version `0.1.1` fixes a Windows configuration-file sharing race that could cause
+`EPERM` and a handoff rollback during concurrent status polling. Use `0.1.1`
+or newer for that correction; the published `0.1.0` artifact is unchanged.
 
 Wait until the channels are idle, then stop the daemon **with the currently
 installed CLI before upgrading**:

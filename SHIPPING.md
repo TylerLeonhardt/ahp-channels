@@ -60,7 +60,23 @@ shorter automated or onboarding checks.
       host/session/chat handoff shared by terminal and agent controls.
 - [x] Verify a pending agent-requested handoff across two isolated hosts,
       including source and destination external-channel replies.
-- [ ] Publish `0.1.0` through OIDC and verify its registry provenance.
+- [x] Publish `0.1.0` through OIDC and verify its registry provenance.
+
+Published as npm `latest` by
+[GitHub Actions](https://github.com/TylerLeonhardt/ahp-channels/actions/runs/35183972812)
+with a [stable GitHub release](https://github.com/TylerLeonhardt/ahp-channels/releases/tag/v0.1.0).
+A clean install of the registry package passed CLI smoke checks; registry
+signatures and SLSA provenance were verified against the release tag, merged
+source commit, and publishing workflow.
+
+## 0.1.1 maintenance correction
+
+- Serialize configuration-file reads and atomic replacements to prevent
+  Windows `EPERM` failures during status polling and handoff commits.
+- Queue same-process file-lock owners directly while retaining cross-process
+  filesystem locks and separate configuration transaction ownership.
+- Cover held I/O locks, concurrent readers/updates, failed-owner recovery, and
+  repeated Windows daemon lifecycle checks.
 
 ## Post-0.1.0 follow-up
 
