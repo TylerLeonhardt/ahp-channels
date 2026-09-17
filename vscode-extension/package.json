@@ -2,7 +2,7 @@
   "name": "ahp-channels-vscode",
   "displayName": "AHP Channels",
   "description": "Manage AHP channel plugins, the background daemon, and session attachments.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "tylerleonhardt",
   "license": "MIT",
   "repository": {

@@ -105,6 +105,17 @@ files.
 - Combined handoff and in-flight MCP resource-materialization coverage with
   byte-exact text/image results and no stale results in the destination chat.
 
+## Completed: VS Code channel management and setup-only handoffs
+
+- Bundled extension and daemon with plugin installation, channel controls,
+  session selection, and npm-distributed VSIX installation commands.
+- Setup-only handoffs keep plugin skills available on the new session while
+  preserving healthy-channel rollback and source ownership checks.
+- Actionable extension health with failure, recovery, retry, and handoff
+  details rendered as plain text.
+- Real bundled-daemon lifecycle tests and local socket regressions under
+  VS Code's HTTP proxy wrapper.
+
 ## Completed: macOS prerelease onboarding
 
 - Install published `0.1.0-alpha.4` and configure Telegram through the ordinary
