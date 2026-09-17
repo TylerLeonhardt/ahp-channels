@@ -374,21 +374,49 @@ describe('ChannelRuntime', () => {
 		await runtime.close();
 	});
 
-	it('rejects a prepared replacement whose channel process cannot start', async () => {
+	it('prepares setup skills without publishing them until activation when MCP startup fails', async () => {
 		const client = new TestHostClient();
-		await assert.rejects(
-			ChannelRuntime.prepare('personal', {
-				plugin: 'fake',
-				session: sessionUri,
-				enabled: true,
-			}, createServices(client, new TestMcpChannel(new Error('missing destination credential')))),
-			(error: unknown) => error instanceof ChannelOperationError
-				&& error.stage === 'mcp-startup'
-				&& /missing destination credential/.test(error.message),
-		);
-		assert.equal(client.dispatched.some(item =>
-			item.action.type === ActionType.SessionActiveClientSet
-		), false);
+		const mcp = new TestMcpChannel(new Error('missing destination credential'));
+		const runtime = await ChannelRuntime.prepare('personal', {
+			plugin: 'fake',
+			session: sessionUri,
+			enabled: true,
+		}, createServices(client, mcp));
+		try {
+			assert.equal(runtime.snapshot.mode, 'customization-only');
+			assert.equal(runtime.startupFailure?.stage, 'mcp-startup');
+			assert.match(runtime.startupFailure.message, /missing destination credential/);
+			assert.equal(mcp.closed, true);
+			assert.equal(client.shutDown, false);
+			assert.equal(client.dispatched.length, 0);
+
+			await runtime.activate();
+			const registration = client.dispatched[0];
+			assert.ok(registration?.action.type === ActionType.SessionActiveClientSet);
+			assert.equal(registration.channel, sessionUri);
+			assert.equal(registration.action.activeClient.customizations?.[0]?.name, 'fake');
+			assert.deepEqual(registration.action.activeClient.tools, []);
+			assert.equal(client.resourceHandlersSetBeforeActiveClient, true);
+			await runtime.activate();
+			assert.equal(client.dispatched.length, 1);
+		} finally {
+			await runtime.close();
+		}
+		assert.equal(client.dispatched.at(-1)?.action.type, ActionType.SessionActiveClientRemoved);
+		assert.equal(client.shutDown, true);
+	});
+
+	it('can discard a prepared setup-only runtime without contributing skills', async () => {
+		const client = new TestHostClient();
+		const runtime = await ChannelRuntime.prepare('personal', {
+			plugin: 'fake',
+			session: sessionUri,
+			enabled: true,
+		}, createServices(client, new TestMcpChannel(new Error('missing destination credential'))));
+		await runtime.close();
+		assert.equal(client.dispatched.some(item => item.action.type === ActionType.SessionActiveClientSet), false);
+		assert.equal(client.subscriptions.get(sessionUri)?.closed, true);
+		assert.equal(client.subscriptions.get(chatUri)?.closed, true);
 		assert.equal(client.shutDown, true);
 	});
 

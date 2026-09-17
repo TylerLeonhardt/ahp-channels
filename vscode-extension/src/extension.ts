@@ -30,6 +30,7 @@ import {
 	SessionCatalogService,
 	type SessionCatalogEntry,
 } from '../../src/sessionCatalog.js';
+import { channelPresentation } from './channelPresentation.js';
 
 const VIEW_ID = 'ahpChannels.explorer';
 
@@ -462,20 +463,20 @@ function daemonTreeItem(node: DaemonNode): vscode.TreeItem {
 
 function channelTreeItem(node: ChannelNode): vscode.TreeItem {
 	const { status } = node;
+	const presentation = channelPresentation(status);
 	const item = new vscode.TreeItem(status.name);
-	item.description = `${status.state} · ${status.definition.plugin}`;
+	item.description = presentation.description;
 	item.contextValue = status.state === 'stopped' || status.desired === 'stopped'
 		? 'channelStopped'
 		: status.state === 'error'
 			? 'channelError'
 			: 'channelRunning';
 	item.iconPath = new vscode.ThemeIcon(channelIcon(status));
-	item.tooltip = new vscode.MarkdownString([
-		`**Plugin:** ${status.definition.plugin}`,
-		`**State:** ${status.state}`,
-		`**Session:** \`${status.definition.session}\``,
-		...(status.definition.host ? [`**Host:** \`${status.definition.host}\``] : []),
-	].join('\n\n'));
+	const tooltip = new vscode.MarkdownString();
+	for (const [label, value] of presentation.details) {
+		tooltip.appendMarkdown(`**${label}:** `).appendText(value).appendMarkdown('\n\n');
+	}
+	item.tooltip = tooltip;
 	return item;
 }
 
@@ -727,7 +728,6 @@ async function runCommand(
 			location: vscode.ProgressLocation.Notification,
 			title,
 		}, operation);
-		provider.refresh();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		output.error(`${title}: ${message}`, error instanceof Error ? error : undefined);
@@ -736,6 +736,8 @@ async function runCommand(
 				output.show();
 			}
 		});
+	} finally {
+		provider.refresh();
 	}
 }
 

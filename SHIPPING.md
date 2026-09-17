@@ -78,6 +78,26 @@ source commit, and publishing workflow.
 - Cover held I/O locks, concurrent readers/updates, failed-owner recovery, and
   repeated Windows daemon lifecycle checks.
 
+## 0.1.2 extension and setup reliability
+
+- Allow setup-only channels to move to another validated session before their
+  messaging server is configured, without weakening healthy-channel rollback
+  or busy-session protection.
+- Reject handoffs if the source disconnects during asynchronous validation;
+  preserve the committed source for recovery.
+- Show setup-only versus connected status, recovery guidance, retry state,
+  and failed-handoff details in the extension.
+- Fix cold startup of the VSIX's ESM daemon with bundled CommonJS dependencies.
+- Preserve Unix-socket and Windows named-pipe targets under VS Code's HTTP
+  proxy handling without disabling proxy support.
+- Cover real extension-command daemon startup, reuse, shutdown, and startup
+  diagnostics, plus transport behavior under the actual VS Code proxy wrapper.
+- Include the matching VSIX and `vscode install` / `vscode path` commands in
+  the npm release. Marketplace upload remains a separate manual step.
+
+Schema version 2 configuration remains unsupported. Its one-off dogfooding
+migration is separate from these runtime fixes.
+
 ## Post-0.1.0 follow-up
 
 - [ ] Longer-running soak tests with fakechat, Telegram, and Discord through

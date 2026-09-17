@@ -29,6 +29,12 @@ Building the VSIX does not publish the extension or the npm package.
 Marketplace extension versions must be numeric `major.minor.patch` versions;
 npm prerelease suffixes such as `-alpha.4` are not accepted for upload.
 
+Run `npm run test:vscode` before uploading. In addition to activation and
+channel UI checks, it starts, reuses, and stops the extension's bundled daemon
+through the actual extension commands in an isolated state directory. It also
+checks that invalid configuration produces its startup diagnostic. Testing
+only the CLI daemon does not cover the VSIX's separate daemon bundle.
+
 Merge the README screenshot into `main` before publishing. Marketplace
 README images load from HTTPS URLs, not from the copy bundled in the VSIX.
 The extension's `vsce` options resolve relative documentation and image links

@@ -1,4 +1,5 @@
-import { createConnection } from 'node:net';
+import { Agent } from 'node:http';
+import { createConnection, type Socket } from 'node:net';
 import { TransportError, type AhpTransport, type JsonRpcMessage, type TransportFrame } from '@microsoft/agent-host-protocol/client';
 import WebSocket, { type RawData } from 'ws';
 
@@ -23,11 +24,14 @@ export class SocketWebSocketTransport implements AhpTransport {
 			if (connectionToken !== undefined) {
 				url.searchParams.set(connectionTokenQueryParameter, connectionToken);
 			}
+			// VS Code's proxy wrapper can bypass a request-level createConnection hook.
+			const agent = new LocalSocketAgent(socketPath);
 			const socket = new WebSocket(url, {
-				createConnection: () => createConnection(socketPath),
+				agent,
 				handshakeTimeout: 10_000,
 				perMessageDeflate: false,
 			});
+			socket.once('close', () => agent.destroy());
 
 			const cleanup = () => {
 				socket.off('open', onOpen);
@@ -41,7 +45,7 @@ export class SocketWebSocketTransport implements AhpTransport {
 			const onError = (error: Error) => {
 				cleanup();
 				socket.terminate();
-				reject(new TransportError('io', `websocket failed to open: ${error.message}`, { cause: error }));
+				reject(new TransportError('io', `websocket failed to open: ${error.message || error.name}`, { cause: error }));
 			};
 			const onClose = (code: number) => {
 				cleanup();
@@ -161,6 +165,16 @@ export class SocketWebSocketTransport implements AhpTransport {
 		for (const waiter of this.waiters.splice(0)) {
 			waiter.resolve(null);
 		}
+	}
+}
+
+class LocalSocketAgent extends Agent {
+	constructor(private readonly socketPath: string) {
+		super();
+	}
+
+	override createConnection(): Socket {
+		return createConnection(this.socketPath);
 	}
 }
 

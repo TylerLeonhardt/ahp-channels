@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { createServer, type Server } from 'node:http';
+import http, { createServer, type Server } from 'node:http';
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, it } from 'node:test';
 import { WebSocketServer } from 'ws';
+import { createHttpPatch, LogLevel, type ProxyAgentParams } from '@vscode/proxy-agent';
 import { SocketWebSocketTransport } from '../src/socketWebSocketTransport.js';
 
 let server: Server | undefined;
@@ -84,6 +85,62 @@ describe('SocketWebSocketTransport', () => {
 		const transport = await SocketWebSocketTransport.connect(socketPath, 'secret');
 
 		assert.equal(await transport.recv(), null);
+	});
+
+	for (const proxySupport of ['on', 'override', 'fallback'] as const) {
+		it(`keeps the local socket endpoint with VS Code proxy support '${proxySupport}'`, async context => {
+			const params: ProxyAgentParams = {
+				resolveProxy: async () => 'DIRECT',
+				getProxyURL: () => undefined,
+				getProxySupport: () => proxySupport,
+				isAdditionalFetchSupportEnabled: () => false,
+				isWebSocketPatchEnabled: () => false,
+				addCertificatesV1: () => false,
+				addCertificatesV2: () => false,
+				loadSystemCertificatesFromNode: () => false,
+				loadAdditionalCertificates: async () => [],
+				log: { trace() { }, debug() { }, info() { }, warn() { }, error() { } },
+				getLogLevel: () => LogLevel.Off,
+				proxyResolveTelemetry() { },
+				isUseHostProxyEnabled: () => false,
+				env: {},
+			};
+			const patch = createHttpPatch(params, http, (_flags, _request, _options, _url, callback) => callback('DIRECT'));
+			context.mock.method(http, 'request', patch.request);
+			socketPath = createSocketPath();
+			server = createServer();
+			webSocketServer = new WebSocketServer({ server });
+			webSocketServer.once('connection', (socket, request) => {
+				assert.equal(new URL(request.url ?? '/', 'http://localhost').searchParams.get('auth'), 'test-token');
+				socket.on('message', (data, isBinary) => {
+					socket.send(data, { binary: isBinary });
+					socket.send(Buffer.from([1, 2, 3]));
+				});
+			});
+			await new Promise<void>((resolve, reject) => {
+				server?.once('error', reject);
+				server?.listen(socketPath, resolve);
+			});
+
+			const transport = await SocketWebSocketTransport.connect(socketPath, 'test-token', 'auth');
+			try {
+				await transport.send('hello');
+				assert.deepEqual(await transport.recv(), { kind: 'text', text: 'hello' });
+				assert.deepEqual(await transport.recv(), { kind: 'binary', data: new Uint8Array([1, 2, 3]) });
+			} finally {
+				await transport.close();
+			}
+		});
+	}
+
+	it('reports a missing socket without leaking its connection token', async () => {
+		await assert.rejects(
+			SocketWebSocketTransport.connect(createSocketPath(), 'test-token'),
+			(error: unknown) => error instanceof Error
+				&& /websocket failed to open/.test(error.message)
+				&& /ENOENT/.test(error.message)
+				&& !error.message.includes('test-token'),
+		);
 	});
 });
 
