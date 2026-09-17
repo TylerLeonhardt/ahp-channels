@@ -1,5 +1,12 @@
 # Shipping checklist
 
+## 0.1.0 release decision
+
+Release after the automated quality, package, and cross-platform/E2E gates
+pass. The maintainer explicitly deferred longer-running multi-plugin soak
+testing to post-release follow-up; it is not claimed as completed by the
+shorter automated or onboarding checks.
+
 ## Published prereleases
 
 - [x] Claude-style MCP channel compatibility.
@@ -16,6 +23,8 @@
 - [x] Verify npm's required first-version `latest` behavior.
 - [x] Configure npm trusted publishing for `TylerLeonhardt/ahp-channels`.
 - [x] Publish `0.1.0-alpha.2` through OIDC with SLSA provenance.
+- [x] Publish `0.1.0-alpha.3` and `0.1.0-alpha.4` through GitHub Actions trusted
+      publishing, with verified registry artifacts and provenance.
 - [x] Verify the public registry install, daemon, signatures, and attestations.
 - [x] Verify live Telegram and Discord channels on macOS against a local build.
 
@@ -38,7 +47,9 @@
       phone message/reply. Existing test bot and allowlist reused.
 - [x] Verify published-prerelease Telegram onboarding on Linux; the user
       confirmed success on another machine.
-- [ ] Soak the alpha with fakechat, Telegram, and Discord.
+- [x] Provide npm-first, cross-platform README setup instructions, explicit
+      conversation selection and plugin setup, compatibility limits, and
+      safe bridge upgrade guidance.
 - [x] Add actionable channel health diagnostics.
 - [x] Add log rotation.
 - [x] Relay tool confirmations through permission-capable channels and verify
@@ -50,3 +61,8 @@
 - [x] Verify a pending agent-requested handoff across two isolated hosts,
       including source and destination external-channel replies.
 - [ ] Publish `0.1.0` through OIDC and verify its registry provenance.
+
+## Post-0.1.0 follow-up
+
+- [ ] Longer-running soak tests with fakechat, Telegram, and Discord through
+      daemon restarts and plugin upgrades (explicitly deferred, not verified).

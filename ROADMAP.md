@@ -121,12 +121,13 @@ pristine-machine or new-pairing test.
   Linux machine. This is user-reported verification, separate from the macOS
   run performed here.
 
-## Next: Remote identity and release validation
+## Next: Post-0.1.0 validation and remote identity
 
 - Define a standard-backed stable identity and credential resolver before
   adding aliases for remote Agent Hosts.
 - Soak fakechat, Telegram, and Discord through daemon restarts and plugin
-  upgrades.
+  upgrades. Longer-running soak testing is explicitly deferred follow-up,
+  not completed `0.1.0` release evidence.
 
 ## Completed: Tool permission relay
 
