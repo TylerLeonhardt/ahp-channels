@@ -26,6 +26,14 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - name: Repeat daemon lifecycle checks on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          for attempt in {1..10}; do
+            echo "Windows daemon lifecycle run $attempt/10"
+            node --test --import tsx test/daemon.test.ts
+          done
       - run: npm run test:package
 
   e2e-fakechat:

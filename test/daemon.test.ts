@@ -550,10 +550,12 @@ describe('DaemonServer', () => {
 		}
 	});
 
-	it('accepts an agent handoff as pending and applies one cross-host binding after the source turn', async () => {
+	it('accepts an agent handoff as pending and applies one cross-host binding after the source turn', async context => {
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
 		temporaryDirectories.push(home);
 		const store = new ConfigStore(home);
+		const configWrites = context.mock.method(store, 'write');
+		const handoffWrites = context.mock.method(FileChannelHandoffStore.prototype, 'write');
 		await configureHostAliases(store, home);
 		const factory = new TestRuntimeFactory();
 		const catalog = new TestSessionCatalog();
@@ -648,6 +650,18 @@ describe('DaemonServer', () => {
 
 			source.finishTurn();
 			const applied = await waitForRunningChannel(home, 'personal', source.bindingId);
+			if (applied.handoff?.state !== 'applied') {
+				const writes = await Promise.allSettled([
+					...configWrites.mock.calls.map(call => call.result),
+					...handoffWrites.mock.calls.map(call => call.result),
+				]);
+				context.diagnostic(JSON.stringify({
+					handoff: applied.handoff,
+					writeFailures: writes.flatMap(result => result.status === 'rejected'
+						? [result.reason instanceof Error ? result.reason.stack : String(result.reason)]
+						: []),
+				}));
+			}
 			assert.equal(applied.handoff?.state, 'applied');
 			status = await requestDaemon(home, { command: 'status' });
 			assert.deepEqual({
