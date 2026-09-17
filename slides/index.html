@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="A five-minute, diagram-first introduction to Claude Channels and multi-client extensibility with ahp-channels.">
+  <title>ahp-channels | Hackathon</title>
+  <style>
+    :root {
+      --background: #080d16;
+      --surface: #101d2c;
+      --inset: #0c1522;
+      --line: #2c4057;
+      --text: #eff5fc;
+      --muted: #a6b8ce;
+      --teal: #70e4cc;
+      --violet: #baa9ff;
+      --blue: #73bdff;
+      --orange: #edac8d;
+      font-family: "Segoe UI", Inter, ui-sans-serif, system-ui, sans-serif;
+      color: var(--text);
+      background: var(--background);
+    }
+
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; min-height: 100svh; display: grid; grid-template-rows: 1fr 60px; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    button { font: inherit; }
+    a { color: inherit; text-underline-offset: 4px; }
+    :focus-visible { outline: 3px solid var(--teal); outline-offset: 5px; }
+    .symbols { position: absolute; width: 0; height: 0; overflow: hidden; }
+    .stage {
+      position: relative;
+      width: min(100vw, calc((100svh - 60px) * 16 / 9));
+      aspect-ratio: 16 / 9;
+      align-self: center;
+      justify-self: center;
+      container-type: inline-size;
+      overflow: hidden;
+      isolation: isolate;
+      background:
+        radial-gradient(ellipse at 92% 0%, #22495838, transparent 55%),
+        radial-gradient(ellipse at 0% 100%, #29224938, transparent 55%),
+        #0b1320;
+      border: 1px solid #253549;
+      box-shadow: 0 24px 100px #0005;
+    }
+    .stage::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      background-image: radial-gradient(#abc5e317 1px, transparent 1px);
+      background-size: 24px 24px;
+      mask-image: linear-gradient(transparent, #000 45%, transparent);
+    }
+    .slide {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      padding: 2.8cqw 4.4cqw 2.2cqw;
+      animation: appear 180ms ease-out;
+    }
+    .masthead { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+    .brand { display: inline-flex; align-items: center; gap: .75cqw; font-size: 1.12cqw; font-weight: 650; letter-spacing: -.02em; }
+    .brand svg { width: 1.9cqw; height: 1.9cqw; color: var(--teal); }
+    .chapter { color: var(--muted); font: 500 .93cqw/1.4 "Cascadia Code", Consolas, monospace; letter-spacing: .11em; text-transform: uppercase; }
+    h1 { margin: 1.7cqw 0 0; font-size: 4cqw; line-height: 1.08; font-weight: 650; letter-spacing: -.045em; }
+    h1 em { font-style: normal; color: var(--teal); }
+    .slide:first-of-type h1 em { color: var(--orange); }
+    .visual { flex: 1; min-height: 0; width: 100%; margin: .8cqw 0 0; }
+    .visual > svg { display: block; width: 100%; height: 100%; }
+    .takeaway {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1.5cqw;
+      min-height: 3.7cqw;
+      padding-top: 1cqw;
+      margin-top: .6cqw;
+      border-top: 1px solid var(--line);
+      font-size: 1.6cqw;
+      letter-spacing: -.025em;
+    }
+    .takeaway strong { color: var(--teal); font-weight: 600; }
+    .detail { color: var(--muted); font-size: 1.04cqw; letter-spacing: 0; }
+    .legend { display: flex; gap: 1.3cqw; align-items: center; }
+    .legend span { display: inline-flex; gap: .5cqw; align-items: center; }
+    .swatch { display: inline-block; width: .55cqw; height: .55cqw; border-radius: 50%; background: var(--teal); }
+    .swatch.violet { background: var(--violet); }
+    .swatch.blue { background: var(--blue); }
+    svg { font-family: inherit; }
+    svg text { fill: var(--text); }
+    .panel { fill: var(--surface); stroke: var(--line); stroke-width: 2; }
+    .inset { fill: var(--inset); stroke: var(--line); stroke-width: 1.5; }
+    .teal-panel { fill: #10272a; stroke: #376a63; stroke-width: 2; }
+    .orange-panel { fill: #291f20; stroke: #775448; stroke-width: 2; }
+    .blue-panel { fill: #12263c; stroke: #41698c; stroke-width: 2; }
+    .violet-panel { fill: #25203b; stroke: #685984; stroke-width: 2; }
+    .eyebrow { font-size: 17px; font-weight: 650; letter-spacing: 2px; }
+    .node-title { font-size: 32px; font-weight: 650; letter-spacing: -.7px; }
+    .node-label { font-size: 24px; font-weight: 500; }
+    .caption { font-size: 19px; fill: var(--muted); }
+    .mono { font-family: "Cascadia Code", Consolas, ui-monospace, monospace; font-size: 21px; }
+    .teal-text { fill: var(--teal); }
+    .violet-text { fill: var(--violet); }
+    .blue-text { fill: var(--blue); }
+    .orange-text { fill: var(--orange); }
+    .muted-text { fill: var(--muted); }
+    .wire { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+    .teal-wire { stroke: var(--teal); }
+    .violet-wire { stroke: var(--violet); }
+    .blue-wire { stroke: var(--blue); }
+    .subtle-wire { stroke: #5e738b; stroke-width: 2; }
+    .dashed { stroke-dasharray: 7 8; }
+    .icon { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .install-visual { display: flex; flex-direction: column; justify-content: center; padding-top: 1.7cqw; }
+    .install-options { display: grid; grid-template-columns: 1fr 1fr; gap: 3cqw; }
+    .install-card {
+      display: block;
+      padding: 1.8cqw 2.2cqw;
+      border: 1px solid var(--line);
+      border-radius: 1.4cqw;
+      background: #101d2cf2;
+      text-decoration: none;
+      transition: border-color 150ms, background 150ms;
+    }
+    .install-card:hover { border-color: var(--teal); background: #142b34; }
+    .install-card.market:hover { border-color: var(--blue); background: #15283e; }
+    .install-top { display: flex; justify-content: space-between; align-items: center; }
+    .install-icon { width: 3.3cqw; height: 3.3cqw; color: var(--orange); }
+    .market .install-icon { color: var(--blue); }
+    .install-tag { font: 500 .85cqw "Cascadia Code", Consolas, monospace; color: var(--muted); letter-spacing: .1em; text-transform: uppercase; }
+    .install-card h2 { font-size: 2.5cqw; font-weight: 650; letter-spacing: -.045em; margin: 1.1cqw 0 1.2cqw; }
+    .install-card code, .search {
+      display: flex;
+      align-items: center;
+      gap: .8cqw;
+      min-height: 3.8cqw;
+      padding: .75cqw 1cqw;
+      background: var(--inset);
+      border: 1px solid var(--line);
+      border-radius: .6cqw;
+      font: 400 1.35cqw/1.4 "Cascadia Code", Consolas, monospace;
+    }
+    .install-card code { color: var(--teal); white-space: nowrap; }
+    .search svg { width: 1.4cqw; height: 1.4cqw; color: var(--blue); }
+    .install-note { display: block; font-size: 1cqw; color: var(--muted); margin-top: 1cqw; }
+    .install-visual > svg { height: 10.5cqw; flex: 0 0 auto; }
+    .controls { display: flex; align-items: center; justify-content: center; gap: 18px; padding: 10px 16px; color: var(--muted); }
+    .controls button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #2b3d52;
+      border-radius: 8px;
+      height: 34px;
+      padding: 0 11px;
+      color: var(--text);
+      background: #0e1927;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .controls button:hover:not(:disabled) { background: #1c3042; }
+    .controls button:disabled { opacity: .35; cursor: default; }
+    .controls button[aria-expanded="true"] { border-color: var(--teal); }
+    .controls svg { width: 16px; height: 16px; }
+    .steps { display: flex; gap: 7px; }
+    .steps button { width: 32px; padding: 0; border: 0; background: transparent; }
+    .steps button::after { content: ""; width: 25px; height: 4px; border-radius: 4px; background: #354962; }
+    .steps button[aria-current="step"]::after { background: var(--teal); }
+    .keyboard-hint { font-size: 12px; }
+    .notes {
+      position: fixed;
+      z-index: 5;
+      bottom: 68px;
+      right: 24px;
+      width: min(580px, calc(100vw - 48px));
+      padding: 24px 28px;
+      background: #152236;
+      border: 1px solid #607089;
+      border-radius: 16px;
+      box-shadow: 0 18px 60px #0008;
+      font-size: 16px;
+      line-height: 1.5;
+    }
+    .notes h2 { font-size: 16px; color: var(--teal); margin: 0 0 12px; }
+    .notes ul { margin: 0; padding-left: 19px; }
+    .notes li + li { margin-top: 8px; }
+    .notes small { display: block; margin-top: 14px; color: var(--muted); }
+    .notice { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 10; padding: 12px 18px; background: #352323; border: 1px solid var(--orange); border-radius: 8px; max-width: 90vw; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+    @keyframes appear { from { opacity: 0; } to { opacity: 1; } }
+    @media (max-width: 650px) {
+      .keyboard-hint { display: none; }
+      .controls { gap: 9px; }
+      .notes { font-size: 14px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+    @page { size: 16in 9in; margin: 0; }
+    @media print {
+      html, body { display: block; min-height: 0; background: #0b1320; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      .stage { width: 100%; aspect-ratio: auto; overflow: visible; border: 0; box-shadow: none; }
+      .slide, .slide[hidden] { display: flex !important; position: relative; aspect-ratio: 16 / 9; break-after: page; }
+      .slide:last-child { break-after: auto; }
+      .controls, .notes, .notice, .sr-only { display: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <svg class="symbols" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <symbol id="link-icon" viewBox="0 0 32 32">
+        <path class="icon" d="M13 10H9a6 6 0 0 0 0 12h5m5-12h4a6 6 0 0 1 0 12h-5M10 16h12"/>
+      </symbol>
+      <symbol id="chat-icon" viewBox="0 0 32 32">
+        <path class="icon" d="M8 5h16a5 5 0 0 1 5 5v10a5 5 0 0 1-5 5H13l-7 5v-6a5 5 0 0 1-3-4V10a5 5 0 0 1 5-5Z"/>
+        <path class="icon" d="M10 13h12m-12 6h8"/>
+      </symbol>
+      <symbol id="terminal-icon" viewBox="0 0 32 32">
+        <rect class="icon" x="2" y="4" width="28" height="24" rx="5"/>
+        <path class="icon" d="m8 11 5 5-5 5m10 0h6"/>
+      </symbol>
+      <symbol id="editor-icon" viewBox="0 0 32 32">
+        <rect class="icon" x="2" y="3" width="28" height="26" rx="4"/>
+        <path class="icon" d="M2 10h28M10 10v19m7-14-3 4 3 4m6-8 3 4-3 4"/>
+      </symbol>
+      <symbol id="tool-icon" viewBox="0 0 32 32">
+        <path class="icon" d="M20 4a8 8 0 0 0-9 10L3 22a4 4 0 0 0 6 6l8-8A8 8 0 0 0 28 9l-6 6-5-5 6-6Z"/>
+      </symbol>
+      <symbol id="skill-icon" viewBox="0 0 32 32">
+        <path class="icon" d="M19 3H7a3 3 0 0 0-3 3v22h24V12L19 3Zm0 0v9h9M10 18h12m-12 5h8"/>
+      </symbol>
+      <symbol id="plane-icon" viewBox="0 0 32 32">
+        <path class="icon" d="m3 14 26-10-8 25-7-9-11-6Zm11 6L29 4"/>
+      </symbol>
+      <symbol id="gamepad-icon" viewBox="0 0 32 32">
+        <path class="icon" d="M10 8h12a6 6 0 0 1 6 5l2 11a3 3 0 0 1-5 3l-5-5h-8l-5 5a3 3 0 0 1-5-3l2-11a6 6 0 0 1 6-5Z"/>
+        <path class="icon" d="M8 15h6m-3-3v6m11-4h.1m3 4h.1"/>
+      </symbol>
+      <symbol id="search-icon" viewBox="0 0 32 32">
+        <circle class="icon" cx="13" cy="13" r="9"/>
+        <path class="icon" d="m20 20 9 9"/>
+      </symbol>
+      <symbol id="arrow-icon" viewBox="0 0 24 24">
+        <path class="icon" d="M4 12h16m-6-6 6 6-6 6"/>
+      </symbol>
+      <symbol id="fullscreen-icon" viewBox="0 0 24 24">
+        <path class="icon" d="M9 3H3v6m12-6h6v6M3 15v6h6m6 0h6v-6"/>
+      </symbol>
+      <marker id="arrow-teal" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+        <path d="m2 2 8 4-8 4" fill="none" stroke="#70e4cc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </marker>
+      <marker id="arrow-violet" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+        <path d="m2 2 8 4-8 4" fill="none" stroke="#baa9ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </marker>
+      <marker id="arrow-blue" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+        <path d="m2 2 8 4-8 4" fill="none" stroke="#73bdff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </marker>
+    </defs>
+  </svg>
+
+  <main class="stage" aria-label="ahp-channels hackathon presentation">
+    <section class="slide" id="channels" aria-labelledby="channels-title" data-title="Claude Channels">
+      <div class="masthead">
+        <span class="brand"><svg aria-hidden="true"><use href="#link-icon"/></svg>ahp-channels</span>
+        <span class="chapter">01 / Claude Channels</span>
+      </div>
+      <h1 id="channels-title">An <em>inbox</em> for your agent.</h1>
+      <figure class="visual">
+        <svg viewBox="0 0 1440 465" role="img" aria-labelledby="channels-diagram-title channels-diagram-description">
+          <title id="channels-diagram-title">Claude Channels: messages in, tool-based replies out</title>
+          <desc id="channels-diagram-description">Discord or Telegram sends a message to a channel plugin's MCP server. The server pushes a notification into an existing Claude Code session. Claude calls the plugin's reply tool to respond. The plugin also supplies configure and access skills.</desc>
+
+          <rect x="22" y="96" width="270" height="284" rx="24" class="panel"/>
+          <text x="49" y="132" class="eyebrow muted-text">CHAT APPS</text>
+          <rect x="44" y="158" width="226" height="82" rx="16" class="inset"/>
+          <use href="#gamepad-icon" x="62" y="181" width="36" height="36" style="color:var(--violet)"/>
+          <text x="114" y="208" class="node-label">Discord</text>
+          <rect x="44" y="257" width="226" height="82" rx="16" class="inset"/>
+          <use href="#plane-icon" x="62" y="280" width="36" height="36" style="color:var(--blue)"/>
+          <text x="114" y="307" class="node-label">Telegram</text>
+
+          <path d="M292 199H455" class="wire teal-wire" marker-end="url(#arrow-teal)"/>
+          <text x="373" y="178" text-anchor="middle" class="caption teal-text">message</text>
+          <path d="M455 298H292" class="wire violet-wire" marker-end="url(#arrow-violet)"/>
+          <text x="373" y="329" text-anchor="middle" class="caption violet-text">reply</text>
+
+          <rect x="455" y="65" width="407" height="344" rx="24" class="orange-panel"/>
+          <text x="484" y="108" class="eyebrow orange-text">CHANNEL PLUGIN</text>
+          <text x="484" y="161" class="node-title">MCP server</text>
+          <text x="484" y="193" class="caption">pushes events into the session</text>
+          <path d="M484 218H833" class="wire subtle-wire"/>
+          <use href="#tool-icon" x="486" y="242" width="29" height="29" style="color:var(--teal)"/>
+          <text x="531" y="265" class="mono teal-text">reply()  react()</text>
+          <rect x="481" y="310" width="355" height="69" rx="14" fill="#211d30" stroke="#796184"/>
+          <use href="#skill-icon" x="497" y="330" width="29" height="29" style="color:var(--violet)"/>
+          <text x="542" y="352" class="mono violet-text">configure / access</text>
+
+          <path d="M862 165H1061" class="wire teal-wire" marker-end="url(#arrow-teal)"/>
+          <text x="961" y="142" text-anchor="middle" class="caption teal-text">MCP notification</text>
+          <path d="M1061 255H862" class="wire violet-wire" marker-end="url(#arrow-violet)"/>
+          <text x="961" y="285" text-anchor="middle" class="caption violet-text">tool call</text>
+          <path d="M862 346H1061" class="wire violet-wire dashed" marker-end="url(#arrow-violet)"/>
+          <text x="961" y="379" text-anchor="middle" class="caption violet-text">plugin skills</text>
+
+          <rect x="1061" y="65" width="357" height="344" rx="24" class="panel"/>
+          <use href="#terminal-icon" x="1088" y="91" width="35" height="35" style="color:var(--orange)"/>
+          <text x="1136" y="118" class="node-title">Claude Code</text>
+          <text x="1090" y="155" class="caption">existing conversation</text>
+          <rect x="1086" y="186" width="256" height="49" rx="14" fill="#183c38"/>
+          <text x="1105" y="218" class="mono teal-text">incoming message</text>
+          <rect x="1134" y="252" width="258" height="49" rx="14" fill="#2a2540"/>
+          <text x="1156" y="284" class="mono violet-text">reply through tool</text>
+          <circle cx="1097" cy="357" r="5" fill="#70e4cc"/>
+          <text x="1114" y="363" class="caption">same session, new input</text>
+        </svg>
+      </figure>
+      <div class="takeaway">
+        <span>Push messages in. <strong>Call tools to reply.</strong></span>
+        <span class="detail">The plugin owns auth, pairing, and delivery.</span>
+      </div>
+    </section>
+
+    <section class="slide" id="architecture" aria-labelledby="architecture-title" data-title="Multi-client AHP architecture" hidden>
+      <div class="masthead">
+        <span class="brand"><svg aria-hidden="true"><use href="#link-icon"/></svg>ahp-channels</span>
+        <span class="chapter">02 / The hack</span>
+      </div>
+      <h1 id="architecture-title">A client can add <em>capabilities.</em></h1>
+      <figure class="visual">
+        <svg viewBox="0 0 1440 520" role="img" aria-labelledby="architecture-diagram-title architecture-diagram-description">
+          <title id="architecture-diagram-title">Two AHP clients extend one Agent Host session</title>
+          <desc id="architecture-diagram-description">An unchanged Claude channel plugin connects by MCP to ahp-channels. The daemon creates an AHP client for each channel. That client forwards messages, publishes proxy tools, and contributes the plugin customization so its skills become available. A VS Code client connects to the same Agent Host session. Both clients contribute to one conversation; the channel tools route back to the channel plugin, not a second host-launched MCP server.</desc>
+
+          <rect x="1040" y="15" width="372" height="88" rx="20" class="blue-panel"/>
+          <use href="#editor-icon" x="1065" y="38" width="39" height="39" style="color:var(--blue)"/>
+          <text x="1119" y="53" class="eyebrow blue-text">CLIENT 01</text>
+          <text x="1119" y="82" class="node-label">VS Code</text>
+          <path d="M1226 103V170" class="wire blue-wire" marker-start="url(#arrow-blue)" marker-end="url(#arrow-blue)"/>
+          <text x="1250" y="145" class="caption blue-text">AHP</text>
+
+          <text x="27" y="175" class="caption">Discord / Telegram</text>
+          <rect x="18" y="200" width="254" height="225" rx="23" class="orange-panel"/>
+          <use href="#chat-icon" x="44" y="224" width="39" height="39" style="color:var(--orange)"/>
+          <text x="44" y="306" class="node-title">Channel</text>
+          <text x="44" y="344" class="node-title">plugin</text>
+          <text x="44" y="394" class="caption orange-text">unchanged</text>
+
+          <rect x="329" y="137" width="581" height="340" rx="26" fill="#11272b55" stroke="#41736b" stroke-width="2" stroke-dasharray="8 7"/>
+          <text x="356" y="178" class="eyebrow teal-text">ahp-channels</text>
+          <text x="880" y="178" text-anchor="end" class="caption">daemon</text>
+          <path d="M272 261H538" class="wire teal-wire" marker-end="url(#arrow-teal)"/>
+          <text x="405" y="239" text-anchor="middle" class="caption teal-text">MCP events</text>
+          <path d="M538 368H272" class="wire violet-wire" marker-end="url(#arrow-violet)"/>
+          <text x="405" y="400" text-anchor="middle" class="caption violet-text">MCP tool calls</text>
+          <rect x="538" y="208" width="345" height="241" rx="22" class="teal-panel"/>
+          <text x="564" y="244" class="eyebrow teal-text">CLIENT 02</text>
+          <text x="564" y="291" class="node-title">AHP client</text>
+          <text x="564" y="321" class="caption">one per channel</text>
+          <rect x="560" y="342" width="135" height="74" rx="13" fill="#133a35" stroke="#427b70"/>
+          <use href="#tool-icon" x="576" y="355" width="26" height="26" style="color:var(--teal)"/>
+          <text x="576" y="402" class="mono teal-text">tools</text>
+          <rect x="711" y="342" width="150" height="74" rx="13" fill="#29223e" stroke="#746491"/>
+          <use href="#skill-icon" x="727" y="355" width="26" height="26" style="color:var(--violet)"/>
+          <text x="727" y="402" class="mono violet-text">plugin</text>
+
+          <text x="971" y="253" text-anchor="middle" class="eyebrow muted-text">AHP</text>
+          <path d="M883 296H1031" class="wire teal-wire" marker-end="url(#arrow-teal)"/>
+          <text x="970" y="327" text-anchor="middle" class="caption teal-text">proxy tools</text>
+          <path d="M883 387H1031" class="wire violet-wire" marker-end="url(#arrow-violet)"/>
+          <text x="970" y="422" text-anchor="middle" class="caption violet-text">plugin skills</text>
+
+          <rect x="1032" y="170" width="388" height="307" rx="26" class="panel"/>
+          <text x="1061" y="207" class="eyebrow muted-text">AGENT HOST</text>
+          <rect x="1057" y="230" width="338" height="222" rx="21" class="inset"/>
+          <text x="1081" y="277" class="node-title">One session</text>
+          <rect x="1080" y="299" width="291" height="47" rx="12" class="blue-panel"/>
+          <use href="#chat-icon" x="1093" y="310" width="26" height="26" style="color:var(--blue)"/>
+          <text x="1132" y="330" class="caption blue-text">shared conversation</text>
+          <rect x="1080" y="369" width="138" height="54" rx="12" fill="#133a35"/>
+          <text x="1149" y="404" text-anchor="middle" class="mono teal-text">tools</text>
+          <rect x="1233" y="369" width="138" height="54" rx="12" fill="#29223e"/>
+          <text x="1302" y="404" text-anchor="middle" class="mono violet-text">skills</text>
+          <text x="618" y="508" text-anchor="middle" class="caption">messages + tools + plugin customizations</text>
+        </svg>
+      </figure>
+      <div class="takeaway">
+        <span><strong>Multi-client</strong> is an extensibility model.</span>
+        <span class="detail legend">
+          <span><i class="swatch blue"></i>editor</span>
+          <span><i class="swatch"></i>tools</span>
+          <span><i class="swatch violet"></i>skills</span>
+        </span>
+      </div>
+    </section>
+
+    <section class="slide" id="install" aria-labelledby="install-title" data-title="Get ahp-channels" hidden>
+      <div class="masthead">
+        <span class="brand"><svg aria-hidden="true"><use href="#link-icon"/></svg>ahp-channels</span>
+        <span class="chapter">03 / Try it</span>
+      </div>
+      <h1 id="install-title">Two ways in. <em>One bridge.</em></h1>
+      <div class="visual install-visual" role="group" aria-label="npm and the VS Code Marketplace are two control surfaces for the same channel daemon">
+        <div class="install-options">
+          <a class="install-card" href="https://www.npmjs.com/package/ahp-channels" target="_blank" rel="noopener noreferrer" aria-label="Get the ahp-channels CLI on npm">
+            <div class="install-top">
+              <svg class="install-icon" aria-hidden="true"><use href="#terminal-icon"/></svg>
+              <span class="install-tag">Terminal</span>
+            </div>
+            <h2>npm</h2>
+            <code>npm install -g ahp-channels</code>
+            <span class="install-note">CLI + bundled VSIX</span>
+          </a>
+          <a class="install-card market" href="https://marketplace.visualstudio.com/items?itemName=tylerleonhardt.ahp-channels-vscode" target="_blank" rel="noopener noreferrer" aria-label="Find AHP Channels on the VS Code Marketplace">
+            <div class="install-top">
+              <svg class="install-icon" aria-hidden="true"><use href="#editor-icon"/></svg>
+              <span class="install-tag">VS Code</span>
+            </div>
+            <h2>Marketplace</h2>
+            <div class="search"><svg aria-hidden="true"><use href="#search-icon"/></svg>AHP Channels</div>
+            <span class="install-note">Runtime included. No CLI install.</span>
+          </a>
+        </div>
+        <svg viewBox="0 0 1440 165" role="img" aria-labelledby="install-diagram-title">
+          <title id="install-diagram-title">The CLI and VS Code extension manage the same daemon, channels, and sessions</title>
+          <path d="M349 0V38Q349 54 366 54H688Q704 54 704 70V95" class="wire teal-wire" marker-end="url(#arrow-teal)"/>
+          <path d="M1091 0V38Q1091 54 1074 54H752Q736 54 736 70V95" class="wire blue-wire" marker-end="url(#arrow-blue)"/>
+          <rect x="369" y="97" width="702" height="66" rx="19" class="teal-panel"/>
+          <use href="#link-icon" x="397" y="112" width="36" height="36" style="color:var(--teal)"/>
+          <text x="461" y="140" class="node-label">Same daemon. Same channels. Same sessions.</text>
+        </svg>
+      </div>
+      <div class="takeaway">
+        <span>Pick a session. <strong>Bring your channels.</strong></span>
+        <a class="detail" href="https://github.com/TylerLeonhardt/ahp-channels" target="_blank" rel="noopener noreferrer">github.com/TylerLeonhardt/ahp-channels</a>
+      </div>
+    </section>
+  </main>
+
+  <nav class="controls" aria-label="Presentation controls">
+    <button id="previous" type="button" title="Previous slide (Left arrow)" aria-label="Previous slide" disabled><svg aria-hidden="true" style="transform:rotate(180deg)"><use href="#arrow-icon"/></svg></button>
+    <div class="steps" aria-label="Slides">
+      <button type="button" data-slide="channels" aria-label="Slide 1: Claude Channels" aria-current="step"></button>
+      <button type="button" data-slide="architecture" aria-label="Slide 2: Multi-client AHP architecture"></button>
+      <button type="button" data-slide="install" aria-label="Slide 3: Get ahp-channels"></button>
+    </div>
+    <button id="next" type="button" title="Next slide (Right arrow or Space)" aria-label="Next slide"><svg aria-hidden="true"><use href="#arrow-icon"/></svg></button>
+    <span class="keyboard-hint">Arrows to navigate</span>
+    <button id="toggle-notes" type="button" aria-controls="speaker-notes" aria-expanded="false" title="Toggle speaker notes (N)">Notes <span aria-hidden="true">&nbsp;N</span></button>
+    <button id="fullscreen" type="button" title="Toggle fullscreen (F)" aria-label="Toggle fullscreen"><svg aria-hidden="true"><use href="#fullscreen-icon"/></svg></button>
+  </nav>
+
+  <aside class="notes" id="speaker-notes" aria-label="Speaker notes" hidden>
+    <div data-notes="channels">
+      <h2>01 / Claude Channels &middot; 1:15</h2>
+      <ul>
+        <li>Start with something familiar: message a bot in Discord or Telegram, and it reaches an agent conversation that is already running.</li>
+        <li>A channel is an MCP server that can push events. Replies are tool calls back through that server, not just text printed in the editor.</li>
+        <li>The plugin also contains setup and access skills. It owns credentials, pairing, and platform behavior.</li>
+        <li>Transition: what if we kept those plugins, but connected them to an AHP session instead?</li>
+      </ul>
+      <small>Reference: <a href="https://code.claude.com/docs/en/channels" target="_blank" rel="noopener noreferrer">Claude Code channels documentation</a>. Channels are a research-preview feature in Claude Code.</small>
+    </div>
+    <div data-notes="architecture" hidden>
+      <h2>02 / Multi-client extensibility &middot; 2:30</h2>
+      <ul>
+        <li>Read left to right: the existing plugin talks MCP to our daemon. The daemon creates an AHP client for each named channel and attaches it to an existing session.</li>
+        <li>The interesting part is registration: the client contributes proxy tools AND a plugin customization. The host discovers the plugin's skills; they are not MCP tools.</li>
+        <li>Tool calls route back to the owning channel client and its MCP process. We disable the plugin's host-side MCP server to avoid launching a duplicate bot.</li>
+        <li>The VS Code client stays connected to the same session. The channel client adds capabilities without replacing that UI or creating a second conversation.</li>
+        <li>Punchline: a protocol client is not only a chat front end. Multi-client AHP can be an extensibility model.</li>
+      </ul>
+      <small>Implementation: bridge.ts publishes the active client's tools and customizations; plugins.ts creates the plugin contribution.</small>
+    </div>
+    <div data-notes="install" hidden>
+      <h2>03 / Try it &middot; 1:15</h2>
+      <ul>
+        <li>Choose the terminal or the VS Code extension. They manage the same daemon and state directory.</li>
+        <li>The VSIX bundles the bridge runtime, so the extension does not need a separate CLI installation.</li>
+        <li>Install a channel plugin, pick an existing local Agent Host session, and complete the plugin's setup and pairing. A supported host, Git, and the plugin runtime (currently Bun for Discord/Telegram) are prerequisites.</li>
+        <li>Close with the takeaway: new client, new capabilities, same conversation.</li>
+      </ul>
+      <small>Release cue: the npm-distributed VSIX starts with the next npm release containing the extension. The Marketplace link becomes available after the manual Marketplace upload.</small>
+    </div>
+  </aside>
+  <div id="announcement" class="sr-only" aria-live="polite"></div>
+  <div id="notice" class="notice" role="status" hidden></div>
+  <noscript><p>This deck uses JavaScript for navigation. Enable JavaScript to present it, or print this page to see all three slides.</p></noscript>
+
+  <script>
+    "use strict";
+
+    const slides = Array.from(document.querySelectorAll(".slide"));
+    const steps = Array.from(document.querySelectorAll("[data-slide]"));
+    const notes = document.getElementById("speaker-notes");
+    const notesButton = document.getElementById("toggle-notes");
+    const previous = document.getElementById("previous");
+    const next = document.getElementById("next");
+    const notice = document.getElementById("notice");
+
+    function currentIndex() {
+      const index = slides.findIndex(slide => `#${slide.id}` === location.hash);
+      return Math.max(0, index);
+    }
+
+    function renderSlide() {
+      const index = currentIndex();
+      const active = slides[index];
+      slides.forEach(slide => { slide.hidden = slide !== active; });
+      steps.forEach(step => {
+        if (step.dataset.slide === active.id) step.setAttribute("aria-current", "step");
+        else step.removeAttribute("aria-current");
+      });
+      document.querySelectorAll("[data-notes]").forEach(note => {
+        note.hidden = note.dataset.notes !== active.id;
+      });
+      previous.disabled = index === 0;
+      next.disabled = index === slides.length - 1;
+      document.title = `${index + 1} / ${slides.length} - ${active.dataset.title} | ahp-channels`;
+      document.getElementById("announcement").textContent = `Slide ${index + 1} of ${slides.length}: ${active.dataset.title}`;
+    }
+
+    function navigate(offset) {
+      const index = Math.max(0, Math.min(slides.length - 1, currentIndex() + offset));
+      location.hash = slides[index].id;
+    }
+
+    function toggleNotes() {
+      notes.hidden = !notes.hidden;
+      notesButton.setAttribute("aria-expanded", String(!notes.hidden));
+    }
+
+    async function toggleFullscreen() {
+      try {
+        if (document.fullscreenElement) {
+          await document.exitFullscreen();
+        } else {
+          if (!document.fullscreenEnabled) throw new Error("Fullscreen is unavailable in this browser.");
+          await document.documentElement.requestFullscreen();
+        }
+        notice.hidden = true;
+      } catch (error) {
+        console.error("Presentation fullscreen failed", error);
+        notice.textContent = "Fullscreen is unavailable here. Use your browser's fullscreen command instead.";
+        notice.hidden = false;
+      }
+    }
+
+    previous.addEventListener("click", () => navigate(-1));
+    next.addEventListener("click", () => navigate(1));
+    steps.forEach(step => step.addEventListener("click", () => { location.hash = step.dataset.slide; }));
+    notesButton.addEventListener("click", toggleNotes);
+    document.getElementById("fullscreen").addEventListener("click", toggleFullscreen);
+    window.addEventListener("hashchange", renderSlide);
+    document.addEventListener("keydown", event => {
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (event.target instanceof Element && event.target.closest("input, textarea, select, [contenteditable]")) return;
+      if (event.key === " " && event.target instanceof Element && event.target.closest("button, a")) return;
+      switch (event.key) {
+        case "ArrowRight":
+        case "PageDown":
+        case " ":
+          event.preventDefault();
+          navigate(1);
+          break;
+        case "ArrowLeft":
+        case "PageUp":
+          event.preventDefault();
+          navigate(-1);
+          break;
+        case "Home":
+          event.preventDefault();
+          location.hash = slides[0].id;
+          break;
+        case "End":
+          event.preventDefault();
+          location.hash = slides[slides.length - 1].id;
+          break;
+        case "n":
+        case "N":
+          event.preventDefault();
+          toggleNotes();
+          break;
+        case "f":
+        case "F":
+          event.preventDefault();
+          void toggleFullscreen();
+          break;
+        case "Escape":
+          notes.hidden = true;
+          notesButton.setAttribute("aria-expanded", "false");
+          notice.hidden = true;
+          break;
+      }
+    });
+
+    if (location.hash && !slides.some(slide => `#${slide.id}` === location.hash)) {
+      notice.textContent = "Unknown slide link. Showing the first slide.";
+      notice.hidden = false;
+    }
+    renderSlide();
+  </script>
+</body>
+</html>
