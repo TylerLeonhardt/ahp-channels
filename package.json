@@ -26,6 +26,7 @@
   },
   "files": [
     "dist",
+    "vscode-extension/*.vsix",
     "LICENSE",
     "PUBLISHING.md",
     "README.md",
@@ -34,9 +35,10 @@
   ],
   "scripts": {
     "prebuild": "node scripts/sync-version.mjs --check",
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "build": "tsc -p tsconfig.json && npm run vscode:bundle",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json && tsc -p vscode-extension/tsconfig.json --noEmit",
     "test": "node --test --import tsx test/*.test.ts",
+    "test:vscode": "npm run vscode:bundle && node scripts/smoke-vscode-extension.cjs",
     "test:package": "tsx scripts/package-smoke.ts",
     "e2e:local": "tsx scripts/e2e-local.ts",
     "e2e:daemon": "npm run build && tsx scripts/e2e-daemon-local.ts",
@@ -44,8 +46,10 @@
     "e2e:handoff": "npm run build && tsx scripts/e2e-handoff.ts",
     "e2e:permissions": "npm run build && tsx scripts/e2e-fakechat.ts --permissions",
     "e2e:attachments": "npm run build && tsx scripts/e2e-fakechat.ts --attachments",
-    "check": "npm run typecheck && npm test && npm run build",
-    "prepack": "npm run build",
+    "check": "npm run typecheck && npm test && npm run build && npm run test:vscode",
+    "vscode:bundle": "node scripts/build-vscode-extension.mjs",
+    "vscode:package": "npm run vscode:bundle && cd vscode-extension && vsce package --no-dependencies",
+    "prepack": "npm run build && npm run vscode:package",
     "version": "node scripts/sync-version.mjs"
   },
   "engines": {
@@ -66,7 +70,10 @@
   "devDependencies": {
     "@types/node": "^24.7.2",
     "@types/proper-lockfile": "^4.1.4",
+    "@types/vscode": "^1.95.0",
     "@types/ws": "^8.18.1",
+    "@vscode/vsce": "^3.6.0",
+    "esbuild": "^0.27.2",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }

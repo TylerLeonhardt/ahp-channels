@@ -141,6 +141,24 @@ The CLI stores configuration under `~/.ahp-channels` by default. Override this
 with `AHP_CHANNELS_HOME`, and use the same value for every command that manages
 that installation. Use a persistent location for a channel you intend to keep.
 
+## VS Code extension
+
+The npm package includes a VS Code extension for managing the daemon, installing
+plugins, creating and controlling channels, and selecting their AHP sessions.
+Install the bundled extension with:
+
+```powershell
+ahp-channels vscode install
+```
+
+Open the AHP Channels view from the Activity Bar. Session rows support
+**Point Channel Here** from their context menu, and channel rows support
+**Select Session**. Start or stop channels using their hover controls or
+right-click menu; Stop and Restart remain available for channels reporting
+errors. All actions are also available from the Command Palette.
+Use `ahpChannels.home` in VS Code settings when the
+extension should use a state directory other than `~/.ahp-channels`.
+
 Installed marketplace plugins are copied into content-addressed directories
 under `~/.ahp-channels/plugins/<marketplace>/<plugin>/<sha256>`. Marketplace
 checkouts remain source catalogs; channel processes and contributed

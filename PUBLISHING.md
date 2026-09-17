@@ -12,6 +12,11 @@ The workflow publishes the version already committed in `package.json`; it
 never bumps versions itself and rejects release commits that are not on
 `main`.
 
+The `prepack` lifecycle also builds
+`vscode-extension/ahp-channels-vscode-<version>.vsix` and includes it in the
+npm tarball. `npm version` keeps the extension manifest version synchronized
+with the package version.
+
 ## Trusted publishing configuration
 
 The package is already bootstrapped on npm. Its trusted publisher is configured
@@ -112,6 +117,8 @@ The workflow:
 2. Rejects a tag that differs from `package.json`.
 3. Runs type checking, unit tests, and the build.
 4. Installs and exercises the packed npm artifact.
-5. Rejects versions already present on npm.
-6. Publishes through npm OIDC trusted publishing.
-7. Creates a matching GitHub Release with the appropriate prerelease/latest flag.
+5. Verifies the bundled VS Code extension is addressable through
+   `ahp-channels vscode path`.
+6. Rejects versions already present on npm.
+7. Publishes through npm OIDC trusted publishing.
+8. Creates a matching GitHub Release with the appropriate prerelease/latest flag.

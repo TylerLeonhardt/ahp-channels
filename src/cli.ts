@@ -3,6 +3,8 @@
 import { SessionStatus } from '@microsoft/agent-host-protocol';
 import { Command } from 'commander';
 import { isAbsolute, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { AgentHostService, type HostAliasInspection } from './agentHosts.js';
 import { ChannelBindingService } from './channelBindings.js';
@@ -38,6 +40,7 @@ import {
 	type SessionDiscoveryResult,
 } from './sessionCatalog.js';
 import { VERSION } from './version.js';
+import { runProcess } from './process.js';
 
 const program = new Command();
 const store = new ConfigStore();
@@ -287,6 +290,28 @@ daemon
 	.command('logs')
 	.action(() => {
 		console.log(getDaemonPaths(store.home).logFile);
+	});
+
+const vscode = program.command('vscode').description('Manage the bundled VS Code extension');
+vscode
+	.command('path')
+	.description('Print the path to the bundled VS Code extension')
+	.action(() => {
+		console.log(resolveVsCodeExtensionPath());
+	});
+vscode
+	.command('install')
+	.description('Install the bundled VS Code extension')
+	.option('--code <command>', 'VS Code command-line executable', 'code')
+	.option('--force', 'Replace an installed version')
+	.action(async (options: { code: string; force?: boolean }) => {
+		const extensionPath = resolveVsCodeExtensionPath();
+		await runProcess(options.code, [
+			'--install-extension',
+			extensionPath,
+			...(options.force ? ['--force'] : []),
+		]);
+		console.log(`Installed AHP Channels VS Code extension from ${extensionPath}`);
 	});
 
 const channel = program.command('channel').description('Run channel compatibility bridges');
@@ -786,6 +811,17 @@ function assertChannelName(name: string): void {
 	if (!isValidChannelInstanceName(name)) {
 		throw new Error(`Invalid channel name '${name}'`);
 	}
+}
+
+function resolveVsCodeExtensionPath(): string {
+	const extensionPath = fileURLToPath(new URL(
+		`../vscode-extension/ahp-channels-vscode-${VERSION}.vsix`,
+		import.meta.url,
+	));
+	if (!existsSync(extensionPath)) {
+		throw new Error('Bundled VS Code extension was not found; install ahp-channels from npm or run npm run vscode:package');
+	}
+	return extensionPath;
 }
 
 function offlineChannelStatuses(config: AppConfig): ChannelDaemonStatus[] {

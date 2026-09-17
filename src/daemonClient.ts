@@ -9,6 +9,7 @@ import { FILE_LOCK_OPTIONS } from './lockedFile.js';
 import {
 	DAEMON_PROTOCOL_VERSION,
 	DaemonProtocolError,
+	DaemonProtocolVersionError,
 	MAX_DAEMON_MESSAGE_BYTES,
 	parseDaemonResponse,
 	type DaemonCommandResult,
@@ -92,7 +93,16 @@ export async function probeDaemon(home: string, timeoutMs = 500): Promise<Daemon
 
 export async function ensureDaemonStarted(home: string): Promise<DaemonStatus> {
 	const deadline = Date.now() + 60_000;
-	const running = await probeDaemon(home, 60_000);
+	let running: DaemonStatus | undefined;
+	try {
+		running = await probeDaemon(home, 60_000);
+	} catch (error) {
+		if (!(error instanceof DaemonProtocolVersionError)
+			|| error.actualVersion >= DAEMON_PROTOCOL_VERSION) {
+			throw error;
+		}
+		await stopDaemonVersion(home, error.actualVersion);
+	}
 	if (running) {
 		return running;
 	}
@@ -173,7 +183,17 @@ function launchDaemon(home: string, timeoutMs: number): Promise<DaemonStartupMes
 }
 
 export async function stopDaemon(home: string): Promise<void> {
-	const status = await probeDaemon(home);
+	let status: DaemonStatus | undefined;
+	try {
+		status = await probeDaemon(home);
+	} catch (error) {
+		if (!(error instanceof DaemonProtocolVersionError)
+			|| error.actualVersion >= DAEMON_PROTOCOL_VERSION) {
+			throw error;
+		}
+		await stopDaemonVersion(home, error.actualVersion);
+		return;
+	}
 	if (!status) {
 		return;
 	}
@@ -186,6 +206,68 @@ export async function stopDaemon(home: string): Promise<void> {
 		await new Promise(resolve => setTimeout(resolve, 100));
 	}
 	throw new Error('Daemon did not stop within 30 seconds');
+}
+
+async function stopDaemonVersion(home: string, version: number): Promise<void> {
+	const token = await readDaemonToken(home);
+	if (!token) {
+		return;
+	}
+	try {
+		await requestDaemonVersion(home, token, version, { command: 'shutdown' }, 10_000);
+	} catch (error) {
+		if (!isShutdownDisconnectError(error)) {
+			throw error;
+		}
+	}
+	const deadline = Date.now() + 30_000;
+	while (Date.now() < deadline) {
+		try {
+			await requestDaemonVersion(home, token, version, { command: 'ping' }, 500);
+		} catch (error) {
+			if (isUnavailableError(error)) {
+				return;
+			}
+			throw error;
+		}
+		await new Promise(resolve => setTimeout(resolve, 100));
+	}
+	throw new Error(`Daemon protocol ${version} did not stop within 30 seconds`);
+}
+
+async function requestDaemonVersion(
+	home: string,
+	token: string,
+	version: number,
+	body: Extract<DaemonRequestBody, { command: 'ping' | 'shutdown' }>,
+	timeoutMs: number,
+): Promise<void> {
+	const response = await sendRequest(getDaemonPaths(home).endpoint, JSON.stringify({
+		version,
+		token,
+		body,
+	}), {
+		connectTimeoutMs: timeoutMs,
+		responseTimeoutMs: timeoutMs,
+	});
+	let value: unknown;
+	try {
+		value = JSON.parse(response);
+	} catch (error) {
+		throw new DaemonProtocolError('INVALID_RESPONSE', 'Daemon response is not valid JSON', { cause: error });
+	}
+	if (!isRecord(value) || value['version'] !== version || typeof value['ok'] !== 'boolean') {
+		throw new DaemonProtocolError('INVALID_RESPONSE', `Daemon protocol ${version} returned an invalid response`);
+	}
+	if (!value['ok']) {
+		const responseError = value['error'];
+		if (!isRecord(responseError)
+			|| typeof responseError['code'] !== 'string'
+			|| typeof responseError['message'] !== 'string') {
+			throw new DaemonProtocolError('INVALID_RESPONSE', `Daemon protocol ${version} returned an invalid error`);
+		}
+		throw new DaemonProtocolError(responseError['code'], responseError['message']);
+	}
 }
 
 interface SendRequestTimeouts {
@@ -296,4 +378,13 @@ function isUnavailableError(error: unknown): boolean {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 	return error instanceof Error;
+}
+
+function isShutdownDisconnectError(error: unknown): boolean {
+	return isUnavailableError(error)
+		|| (error instanceof Error && error.message === 'Daemon closed the connection without a response');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

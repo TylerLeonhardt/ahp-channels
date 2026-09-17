@@ -16,7 +16,8 @@ const environment = {
 };
 
 try {
-	const packed = await runNpm(['pack', '--json', '--silent'], root);
+	await runNpm(['run', 'vscode:package'], root);
+	const packed = await runNpm(['pack', '--json', '--silent', '--ignore-scripts'], root);
 	const result: unknown = JSON.parse(packed.stdout);
 	if (!Array.isArray(result) || !isRecord(result[0]) || typeof result[0]['filename'] !== 'string') {
 		throw new Error(`npm pack returned an unexpected result: ${packed.stdout}`);
@@ -25,6 +26,10 @@ try {
 	if (!Array.isArray(packedFiles)
 		|| !packedFiles.some(file => isRecord(file) && file['path'] === 'LICENSE')) {
 		throw new Error('Packed npm artifact does not contain LICENSE');
+	}
+	const extensionFile = `vscode-extension/ahp-channels-vscode-${VERSION}.vsix`;
+	if (!packedFiles.some(file => isRecord(file) && file['path'] === extensionFile)) {
+		throw new Error(`Packed npm artifact does not contain ${extensionFile}`);
 	}
 	tarball = join(root, result[0]['filename']);
 	if (basename(tarball) !== `ahp-channels-${VERSION}.tgz`) {
@@ -35,6 +40,10 @@ try {
 	const version = await run(process.execPath, [cliEntry, '--version'], root, environment);
 	if (version.stdout.trim() !== VERSION) {
 		throw new Error(`Expected CLI version ${VERSION}, received ${version.stdout.trim()}`);
+	}
+	const extensionPath = await run(process.execPath, [cliEntry, 'vscode', 'path'], root, environment);
+	if (basename(extensionPath.stdout.trim()) !== `ahp-channels-vscode-${VERSION}.vsix`) {
+		throw new Error(`Unexpected bundled VS Code extension path: ${extensionPath.stdout.trim()}`);
 	}
 	daemonStarted = true;
 	const starts = await Promise.all([

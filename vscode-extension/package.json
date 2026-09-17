@@ -1,0 +1,228 @@
+{
+  "name": "ahp-channels-vscode",
+  "displayName": "AHP Channels",
+  "description": "Manage AHP channel plugins, the background daemon, and session attachments.",
+  "version": "0.1.1",
+  "publisher": "tylerleonhardt",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TylerLeonhardt/ahp-channels.git"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "agent",
+    "agent host protocol",
+    "ahp",
+    "channels"
+  ],
+  "type": "module",
+  "main": "./dist/extension.cjs",
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onView:ahpChannels.explorer",
+    "onCommand:ahpChannels.refresh",
+    "onCommand:ahpChannels.startDaemon",
+    "onCommand:ahpChannels.stopDaemon",
+    "onCommand:ahpChannels.restartDaemon",
+    "onCommand:ahpChannels.openDaemonLog",
+    "onCommand:ahpChannels.installPlugin",
+    "onCommand:ahpChannels.createChannel",
+    "onCommand:ahpChannels.startChannel",
+    "onCommand:ahpChannels.stopChannel",
+    "onCommand:ahpChannels.restartChannel",
+    "onCommand:ahpChannels.selectSession",
+    "onCommand:ahpChannels.attachSession"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "ahpChannels.refresh",
+        "title": "Refresh",
+        "category": "AHP Channels",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "ahpChannels.startDaemon",
+        "title": "Start Daemon",
+        "category": "AHP Channels",
+        "icon": "$(play)"
+      },
+      {
+        "command": "ahpChannels.stopDaemon",
+        "title": "Stop Daemon",
+        "category": "AHP Channels",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "ahpChannels.restartDaemon",
+        "title": "Restart Daemon",
+        "category": "AHP Channels",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "ahpChannels.openDaemonLog",
+        "title": "Open Daemon Log",
+        "category": "AHP Channels",
+        "icon": "$(output)"
+      },
+      {
+        "command": "ahpChannels.installPlugin",
+        "title": "Install Plugin...",
+        "category": "AHP Channels",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "ahpChannels.createChannel",
+        "title": "Create Channel...",
+        "category": "AHP Channels",
+        "icon": "$(add)"
+      },
+      {
+        "command": "ahpChannels.startChannel",
+        "title": "Start Channel",
+        "category": "AHP Channels",
+        "icon": "$(play)"
+      },
+      {
+        "command": "ahpChannels.stopChannel",
+        "title": "Stop Channel",
+        "category": "AHP Channels",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "ahpChannels.restartChannel",
+        "title": "Restart Channel",
+        "category": "AHP Channels",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "ahpChannels.selectSession",
+        "title": "Select Session...",
+        "category": "AHP Channels",
+        "icon": "$(link)"
+      },
+      {
+        "command": "ahpChannels.attachSession",
+        "title": "Point Channel Here...",
+        "category": "AHP Channels",
+        "icon": "$(link)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ahpChannels",
+          "title": "AHP Channels",
+          "icon": "media/ahp-channels.svg"
+        }
+      ]
+    },
+    "views": {
+      "ahpChannels": [
+        {
+          "id": "ahpChannels.explorer",
+          "name": "AHP Channels"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "ahpChannels.refresh",
+          "when": "view == ahpChannels.explorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ahpChannels.createChannel",
+          "when": "view == ahpChannels.explorer",
+          "group": "navigation@2"
+        },
+        {
+          "command": "ahpChannels.installPlugin",
+          "when": "view == ahpChannels.explorer",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "ahpChannels.startDaemon",
+          "when": "view == ahpChannels.explorer && viewItem == daemonStopped",
+          "group": "inline@1"
+        },
+        {
+          "command": "ahpChannels.stopDaemon",
+          "when": "view == ahpChannels.explorer && viewItem == daemonRunning",
+          "group": "inline@1"
+        },
+        {
+          "command": "ahpChannels.restartDaemon",
+          "when": "view == ahpChannels.explorer && viewItem == daemonRunning",
+          "group": "daemon@1"
+        },
+        {
+          "command": "ahpChannels.openDaemonLog",
+          "when": "view == ahpChannels.explorer && (viewItem == daemonRunning || viewItem == daemonStopped)",
+          "group": "daemon@2"
+        },
+        {
+          "command": "ahpChannels.startChannel",
+          "when": "view == ahpChannels.explorer && viewItem == channelStopped",
+          "group": "inline@1"
+        },
+        {
+          "command": "ahpChannels.stopChannel",
+          "when": "view == ahpChannels.explorer && (viewItem == channelRunning || viewItem == channelError)",
+          "group": "inline@1"
+        },
+        {
+          "command": "ahpChannels.startChannel",
+          "when": "view == ahpChannels.explorer && viewItem == channelStopped",
+          "group": "channel@1"
+        },
+        {
+          "command": "ahpChannels.stopChannel",
+          "when": "view == ahpChannels.explorer && (viewItem == channelRunning || viewItem == channelError)",
+          "group": "channel@1"
+        },
+        {
+          "command": "ahpChannels.restartChannel",
+          "when": "view == ahpChannels.explorer && (viewItem == channelRunning || viewItem == channelError)",
+          "group": "channel@2"
+        },
+        {
+          "command": "ahpChannels.selectSession",
+          "when": "view == ahpChannels.explorer && (viewItem == channelRunning || viewItem == channelStopped || viewItem == channelError)",
+          "group": "channel@3"
+        },
+        {
+          "command": "ahpChannels.attachSession",
+          "when": "view == ahpChannels.explorer && viewItem == session",
+          "group": "inline@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AHP Channels",
+      "properties": {
+        "ahpChannels.home": {
+          "type": "string",
+          "default": "",
+          "description": "AHP Channels state directory. Leave empty to use AHP_CHANNELS_HOME or ~/.ahp-channels."
+        }
+      }
+    }
+  }
+}
