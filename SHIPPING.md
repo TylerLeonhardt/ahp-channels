@@ -33,8 +33,11 @@
 - [x] Pin channels across explicit upgrade, rollback, and prune operations.
 - [x] Exercise the official fakechat plugin through its external UI across a
       daemon restart in CI.
-- [ ] Run a fresh-machine Telegram setup from the published prerelease using
-      plugin-owned configuration.
+- [x] Verify published `0.1.0-alpha.4` Telegram onboarding on macOS with fresh
+      bridge configuration and plugin-owned token setup, including a real
+      phone message/reply. Existing test bot and allowlist reused.
+- [ ] Verify published-prerelease Telegram onboarding on Linux; results from
+      another machine are pending.
 - [ ] Soak the alpha with fakechat, Telegram, and Discord.
 - [x] Add actionable channel health diagnostics.
 - [x] Add log rotation.
