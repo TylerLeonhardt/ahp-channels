@@ -22,6 +22,14 @@ The **0.1** release series includes:
 [Channel controls](#manage-a-channel) · [Upgrading](#upgrade-the-bridge) ·
 [Compatibility](#compatibility-and-limits) · [Development](#development)
 
+## Five-minute project tour
+
+Open [the HTML presentation](./slides/index.html) in a browser for three
+diagram-first slides: Claude Channels, multi-client AHP extensibility, and
+npm/Marketplace distribution. It is self-contained and works offline.
+Use the arrow keys to navigate, **N** for speaker notes, and **F** for
+fullscreen. Browser printing exports all three slides.
+
 ## Requirements
 
 - **Node.js 22 or newer** and npm.
