@@ -151,18 +151,22 @@ export class ConfigStore {
 	}
 
 	async read(): Promise<AppConfig> {
-		let raw: string;
-		try {
-			raw = await readFile(this.configPath, 'utf8');
-		} catch (error) {
-			if (isNodeError(error) && error.code === 'ENOENT') {
-				return defaultConfig();
+		// Separate from the transaction lock: callers holding configPath's lock
+		// still need reads serialized with atomic replacement on Windows.
+		return withFileLock(`${this.configPath}.io`, async () => {
+			let raw: string;
+			try {
+				raw = await readFile(this.configPath, 'utf8');
+			} catch (error) {
+				if (isNodeError(error) && error.code === 'ENOENT') {
+					return defaultConfig();
+				}
+				throw error;
 			}
-			throw error;
-		}
 
-		const value: unknown = JSON.parse(raw);
-		return validateAppConfig(value);
+			const value: unknown = JSON.parse(raw);
+			return validateAppConfig(value);
+		});
 	}
 
 	async update(change: (config: AppConfig) => AppConfig): Promise<AppConfig> {
@@ -175,7 +179,9 @@ export class ConfigStore {
 
 	async write(config: AppConfig): Promise<void> {
 		const parsed = validateAppConfig(config);
-		await writeFileAtomic(this.configPath, `${JSON.stringify(parsed, undefined, 2)}\n`);
+		await withFileLock(`${this.configPath}.io`, () =>
+			writeFileAtomic(this.configPath, `${JSON.stringify(parsed, undefined, 2)}\n`),
+		);
 	}
 
 }

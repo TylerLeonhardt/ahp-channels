@@ -69,6 +69,15 @@ A clean install of the registry package passed CLI smoke checks; registry
 signatures and SLSA provenance were verified against the release tag, merged
 source commit, and publishing workflow.
 
+## 0.1.1 maintenance correction
+
+- Serialize configuration-file reads and atomic replacements to prevent
+  Windows `EPERM` failures during status polling and handoff commits.
+- Queue same-process file-lock owners directly while retaining cross-process
+  filesystem locks and separate configuration transaction ownership.
+- Cover held I/O locks, concurrent readers/updates, failed-owner recovery, and
+  repeated Windows daemon lifecycle checks.
+
 ## Post-0.1.0 follow-up
 
 - [ ] Longer-running soak tests with fakechat, Telegram, and Discord through
