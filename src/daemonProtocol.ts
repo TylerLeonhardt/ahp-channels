@@ -258,6 +258,11 @@ export function parseDaemonRequest(value: unknown): DaemonRequest {
 }
 
 export function parseDaemonResponse(value: unknown): DaemonResponse {
+	if (isRecord(value)
+		&& Number.isInteger(value['version'])
+		&& value['version'] !== DAEMON_PROTOCOL_VERSION) {
+		throw new DaemonProtocolVersionError(value['version'] as number);
+	}
 	const parsed = ResponseSchema.safeParse(value);
 	if (!parsed.success) {
 		throw new DaemonProtocolError('INVALID_RESPONSE', z.prettifyError(parsed.error));
@@ -273,4 +278,19 @@ export class DaemonProtocolError extends Error {
 	) {
 		super(message, options);
 	}
+}
+
+export class DaemonProtocolVersionError extends DaemonProtocolError {
+	constructor(readonly actualVersion: number) {
+		super(
+			'VERSION_MISMATCH',
+			actualVersion < DAEMON_PROTOCOL_VERSION
+				? `Daemon protocol ${actualVersion} is older than client protocol ${DAEMON_PROTOCOL_VERSION}`
+				: `Daemon protocol ${actualVersion} is newer than client protocol ${DAEMON_PROTOCOL_VERSION}; update ahp-channels`,
+		);
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

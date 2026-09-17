@@ -1,18 +1,20 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { access, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { setTimeout } from 'node:timers/promises';
 import { lock } from 'proper-lockfile';
-import { probeDaemon } from '../src/daemonClient.js';
+import { probeDaemon, stopDaemon } from '../src/daemonClient.js';
 import { getDaemonPaths, getOrCreateDaemonToken, readDaemonToken } from '../src/daemonPaths.js';
 import { parseDaemonStartupMessage } from '../src/daemonStartup.js';
 import { FILE_LOCK_OPTIONS } from '../src/lockedFile.js';
 import {
 	DAEMON_PROTOCOL_VERSION,
 	DaemonProtocolError,
+	DaemonProtocolVersionError,
 	parseDaemonRequest,
 	parseDaemonResponse,
 } from '../src/daemonProtocol.js';
@@ -37,6 +39,15 @@ describe('daemon control protocol', () => {
 	});
 
 	it('rejects unknown request fields and incomplete responses', () => {
+		assert.throws(
+			() => parseDaemonResponse({
+				version: DAEMON_PROTOCOL_VERSION - 1,
+				ok: false,
+				error: { code: 'VERSION_MISMATCH', message: 'upgrade' },
+			}),
+			(error: unknown) => error instanceof DaemonProtocolVersionError
+				&& error.actualVersion === DAEMON_PROTOCOL_VERSION - 1,
+		);
 		assert.throws(
 			() => parseDaemonRequest({
 				version: DAEMON_PROTOCOL_VERSION,
@@ -216,5 +227,59 @@ describe('daemon control protocol', () => {
 		await assert.rejects(access(home), (error: unknown) =>
 			error instanceof Error && 'code' in error && error.code === 'ENOENT'
 		);
+	});
+
+	it('stops an older daemon using its advertised protocol version', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-old-daemon-'));
+		temporaryDirectories.push(home);
+		const token = await getOrCreateDaemonToken(home);
+		const requests: Array<{ readonly version: number; readonly command: string }> = [];
+		const server = createServer(socket => {
+			let buffer = '';
+			socket.setEncoding('utf8');
+			socket.on('data', chunk => {
+				buffer += chunk;
+				const newline = buffer.indexOf('\n');
+				if (newline < 0) {
+					return;
+				}
+				const request = JSON.parse(buffer.slice(0, newline)) as {
+					readonly version: number;
+					readonly token: string;
+					readonly body: { readonly command: string };
+				};
+				assert.equal(request.token, token);
+				requests.push({ version: request.version, command: request.body.command });
+				if (request.version === DAEMON_PROTOCOL_VERSION) {
+					socket.end(`${JSON.stringify({
+						version: DAEMON_PROTOCOL_VERSION - 1,
+						ok: false,
+						error: { code: 'INVALID_REQUEST', message: 'unsupported protocol' },
+					})}\n`);
+					return;
+				}
+				assert.equal(request.version, DAEMON_PROTOCOL_VERSION - 1);
+				assert.equal(request.body.command, 'shutdown');
+				socket.end();
+				server.close();
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once('error', reject);
+			server.listen(getDaemonPaths(home).endpoint, resolve);
+		});
+
+		try {
+			await stopDaemon(home);
+		} finally {
+			if (server.listening) {
+				await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+			}
+		}
+
+		assert.deepEqual(requests, [
+			{ version: DAEMON_PROTOCOL_VERSION, command: 'ping' },
+			{ version: DAEMON_PROTOCOL_VERSION - 1, command: 'shutdown' },
+		]);
 	});
 });

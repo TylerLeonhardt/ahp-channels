@@ -12,6 +12,28 @@ The workflow publishes the version already committed in `package.json`; it
 never bumps versions itself and rejects release commits that are not on
 `main`.
 
+The `prepack` lifecycle also builds
+`vscode-extension/ahp-channels-vscode-<version>.vsix` and includes it in the
+npm tarball. `npm version` keeps the extension manifest version synchronized
+with the package version.
+
+## Build a VSIX for manual Marketplace upload
+
+```powershell
+npm run vscode:package
+```
+
+Upload `vscode-extension/ahp-channels-vscode-<version>.vsix` through the
+[Marketplace publisher portal](https://marketplace.visualstudio.com/manage).
+Building the VSIX does not publish the extension or the npm package.
+Marketplace extension versions must be numeric `major.minor.patch` versions;
+npm prerelease suffixes such as `-alpha.4` are not accepted for upload.
+
+Merge the README screenshot into `main` before publishing. Marketplace
+README images load from HTTPS URLs, not from the copy bundled in the VSIX.
+The extension's `vsce` options resolve relative documentation and image links
+against its `vscode-extension` directory in this repository.
+
 ## Trusted publishing configuration
 
 The package is already bootstrapped on npm. Its trusted publisher is configured
@@ -44,7 +66,7 @@ npm run check
 npm run test:package
 
 $version = node -p "require('./package.json').version"
-git add package.json package-lock.json src/version.ts
+git add package.json package-lock.json src/version.ts vscode-extension/package.json
 git commit -m "Bump version to $version"
 git push -u origin HEAD
 gh pr create --base main --title "release: prepare v$version" --body "Prepare v$version for npm publication."
@@ -73,9 +95,10 @@ git tag -a "v$version" -m "v$version"
 git push origin "v$version"
 ```
 
-The `npm version` lifecycle synchronizes `src/version.ts`, and the build fails
-if it does not match `package.json`. The package smoke test verifies the CLI and
-tarball versions; the publish workflow separately verifies the git tag.
+The `npm version` lifecycle synchronizes `src/version.ts` and
+`vscode-extension/package.json`, and the build fails if either does not match
+`package.json`. The package smoke test verifies the CLI and tarball versions;
+the publish workflow separately verifies the git tag.
 
 Prerelease versions publish under npm's `next` tag. Stable versions publish
 under `latest` and create a non-prerelease GitHub Release marked latest.
@@ -112,6 +135,8 @@ The workflow:
 2. Rejects a tag that differs from `package.json`.
 3. Runs type checking, unit tests, and the build.
 4. Installs and exercises the packed npm artifact.
-5. Rejects versions already present on npm.
-6. Publishes through npm OIDC trusted publishing.
-7. Creates a matching GitHub Release with the appropriate prerelease/latest flag.
+5. Verifies the bundled VS Code extension is addressable through
+   `ahp-channels vscode path`.
+6. Rejects versions already present on npm.
+7. Publishes through npm OIDC trusted publishing.
+8. Creates a matching GitHub Release with the appropriate prerelease/latest flag.

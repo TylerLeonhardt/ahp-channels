@@ -152,6 +152,27 @@ credentials or accounts**. Do not start a second poller for the same bot or
 channel identity. Stop the old bridge first, and follow the plugin's own
 multi-instance guidance if you need separate bots.
 
+## VS Code extension
+
+The npm package includes a VS Code extension for managing the daemon, installing
+plugins, creating and controlling channels, and selecting their AHP sessions.
+Install the bundled extension with:
+
+```powershell
+ahp-channels vscode install
+```
+
+Open the AHP Channels view from the Activity Bar. Session rows support
+**Point Channel Here** from their context menu, and channel rows support
+**Select Session**. Start or stop channels using their hover controls or
+right-click menu; Stop and Restart remain available for channels reporting
+errors. All actions are also available from the Command Palette.
+Use `ahpChannels.home` in VS Code settings when the
+extension should use a state directory other than `~/.ahp-channels`.
+
+See the [extension guide](./vscode-extension/README.md) for setup, controls, and
+troubleshooting.
+
 ## Select a local Agent Host
 
 AHP defines the protocol after a client transport is open; it does not define
