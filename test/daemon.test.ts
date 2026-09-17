@@ -792,6 +792,56 @@ describe('DaemonServer', () => {
 		}
 	});
 
+	it('keeps the committed source binding while the destination is preparing', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		const server = new DaemonServer(
+			home, await getOrCreateDaemonToken(home), store, factory, undefined, new TestSessionCatalog(),
+		);
+		let prepared!: () => void;
+		let release!: () => void;
+		const preparing = new Promise<void>(resolve => { prepared = resolve; });
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		let switching: Promise<unknown> | undefined;
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake', host: '@source', session: 'ahp-session:/source', enabled: false,
+				},
+				start: true,
+			});
+			factory.startHook = async definition => {
+				if (definition.session === 'ahp-session:/destination') {
+					prepared();
+					await gate;
+				}
+			};
+			switching = requestDaemon(home, {
+				command: 'channel.handoff',
+				name: 'personal',
+				target: { host: '@destination', session: 'ahp-session:/destination' },
+			});
+			await preparing;
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
+			const status = await requestDaemon(home, { command: 'status' });
+			assert.equal(status.channels[0]?.handoff?.state, 'pending');
+			assert.equal(status.channels[0]?.state, 'starting');
+			release();
+			await switching;
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/destination');
+		} finally {
+			release();
+			await switching;
+			await server.close();
+		}
+	});
+
 	it('restores the committed source and reports failure when restart interrupts a pending handoff', async () => {
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
 		temporaryDirectories.push(home);

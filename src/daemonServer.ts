@@ -889,18 +889,18 @@ export class DaemonServer {
 		let configUpdated = false;
 		let preparedRuntime: ManagedChannelRuntime | undefined;
 		try {
-			await this.bindings.replace(name, previous, next, handoff?.requestId);
-			configUpdated = true;
 			if (next.enabled) {
 				this.restartAttempts.delete(name);
 				preparedRuntime = await this.prepareOne(name, next);
-				if (handoff) {
-					await this.setHandoffRecord(name, appliedHandoff(handoff, preparedRuntime));
-				}
+			}
+			await this.bindings.replace(name, previous, next, handoff?.requestId);
+			configUpdated = true;
+			if (handoff) {
+				await this.setHandoffRecord(name, appliedHandoff(handoff, preparedRuntime));
+			}
+			if (preparedRuntime) {
 				await this.activatePreparedOne(name, preparedRuntime);
 				preparedRuntime = undefined;
-			} else if (handoff) {
-				await this.setHandoffRecord(name, appliedHandoff(handoff, undefined));
 			}
 		} catch (switchError) {
 			this.transitions.delete(name);
