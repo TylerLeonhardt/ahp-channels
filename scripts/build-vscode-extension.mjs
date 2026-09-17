@@ -28,6 +28,9 @@ await Promise.all([
 	build({
 		entryPoints: [resolve(root, 'src', 'daemonMain.ts')],
 		bundle: true,
+		banner: {
+			js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
+		},
 		format: 'esm',
 		outfile: resolve(outputDirectory, 'daemonMain.js'),
 		platform: 'node',

@@ -72,6 +72,7 @@
     "@types/proper-lockfile": "^4.1.4",
     "@types/vscode": "^1.95.0",
     "@types/ws": "^8.18.1",
+    "@vscode/proxy-agent": "^0.44.0",
     "@vscode/vsce": "^3.6.0",
     "esbuild": "^0.27.2",
     "tsx": "^4.20.6",

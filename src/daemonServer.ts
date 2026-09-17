@@ -546,14 +546,7 @@ export class DaemonServer {
 				new DaemonChannelStatusReporter(this.logger, name),
 			);
 			this.runtimes.set(name, runtime);
-			if (runtime.startupFailure) {
-				await this.recordFailure(name, runtime.startupFailure);
-				await this.scheduleRestart(name);
-			} else {
-				await this.clearHealth(name);
-				this.markStableAfterDelay(name, runtime);
-			}
-			this.superviseRuntime(name, runtime);
+			await this.superviseRuntime(name, runtime);
 		} catch (error) {
 			await this.recordFailure(name, error);
 			throw error;
@@ -565,6 +558,7 @@ export class DaemonServer {
 	private async prepareOne(
 		name: string,
 		definition: ChannelInstanceConfig,
+		sourceMode: ChannelRuntimeSnapshot['mode'] | undefined,
 	): Promise<ManagedChannelRuntime> {
 		this.clearRestart(name);
 		this.transitions.set(name, 'starting');
@@ -574,7 +568,7 @@ export class DaemonServer {
 				definition,
 				new DaemonChannelStatusReporter(this.logger, name),
 			);
-			if (runtime.startupFailure) {
+			if (runtime.startupFailure && sourceMode !== 'customization-only') {
 				const startupFailure = runtime.startupFailure;
 				await runtime.close();
 				throw startupFailure;
@@ -590,9 +584,7 @@ export class DaemonServer {
 		this.runtimes.set(name, runtime);
 		try {
 			await runtime.activate();
-			await this.clearHealth(name);
-			this.markStableAfterDelay(name, runtime);
-			this.superviseRuntime(name, runtime);
+			await this.superviseRuntime(name, runtime);
 		} catch (error) {
 			if (this.runtimes.get(name) === runtime) {
 				this.runtimes.delete(name);
@@ -611,7 +603,14 @@ export class DaemonServer {
 		}
 	}
 
-	private superviseRuntime(name: string, runtime: ManagedChannelRuntime): void {
+	private async superviseRuntime(name: string, runtime: ManagedChannelRuntime): Promise<void> {
+		if (runtime.startupFailure) {
+			await this.recordFailure(name, runtime.startupFailure);
+			await this.scheduleRestart(name);
+		} else {
+			await this.clearHealth(name);
+			this.markStableAfterDelay(name, runtime);
+		}
 		void runtime.whenStopped.then(
 			() => this.handleUnexpectedStop(name, runtime, new Error('Channel runtime stopped unexpectedly')),
 			error => this.handleUnexpectedStop(name, runtime, error),
@@ -868,10 +867,14 @@ export class DaemonServer {
 				? await runtime.quiesceHandoff(sourceHandoffId)
 				: await runtime.quiesce()
 			: true;
+		if (runtime && this.runtimes.get(name) !== runtime) {
+			throw new DaemonProtocolError('STALE_BINDING', `Channel '${name}' is no longer owned by this source binding`);
+		}
 		if (!quiesced) {
 			throw new DaemonProtocolError('CHANNEL_BUSY', `Channel '${name}' is processing a turn`);
 		}
 		const wasRunning = runtime !== undefined;
+		const sourceMode = runtime?.snapshot.mode;
 		try {
 			await this.stopOne(name);
 		} catch (error) {
@@ -891,7 +894,7 @@ export class DaemonServer {
 		try {
 			if (next.enabled) {
 				this.restartAttempts.delete(name);
-				preparedRuntime = await this.prepareOne(name, next);
+				preparedRuntime = await this.prepareOne(name, next, sourceMode);
 			}
 			await this.bindings.replace(name, previous, next, handoff?.requestId);
 			configUpdated = true;

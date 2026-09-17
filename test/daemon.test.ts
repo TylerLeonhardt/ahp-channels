@@ -1125,6 +1125,232 @@ describe('DaemonServer', () => {
 		}
 	});
 
+	it('moves a setup-only channel and recovers on the destination after setup finishes', async context => {
+		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-setup-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		factory.runtimeError = 'Plugin setup required';
+		const server = new DaemonServer(
+			home, await getOrCreateDaemonToken(home), store, factory, undefined, new TestSessionCatalog(),
+		);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: { plugin: 'fake', host: '@source', session: 'ahp-session:/source', enabled: false },
+				start: true,
+			});
+			const source = factory.runtimes[0];
+			assert.equal(source.snapshot.mode, 'customization-only');
+			const target = { host: '@destination', session: 'ahp-session:/destination', chat: 'ahp-chat:/destination' };
+			source.busy = true;
+			await assert.rejects(
+				requestDaemon(home, { command: 'channel.handoff', name: 'personal', target }),
+				(error: unknown) => error instanceof DaemonProtocolError && error.code === 'CHANNEL_BUSY',
+			);
+			assert.equal(source.closed, false);
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
+			source.finishTurn();
+			const moved = (await requestDaemon(home, { command: 'channel.handoff', name: 'personal', target })).channels[0];
+			assert.deepEqual({
+				state: moved.state,
+				mode: moved.runtime?.mode,
+				health: moved.health.state,
+				failure: moved.health.failure?.summary,
+				retry: moved.health.retry,
+				definition: moved.definition,
+				runtimeHost: moved.runtime?.host,
+				runtimeSession: moved.runtime?.session,
+				runtimeChat: moved.runtime?.chat,
+				handoff: moved.handoff?.state,
+			}, {
+				state: 'error',
+				mode: 'customization-only',
+				health: 'degraded',
+				failure: 'Plugin setup required',
+				retry: { state: 'scheduled', attempt: 1, nextRetryAt: new Date(Date.now() + 1000).toISOString() },
+				definition: { plugin: 'fake', enabled: true, ...target },
+				runtimeHost: 'editor:2:destination',
+				runtimeSession: target.session,
+				runtimeChat: target.chat,
+				handoff: 'applied',
+			});
+			assert.deepEqual((await store.read()).channels['personal'], moved.definition);
+			assert.equal(source.closed, true);
+			const destination = factory.runtimes.at(-1)!;
+			destination.busy = true;
+			factory.runtimeError = undefined;
+			context.mock.timers.tick(1000);
+			const waiting = await settledChannelStatus(home, 'personal', '@destination');
+			assert.equal(waiting.runtime?.bindingId, destination.bindingId);
+			assert.equal(waiting.health.retry?.attempt, 2);
+			assert.equal(destination.closed, false);
+			destination.finishTurn();
+			context.mock.timers.tick(2000);
+			const recovered = await waitForRunningChannel(home, 'personal', destination.bindingId);
+			assert.equal(recovered.runtime?.session, target.session);
+			assert.equal(recovered.runtime?.chat, target.chat);
+			assert.equal(recovered.runtime?.mode, 'mcp');
+			assert.equal(recovered.handoff?.state, 'applied');
+			assert.equal(destination.closed, true);
+			await assert.rejects(access(join(home, 'instances', 'personal', 'health.json')));
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('applies an agent-requested setup-only handoff after the source turn and restores its target on restart', async context => {
+		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-setup-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		factory.runtimeError = 'Plugin setup required';
+		const token = await getOrCreateDaemonToken(home);
+		const catalog = new TestSessionCatalog();
+		const server = new DaemonServer(home, token, store, factory, undefined, catalog);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: { plugin: 'fake', host: '@source', session: 'ahp-session:/source', enabled: false },
+				start: true,
+			});
+			const source = factory.runtimes[0];
+			source.busy = true;
+			const pending = await requestDaemon(home, {
+				command: 'channel.handoff.request',
+				name: 'personal',
+				sourceBindingId: source.bindingId,
+				target: { host: '@destination', session: 'ahp-session:/destination' },
+			});
+			assert.equal(pending.channels[0].handoff?.state, 'pending');
+			assert.equal(source.closed, false);
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
+			source.finishTurn();
+			await waitFor(async () => (await requestDaemon(home, { command: 'status' })).channels[0].handoff?.state === 'applied', 5000);
+			const applied = await settledChannelStatus(home, 'personal', '@destination');
+			assert.equal(applied.runtime?.mode, 'customization-only');
+			assert.equal(applied.runtime?.session, 'ahp-session:/destination');
+			assert.equal(applied.health.state, 'degraded');
+			assert.equal(source.closed, true);
+		} finally {
+			await server.close();
+		}
+		const restarted = new DaemonServer(home, token, store, factory, undefined, catalog);
+		await restarted.start();
+		try {
+			const restored = (await requestDaemon(home, { command: 'status' })).channels[0];
+			assert.equal(restored.definition.host, '@destination');
+			assert.equal(restored.definition.session, 'ahp-session:/destination');
+			assert.equal(restored.runtime?.mode, 'customization-only');
+			assert.equal(restored.handoff?.state, 'applied');
+			assert.equal(restored.health.failure?.summary, 'Plugin setup required');
+			assert.equal(restored.health.retry?.state, 'scheduled');
+		} finally {
+			await restarted.close();
+		}
+	});
+
+	it('rejects a setup-only handoff if the source disconnects during replacement validation', async context => {
+		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-setup-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		factory.runtimeError = 'Plugin setup required';
+		const catalog = new TestSessionCatalog();
+		const validation = new TestGate();
+		const validateBinding = catalog.validateBinding.bind(catalog);
+		context.mock.method(catalog, 'validateBinding', async (target: ChannelBindingTarget) => {
+			const result = await validateBinding(target);
+			factory.validationGate = validation;
+			return result;
+		});
+		const server = new DaemonServer(home, await getOrCreateDaemonToken(home), store, factory, undefined, catalog);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: { plugin: 'fake', host: '@source', session: 'ahp-session:/source', enabled: false },
+				start: true,
+			});
+			const source = factory.runtimes[0];
+			const handoff = requestDaemon(home, {
+				command: 'channel.handoff',
+				name: 'personal',
+				target: { host: '@destination', session: 'ahp-session:/destination' },
+			});
+			const rejected = assert.rejects(
+				handoff,
+				(error: unknown) => error instanceof DaemonProtocolError && error.code === 'STALE_BINDING',
+			);
+			await validation.entered;
+			source.stopUnexpectedly();
+			await waitFor(async () => !(await requestDaemon(home, { command: 'status' })).channels[0].runtime, 5000);
+			validation.release();
+			await rejected;
+			const recovering = await settledChannelStatus(home, 'personal', '@source');
+			assert.equal(recovering.definition.session, 'ahp-session:/source');
+			assert.equal(recovering.handoff?.state, 'failed');
+			assert.equal(recovering.health.retry?.state, 'scheduled');
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
+			assert.equal(factory.runtimes.length, 1, 'A disconnected source must not prepare or publish a destination');
+			assert.equal(source.closed, true);
+		} finally {
+			validation.release();
+			await server.close();
+		}
+	});
+
+	it('rolls back a setup-only handoff when the destination session cannot be opened', async context => {
+		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-setup-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		factory.runtimeError = 'Plugin setup required';
+		const server = new DaemonServer(
+			home, await getOrCreateDaemonToken(home), store, factory, undefined, new TestSessionCatalog(),
+		);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: { plugin: 'fake', host: '@source', session: 'ahp-session:/source', enabled: false },
+				start: true,
+			});
+			factory.failSession = 'ahp-session:/destination';
+			await assert.rejects(
+				requestDaemon(home, {
+					command: 'channel.handoff',
+					name: 'personal',
+					target: { host: '@destination', session: 'ahp-session:/destination' },
+				}),
+				/Failed to switch channel/,
+			);
+			const restored = await settledChannelStatus(home, 'personal', '@source');
+			assert.equal(restored.definition.session, 'ahp-session:/source');
+			assert.equal(restored.runtime?.session, 'ahp-session:/source');
+			assert.equal(restored.runtime?.mode, 'customization-only');
+			assert.equal(restored.handoff?.state, 'failed');
+			assert.equal(restored.health.failure?.summary, 'Plugin setup required');
+			assert.equal(restored.health.retry?.state, 'scheduled');
+		} finally {
+			await server.close();
+		}
+	});
+
 	it('reports a customization-only runtime as an error and retries only after its turn', async context => {
 		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));

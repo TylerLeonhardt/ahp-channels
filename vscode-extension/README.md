@@ -67,6 +67,11 @@ You can also right-click a channel and choose **Select Session...**. The chosen
 session receives subsequent messages; it does not have to be the conversation
 currently focused in the editor.
 
+Channels already attached for setup can move their setup skills to another
+session even when the messaging server still cannot start. You do not need to
+stop and restart the channel first. Working channels retain failed-handoff
+rollback protection, and handoffs never interrupt an active turn.
+
 ## Controls and troubleshooting
 
 **Stop Channel** disables the channel and its automatic retries.
@@ -74,17 +79,41 @@ currently focused in the editor.
 Both remain available for an enabled channel reporting an error.
 Stopping the daemon stops all its channels; closing the view does not stop it.
 
+Channel rows distinguish **connected** (messaging server running) from
+**attached for setup** (plugin skills available, messaging unavailable). An
+**error** without a setup-only attachment means the channel has no usable
+connection.
+
+Hover over a channel to see its health, failure reason and stage, recovery
+guidance, and scheduled or exhausted retries. A scheduled retry waits until
+the conversation is idle. Failed handoffs also show the requested session and
+error without changing the status of a restored healthy connection. Choose
+**Refresh** to read the latest daemon status after automatic recovery.
+
 ### No sessions are listed
 
 Make sure a supported local Agent Host is running and has an existing
 conversation, then choose **Refresh**. Check the **AHP Channels** output channel
 for connection or discovery errors.
 
+Local Unix-socket and Windows named-pipe connections preserve their endpoint
+under VS Code's HTTP proxy handling; you do not need to disable proxy support.
+
+### An older configuration is unsupported
+
+Extension updates also update its bundled bridge runtime; a separate npm CLI
+update is not required. Configuration schema versions are different from
+extension release versions. Version 2 configuration predates versioned plugin
+installations and is not migrated automatically. A v2 configuration upgrade
+action is not available yet; preserve the old configuration and do not change
+its version number by hand.
+
 ### A channel reports an error during setup
 
-A plugin may need credentials before its messaging server can start. Its setup
-skills can still be available in the selected session. Finish setup there; the
-daemon retries after the setup turn completes.
+A plugin may need credentials before its messaging server can start. A channel
+marked **attached for setup** still provides its setup skills in the selected
+session. Follow the recovery guidance in its tooltip; the daemon retries after
+the setup turn completes.
 
 Use **Open Daemon Log** for the plugin's diagnostic, such as a missing bot token
 or Bun installation. A generic `MCP error -32000: Connection closed` is not the
@@ -92,9 +121,10 @@ underlying cause.
 
 ### A setup skill is missing
 
-Make sure you are in the channel's selected conversation. If an unconfigured
-channel cannot switch sessions because its messaging server will not start,
-**Stop Channel**, select the new session, then **Start Channel**.
+Make sure the channel is started and you are in its selected conversation.
+Use **Select Session...** to move a setup-only attachment to the conversation
+you want. If the host or session cannot be reached, the handoff fails and
+restores the source binding; inspect the channel tooltip for the failure.
 
 ## Settings and the CLI
 

@@ -470,7 +470,15 @@ validates the destination host, exact existing session, and optional chat
 before stopping the source. Host, session, and chat are committed as one
 binding; the implementation never chains the older `switch` and `select-host`
 commands through an invalid intermediate combination. A failed destination
-start restores the previous persisted binding and runtime.
+start restores the previous persisted binding and runtime for a working
+channel.
+
+A channel already running in customization-only mode may move to another
+validated session even if its MCP server still cannot start. Its plugin skills
+are published only after the new binding is committed; health remains
+`degraded`, and retries resume on the destination after its turn finishes.
+This does not allow a healthy channel to silently downgrade during a handoff,
+and host/session failures still restore the source binding.
 
 When the daemon is stopped, terminal binding changes use the same recovery-aware
 binding service as daemon startup and handoff commits. An interrupted request is
@@ -523,12 +531,11 @@ source binding, and replays held messages there. `channel status` and
 `ahp_channels_handoff_status` report `pending`, `applied`, `failed`, or
 `cancelled` with the request ID and any sanitized failure.
 
-The same typed catalog and handoff contracts back the terminal and agent
-adapters. A future editor extension can use the authenticated daemon client
-contract and supply only editor UI plus a client adapter; it does not need to
-import terminal code, parse stdout, run another plugin process, duplicate the
-configuration store, or reimplement handoff policy. No VS Code extension or
-private editor integration is included today.
+The same typed catalog and handoff contracts back the terminal, VS Code
+extension, and agent adapters. The extension uses the authenticated daemon
+client instead of importing terminal code, parsing stdout, running another
+plugin process, duplicating configuration state, or reimplementing handoff
+policy.
 
 `channel status <name>` reports both the runtime state and bridge-owned health:
 
@@ -555,6 +562,11 @@ report `health.state: "healthy"` without a failure. Intentionally stopped
 channels report `health.state: "stopped"`. An MCP startup failure reports
 `"degraded"` when plugin customizations and setup skills remain available;
 failures without a usable runtime report `"unhealthy"`.
+
+The VS Code extension labels customization-only runtimes **attached for setup**
+and healthy messaging runtimes **connected**. Channel tooltips show the
+daemon's failure, guidance, retry metadata, and failed-handoff details as plain
+text. Use **Refresh** to read status after automatic recovery.
 
 The daemon atomically stores only the latest actionable failure and retry
 metadata under the channel's bridge-owned instance directory. Runtime facts

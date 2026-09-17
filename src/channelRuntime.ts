@@ -238,9 +238,6 @@ export class ChannelRuntime {
 					new AggregateError(errors, errors.map(candidate => candidate.message).join('; ')),
 				);
 				status?.report(startupFailure.message);
-				if (activation === 'prepared') {
-					throw startupFailure;
-				}
 				mcp = new CustomizationOnlyChannel(plugin.name);
 				channelInfo = await mcp.start();
 			}
