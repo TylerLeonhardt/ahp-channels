@@ -10,6 +10,7 @@ import {
 } from '@microsoft/agent-host-protocol';
 import type { DispatchHandle, ResourceRequestHandlers, SubscriptionEvent } from '@microsoft/agent-host-protocol/client';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import {
@@ -21,7 +22,7 @@ import {
 } from '../src/channelRuntime.js';
 import { ChannelOperationError } from '../src/channelHealth.js';
 import type { AgentHostEndpoint } from '../src/endpoints.js';
-import type { McpChannelClient, StartedMcpChannel } from '../src/mcpChannel.js';
+import { McpChannelProcess, type McpChannelClient, type StartedMcpChannel } from '../src/mcpChannel.js';
 import { PluginIntegrityError, PluginLoadingError } from '../src/plugins.js';
 import {
 	SessionHostResolutionError,
@@ -356,6 +357,29 @@ describe('ChannelRuntime', () => {
 		assert.equal(client.shutDown, true);
 	});
 
+	it('keeps setup skills available and preserves missing-executable recovery guidance', async () => {
+		const client = new TestHostClient();
+		const command = `ahp-runtime-unavailable-${randomUUID()}`;
+		const mcp = new McpChannelProcess({ command, args: [] }, { write() { } });
+		const runtime = await ChannelRuntime.start('personal', {
+			plugin: 'fake', session: sessionUri, enabled: true,
+		}, createServices(client, mcp));
+		try {
+			assert.equal(runtime.snapshot.mode, 'customization-only');
+			assert.equal(runtime.startupFailure?.stage, 'mcp-startup');
+			assert.ok(runtime.startupFailure.message.includes(command));
+			assert.match(runtime.startupFailure.guidance, /daemon.*PATH/);
+			assert.match(runtime.startupFailure.guidance, /[Rr]estart the daemon/);
+			const registration = client.dispatched.find(item => item.action.type === ActionType.SessionActiveClientSet);
+			assert.ok(registration?.action.type === ActionType.SessionActiveClientSet);
+			assert.equal(registration.action.activeClient.customizations?.[0]?.name, 'fake');
+			assert.equal(client.shutDown, false);
+		} finally {
+			await runtime.close();
+		}
+		assert.equal(client.shutDown, true);
+	});
+
 	it('prepares a healthy replacement without publishing it until activation', async () => {
 		const client = new TestHostClient();
 		const runtime = await ChannelRuntime.prepare('personal', {
@@ -611,7 +635,7 @@ interface TestRuntimeServices extends ChannelRuntimeServices {
 	readonly sessionCatalog: TestSessionCatalog;
 }
 
-function createServices(client: TestHostClient, mcp: TestMcpChannel): TestRuntimeServices {
+function createServices(client: TestHostClient, mcp: McpChannelClient): TestRuntimeServices {
 	return {
 		async resolvePlugin() {
 			return {

@@ -233,9 +233,11 @@ export class ChannelRuntime {
 			} catch (error) {
 				const errors = [toError('MCP channel startup', error)];
 				await cleanup('MCP channel cleanup', () => mcp?.close(), errors);
-				startupFailure = operationError(
+				startupFailure = new ChannelOperationError(
 					'mcp-startup',
-					new AggregateError(errors, errors.map(candidate => candidate.message).join('; ')),
+					errors.map(candidate => candidate.message).join('; '),
+					error instanceof ChannelOperationError ? error.guidance : recoveryGuidance('mcp-startup'),
+					{ cause: new AggregateError(errors, 'MCP channel startup failed') },
 				);
 				status?.report(startupFailure.message);
 				mcp = new CustomizationOnlyChannel(plugin.name);

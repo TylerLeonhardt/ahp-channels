@@ -311,6 +311,26 @@ startup error but keeps its plugin customizations active. Run the contributed
 setup skill in the target session. The daemon retries automatically after the
 setup turn finishes and activates the channel server when it becomes runnable.
 
+### Missing plugin runtimes
+
+Plugins declare their launch executable in their MCP configuration. For
+example, the official Telegram and Discord plugins declare `command: "bun"`.
+The bridge uses the OS's normal executable lookup with the actual process
+environment and working directory; it does not run a separate version probe
+or guess requirements from the plugin name.
+
+When the executable or its interpreter cannot be found, channel health names
+the command and explains how to make it available. A missing working directory
+gets different guidance. These diagnostics do not block plugin installation
+or remove setup skills, and executable availability is checked by each launch
+attempt rather than cached. Runtime versions and dependencies hidden inside
+scripts remain the plugin's responsibility.
+
+Install the declared runtime, then restart the daemon from an environment
+whose `PATH` includes it. A channel restart alone does not refresh the daemon's
+inherited environment. If VS Code started before the runtime was installed,
+restart it from the updated environment too.
+
 ### Plugin environment and restarts
 
 For plugins configured through environment variables, follow the plugin's own
@@ -337,6 +357,18 @@ foreground execution, stop and rerun `channel run` from the updated terminal.
 Plugin-owned credential files and live-reload behavior remain the plugin's
 responsibility; follow its documentation. The bridge does not interpret those
 files or manage plugin authentication.
+
+### Windows credential-file line endings
+
+Some versions of the official Telegram and Discord plugins ignore credential
+assignments in files saved with Windows CRLF line endings. If a setup skill
+saved a token but the plugin still reports it missing, save that plugin's
+credential file as UTF-8 with **LF** line endings and retry the channel when
+idle. Keep its contents private.
+
+This is a plugin parser compatibility issue. The bridge does not read or
+normalize plugin credential files, and it does not patch installed snapshots.
+The upstream parser should accept both LF and CRLF.
 
 ## Attachments and resources
 

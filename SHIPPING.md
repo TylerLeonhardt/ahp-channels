@@ -98,6 +98,21 @@ source commit, and publishing workflow.
 Schema version 2 configuration remains unsupported. Its one-off dogfooding
 migration is separate from these runtime fixes.
 
+## 0.1.3 runtime prerequisite diagnostics
+
+- Identify missing MCP executables or interpreters using the actual launch
+  result, with install and daemon PATH guidance shared by CLI and extension.
+- Distinguish missing or invalid working directories from missing runtimes.
+- Preserve setup skills and actionable guidance while retaining native
+  environment lookup, permission errors, and retry behavior.
+- Cover overridden PATH, relative and absolute commands, installation between
+  attempts, and unchanged post-launch failures.
+- Document the LF credential-file workaround for affected Telegram and
+  Discord versions without rewriting plugin-owned files.
+
+No upstream plugin parser changes, automatic runtime installation, or
+configuration migration are included.
+
 ## Post-0.1.0 follow-up
 
 - [ ] Longer-running soak tests with fakechat, Telegram, and Discord through

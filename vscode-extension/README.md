@@ -119,6 +119,27 @@ Use **Open Daemon Log** for the plugin's diagnostic, such as a missing bot token
 or Bun installation. A generic `MCP error -32000: Connection closed` is not the
 underlying cause.
 
+### A required executable is missing
+
+The MCP launch configuration declares the executable, such as `bun`, `node`,
+or `python`. If it cannot be launched because it or its interpreter is missing,
+the channel tooltip identifies the command and provides recovery guidance.
+Setup skills remain available. Missing working directories are reported
+separately; the extension does not infer runtime requirements from plugin names
+or inspect credentials.
+
+Install the runtime and restart the daemon so it inherits an updated `PATH`.
+If needed, restart VS Code from that environment first. Restarting only the
+channel reuses the daemon's old environment.
+
+### A token saved on Windows is reported as missing
+
+Some Telegram and Discord plugin versions cannot parse CRLF credential files.
+Save the plugin's credential file as UTF-8 with **LF** line endings, then retry
+the channel when idle. Do not share the file contents. The parser fix belongs
+in the plugin; this extension does not rewrite credential files or installed
+plugin snapshots.
+
 ### A setup skill is missing
 
 Make sure the channel is started and you are in its selected conversation.
