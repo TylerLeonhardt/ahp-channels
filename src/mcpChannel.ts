@@ -10,6 +10,7 @@ import type { LogWriter } from './daemonLog.js';
 import { McpPermissionTransport, supportsChannelPermissions } from './mcpPermissions.js';
 import type { StdioMcpServerConfig } from './plugins.js';
 import { ChannelStdioClientTransport } from './channelStdioTransport.js';
+import { explainMcpStartupError } from './mcpStartup.js';
 import { convertToolResult, failedToolResult, formatMcpError, MAX_MCP_CONTENT_BYTES } from './mcpToolResult.js';
 import { VERSION } from './version.js';
 
@@ -100,7 +101,11 @@ export class McpChannelProcess implements McpChannelClient {
 			maxBufferSize: MAX_CHANNEL_MESSAGE_BYTES,
 		});
 		this.transport.stderr?.on('data', chunk => this.stderr.write(String(chunk)));
-		await this.client.connect(this.transport);
+		try {
+			await this.client.connect(this.transport);
+		} catch (error) {
+			throw await explainMcpStartupError(error, this.config);
+		}
 
 		const capabilities = this.client.getServerCapabilities();
 		const channelCapability = capabilities?.experimental?.['claude/channel'];
