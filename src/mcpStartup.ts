@@ -11,7 +11,7 @@ export async function explainMcpStartupError(
 		|| !('code' in error)
 		|| (error.code !== 'ENOENT' && error.code !== 'ENOTDIR')
 		|| !('syscall' in error)
-		|| error.syscall !== `spawn ${server.command}`) {
+		|| (error.syscall !== 'spawn' && error.syscall !== `spawn ${server.command}`)) {
 		return error;
 	}
 
