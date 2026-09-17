@@ -5,6 +5,7 @@ import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
+import { raceAbort } from '../src/async.js';
 import { ConfigStore, type ChannelInstanceConfig } from '../src/config.js';
 import { FileChannelHandoffStore, type ChannelHandoffRecord } from '../src/channelHandoff.js';
 import { ChannelOperationError } from '../src/channelHealth.js';
@@ -14,7 +15,7 @@ import {
 } from '../src/channelManagement.js';
 import { requestDaemon, requestDaemonData } from '../src/daemonClient.js';
 import { getOrCreateDaemonToken } from '../src/daemonPaths.js';
-import { DaemonProtocolError } from '../src/daemonProtocol.js';
+import { DaemonProtocolError, type ChannelDaemonStatus } from '../src/daemonProtocol.js';
 import {
 	DaemonServer,
 	type DaemonRuntimeFactory,
@@ -32,6 +33,26 @@ import type {
 } from '../src/sessionCatalog.js';
 
 const temporaryDirectories: string[] = [];
+
+class TestGate {
+	private enter!: () => void;
+	private open!: () => void;
+	readonly entered = new Promise<void>(resolve => {
+		this.enter = resolve;
+	});
+	private readonly released = new Promise<void>(resolve => {
+		this.open = resolve;
+	});
+
+	async wait(): Promise<void> {
+		this.enter();
+		await this.released;
+	}
+
+	release(): void {
+		this.open();
+	}
+}
 
 afterEach(async () => {
 	await Promise.all(temporaryDirectories.splice(0).map(directory => rm(directory, { recursive: true, force: true })));
@@ -105,12 +126,7 @@ class TestRuntime implements ManagedChannelRuntime {
 		if (!this.handoff || this.handoff.id !== id) {
 			throw new Error(`Unknown handoff ${id}`);
 		}
-		await Promise.race([
-			this.handoff.ready,
-			new Promise<never>((_resolve, reject) => {
-				signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-			}),
-		]);
+		await raceAbort(this.handoff.ready, signal);
 	}
 
 	async cancelHandoff(id: string): Promise<void> {
@@ -149,18 +165,17 @@ class TestRuntimeFactory implements DaemonRuntimeFactory {
 	failSession: string | undefined;
 	runtimeError: string | undefined;
 	runtimeErrorSession: string | undefined;
-	validateHook: ((definition: ChannelInstanceConfig) => void | Promise<void>) | undefined;
-	startHook: ((definition: ChannelInstanceConfig) => void | Promise<void>) | undefined;
+	validationGate: TestGate | undefined;
+	startGate: TestGate | undefined;
 
 	async validate(definition: ChannelInstanceConfig): Promise<void> {
-		await this.validateHook?.(definition);
+		await this.validationGate?.wait();
 		if (definition.plugin === 'invalid') {
 			throw new Error('invalid plugin');
 		}
 	}
 
 	async start(name: string, definition: ChannelInstanceConfig): Promise<TestRuntime> {
-		await this.startHook?.(definition);
 		if (definition.session === this.failSession) {
 			throw new ChannelOperationError('session-resolution', `failed to connect ${definition.session}`);
 		}
@@ -172,6 +187,7 @@ class TestRuntimeFactory implements DaemonRuntimeFactory {
 				: undefined,
 		);
 		this.runtimes.push(runtime);
+		await this.startGate?.wait();
 		return runtime;
 	}
 
@@ -257,7 +273,7 @@ class TestSessionCatalog implements DaemonSessionCatalog {
 }
 
 describe('DaemonServer', () => {
-	it('creates, starts, safely switches, retries, stops, and deletes channels', async () => {
+	it('creates, starts, safely switches, rolls back, stops, and deletes channels', async () => {
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
 		temporaryDirectories.push(home);
 		const store = new ConfigStore(home);
@@ -291,13 +307,9 @@ describe('DaemonServer', () => {
 			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/one');
 
 			factory.runtimes[0].busy = false;
-			factory.validateHook = async definition => {
-				if (definition.session === 'ahp-session:/racing') {
-					await Promise.resolve();
-					factory.runtimes[0].busy = true;
-				}
-			};
-			await assert.rejects(
+			const validationGate = new TestGate();
+			factory.validationGate = validationGate;
+			const racingSwitch = assert.rejects(
 				requestDaemon(home, {
 					command: 'channel.switch',
 					name: 'personal',
@@ -305,9 +317,16 @@ describe('DaemonServer', () => {
 				}),
 				(error: unknown) => error instanceof DaemonProtocolError && error.code === 'CHANNEL_BUSY',
 			);
+			try {
+				await validationGate.entered;
+				factory.runtimes[0].busy = true;
+			} finally {
+				validationGate.release();
+			}
+			await racingSwitch;
 			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/one');
 			factory.runtimes[0].busy = false;
-			factory.validateHook = undefined;
+			factory.validationGate = undefined;
 
 			status = await requestDaemon(home, {
 				command: 'channel.switch',
@@ -381,16 +400,6 @@ describe('DaemonServer', () => {
 			assert.equal(status.channels[0]?.state, 'running');
 			assert.equal(factory.runtimes.length, beforeRestartCommand + 1);
 
-			const beforeFailedRestart = factory.runtimes.length;
-			const failingRuntime = factory.runtimes.at(-1);
-			assert.ok(failingRuntime);
-			failingRuntime.failClose = true;
-			await assert.rejects(
-				requestDaemon(home, { command: 'channel.restart', name: 'personal' }),
-				/close failed/,
-			);
-			await waitFor(async () => factory.runtimes.length > beforeFailedRestart, 3000);
-
 			factory.failSession = 'ahp-session:/broken';
 			await assert.rejects(
 				requestDaemon(home, {
@@ -404,24 +413,6 @@ describe('DaemonServer', () => {
 			assert.equal(factory.runtimes.at(-1)?.definition.session, 'ahp-session:/two');
 			factory.failSession = undefined;
 
-			const beforeRestart = factory.runtimes.length;
-			factory.runtimes.at(-1)?.stopUnexpectedly();
-			await waitFor(async () => {
-				const channel = (await requestDaemon(home, { command: 'status' })).channels[0];
-				return channel?.health.failure?.stage === 'mcp-exit'
-					&& channel.health.retry?.attempt === 1
-					&& channel.health.retry.nextRetryAt !== undefined;
-			}, 500);
-			await waitFor(async () => factory.runtimes.length > beforeRestart, 3000);
-			status = await requestDaemon(home, { command: 'status' });
-			assert.equal(status.channels[0]?.state, 'running');
-
-			const afterFirstRestart = factory.runtimes.length;
-			factory.runtimes.at(-1)?.stopUnexpectedly();
-			await new Promise(resolve => setTimeout(resolve, 1300));
-			assert.equal(factory.runtimes.length, afterFirstRestart);
-			await waitFor(async () => factory.runtimes.length > afterFirstRestart, 2500);
-
 			status = await requestDaemon(home, { command: 'channel.stop', name: 'personal' });
 			assert.equal(status.channels[0]?.state, 'stopped');
 			assert.equal(status.channels[0]?.desired, 'stopped');
@@ -433,6 +424,127 @@ describe('DaemonServer', () => {
 			status = await requestDaemon(home, { command: 'channel.delete', name: 'personal' });
 			assert.deepEqual(status.channels, []);
 			assert.deepEqual((await store.read()).channels, {});
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('waits for a complete replacement after a failed runtime close', { timeout: 15_000 }, async context => {
+		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		const factory = new TestRuntimeFactory();
+		const gate = new TestGate();
+		const server = new DaemonServer(home, await getOrCreateDaemonToken(home), store, factory);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake', session: 'ahp-session:/one', host: 'test-host', enabled: false,
+				},
+				start: true,
+			});
+			const original = factory.runtimes[0];
+			original.failClose = true;
+			await assert.rejects(
+				requestDaemon(home, { command: 'channel.restart', name: 'personal' }),
+				/close failed/,
+			);
+			const scheduled = await settledChannelStatus(home, 'personal', 'test-host');
+			assert.equal(scheduled.health.failure?.stage, 'mcp-exit');
+			assert.equal(scheduled.health.retry?.attempt, 1);
+			assert.equal(scheduled.health.retry?.nextRetryAt, new Date(Date.now() + 1000).toISOString());
+
+			factory.startGate = gate;
+			context.mock.timers.tick(999);
+			assert.equal((await settledChannelStatus(home, 'personal', 'test-host')).state, 'error');
+			assert.equal(factory.runtimes.length, 1);
+
+			context.mock.timers.tick(1);
+			await raceAbort(gate.entered, context.signal);
+			const created = factory.runtimes[1];
+			assert.ok(created, 'The fixture deliberately allocates a replacement before startup completes');
+			const preparing = (await requestDaemon(home, { command: 'status' })).channels[0];
+			assert.equal(preparing.state, 'starting');
+			assert.equal(preparing.runtime, undefined);
+
+			gate.release();
+			const running = await waitForRunningChannel(home, 'personal', original.bindingId);
+			assert.equal(running.runtime?.bindingId, created.bindingId);
+			assert.equal(running.definition.session, 'ahp-session:/one');
+			assert.equal(original.closed, true);
+			await assert.rejects(access(join(home, 'instances', 'personal', 'health.json')));
+
+			created.stopUnexpectedly();
+			const exited = await settledChannelStatus(home, 'personal', 'test-host');
+			assert.equal(exited.health.failure?.stage, 'mcp-exit', 'Ready means the replacement is supervised too');
+			assert.equal(exited.health.retry?.attempt, 2, 'A replacement that exits before stability keeps its backoff history');
+		} finally {
+			gate.release();
+			await server.close();
+		}
+	});
+
+	it('uses exact retry deadlines, caps backoff, and resets after a stable runtime', { timeout: 15_000 }, async context => {
+		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		const factory = new TestRuntimeFactory();
+		const server = new DaemonServer(home, await getOrCreateDaemonToken(home), store, factory);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake', session: 'ahp-session:/one', host: 'test-host', enabled: false,
+				},
+				start: true,
+			});
+
+			for (const [index, delayMs] of [1000, 2000, 4000, 8000, 16_000, 30_000, 30_000].entries()) {
+				const original = factory.runtimes.at(-1);
+				assert.ok(original);
+				const started = factory.runtimes.length;
+				original.stopUnexpectedly();
+				const scheduled = await settledChannelStatus(home, 'personal', 'test-host');
+				assert.equal(scheduled.state, 'error');
+				assert.equal(scheduled.health.failure?.stage, 'mcp-exit');
+				assert.equal(scheduled.health.retry?.attempt, index + 1);
+				assert.equal(scheduled.health.retry?.nextRetryAt, new Date(Date.now() + delayMs).toISOString());
+				assert.equal(original.closed, true);
+
+				context.mock.timers.tick(delayMs - 1);
+				assert.equal((await settledChannelStatus(home, 'personal', 'test-host')).state, 'error');
+				assert.equal(factory.runtimes.length, started, 'No replacement may start before its retry deadline');
+				context.mock.timers.tick(1);
+				const recovered = await waitForRunningChannel(home, 'personal', original.bindingId);
+				assert.equal(factory.runtimes.length, started + 1);
+				assert.equal(recovered.runtime?.bindingId, factory.runtimes.at(-1)?.bindingId);
+			}
+
+			context.mock.timers.tick(29_999);
+			const unstable = factory.runtimes.at(-1);
+			assert.ok(unstable);
+			unstable.stopUnexpectedly();
+			const beforeStability = await settledChannelStatus(home, 'personal', 'test-host');
+			assert.equal(beforeStability.health.retry?.attempt, 8, 'Backoff must not reset before 30 seconds of stability');
+			context.mock.timers.tick(30_000);
+			await waitForRunningChannel(home, 'personal', unstable.bindingId);
+
+			context.mock.timers.tick(30_000);
+			const stable = factory.runtimes.at(-1);
+			assert.ok(stable);
+			stable.stopUnexpectedly();
+			const afterStability = await settledChannelStatus(home, 'personal', 'test-host');
+			assert.equal(afterStability.health.retry?.attempt, 1);
+			assert.equal(afterStability.health.retry?.nextRetryAt, new Date(Date.now() + 1000).toISOString());
+			context.mock.timers.tick(1000);
+			await waitForRunningChannel(home, 'personal', stable.bindingId);
 		} finally {
 			await server.close();
 		}
@@ -535,10 +647,8 @@ describe('DaemonServer', () => {
 			);
 
 			source.finishTurn();
-			await waitFor(async () => {
-				const handoff = (await requestDaemon(home, { command: 'status' })).channels[0]?.handoff;
-				return handoff?.state === 'applied';
-			}, 1000);
+			const applied = await waitForRunningChannel(home, 'personal', source.bindingId);
+			assert.equal(applied.handoff?.state, 'applied');
 			status = await requestDaemon(home, { command: 'status' });
 			assert.deepEqual({
 				definition: status.channels[0]?.definition,
@@ -635,7 +745,9 @@ describe('DaemonServer', () => {
 			});
 			assert.equal(cancelled.channels[0]?.handoff?.state, 'cancelled');
 			source.finishTurn();
-			await new Promise(resolve => setTimeout(resolve, 20));
+			const settled = await settledChannelStatus(home, 'personal', '@source');
+			assert.equal(settled.handoff?.state, 'cancelled');
+			assert.equal(settled.runtime?.bindingId, source.bindingId);
 			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
 			assert.equal(source.closed, false);
 		} finally {
@@ -801,10 +913,7 @@ describe('DaemonServer', () => {
 		const server = new DaemonServer(
 			home, await getOrCreateDaemonToken(home), store, factory, undefined, new TestSessionCatalog(),
 		);
-		let prepared!: () => void;
-		let release!: () => void;
-		const preparing = new Promise<void>(resolve => { prepared = resolve; });
-		const gate = new Promise<void>(resolve => { release = resolve; });
+		const gate = new TestGate();
 		let switching: Promise<unknown> | undefined;
 		await server.start();
 		try {
@@ -816,27 +925,22 @@ describe('DaemonServer', () => {
 				},
 				start: true,
 			});
-			factory.startHook = async definition => {
-				if (definition.session === 'ahp-session:/destination') {
-					prepared();
-					await gate;
-				}
-			};
+			factory.startGate = gate;
 			switching = requestDaemon(home, {
 				command: 'channel.handoff',
 				name: 'personal',
 				target: { host: '@destination', session: 'ahp-session:/destination' },
 			});
-			await preparing;
+			await gate.entered;
 			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
 			const status = await requestDaemon(home, { command: 'status' });
 			assert.equal(status.channels[0]?.handoff?.state, 'pending');
 			assert.equal(status.channels[0]?.state, 'starting');
-			release();
+			gate.release();
 			await switching;
 			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/destination');
 		} finally {
-			release();
+			gate.release();
 			await switching;
 			await server.close();
 		}
@@ -1007,7 +1111,8 @@ describe('DaemonServer', () => {
 		}
 	});
 
-	it('reports a customization-only runtime as an error', async () => {
+	it('reports a customization-only runtime as an error and retries only after its turn', async context => {
+		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
 		temporaryDirectories.push(home);
 		const store = new ConfigStore(home);
@@ -1022,6 +1127,7 @@ describe('DaemonServer', () => {
 				definition: {
 					plugin: 'fake',
 					session: 'ahp-session:/one',
+					host: 'test-host',
 					enabled: false,
 				},
 				start: true,
@@ -1051,11 +1157,22 @@ describe('DaemonServer', () => {
 			});
 
 			factory.runtimeError = undefined;
-			await waitFor(async () => factory.runtimes.length > 1, 3000);
-			const recovered = await requestDaemon(home, { command: 'status' });
+			const failedRuntime = factory.runtimes[0];
+			failedRuntime.busy = true;
+			context.mock.timers.tick(1000);
+			const deferred = await settledChannelStatus(home, 'personal', 'test-host');
+			assert.equal(deferred.runtime?.bindingId, failedRuntime.bindingId);
+			assert.equal(deferred.health.retry?.attempt, 2);
+			assert.equal(deferred.health.retry?.nextRetryAt, new Date(Date.now() + 2000).toISOString());
+			assert.equal(failedRuntime.closed, false);
+			assert.equal(factory.runtimes.length, 1);
+
+			failedRuntime.busy = false;
+			context.mock.timers.tick(2000);
+			const recovered = await waitForRunningChannel(home, 'personal', failedRuntime.bindingId);
 			assert.deepEqual({
-				state: recovered.channels[0]?.state,
-				health: recovered.channels[0]?.health,
+				state: recovered.state,
+				health: recovered.health,
 				failedRuntimeClosed: factory.runtimes[0]?.closed,
 			}, {
 				state: 'running',
@@ -1068,7 +1185,8 @@ describe('DaemonServer', () => {
 		}
 	});
 
-	it('preserves failure and retry attempts across a daemon restart', async () => {
+	it('preserves failure and retry attempts across a daemon restart', async context => {
+		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
 		temporaryDirectories.push(home);
 		const store = new ConfigStore(home);
@@ -1086,11 +1204,14 @@ describe('DaemonServer', () => {
 		const firstFactory = new TestRuntimeFactory();
 		firstFactory.failSession = 'ahp-session:/remembered';
 		const first = new DaemonServer(home, await getOrCreateDaemonToken(home), store, firstFactory);
-		await first.start();
-		const firstStatus = await requestDaemon(home, { command: 'status' });
-		assert.equal(firstStatus.channels[0]?.health.failure?.summary, 'failed to connect ahp-session:/remembered');
-		assert.equal(firstStatus.channels[0]?.health.retry?.attempt, 1);
-		await first.close();
+		try {
+			await first.start();
+			const firstStatus = await requestDaemon(home, { command: 'status' });
+			assert.equal(firstStatus.channels[0]?.health.failure?.summary, 'failed to connect ahp-session:/remembered');
+			assert.equal(firstStatus.channels[0]?.health.retry?.attempt, 1);
+		} finally {
+			await first.close();
+		}
 
 		const secondFactory = new TestRuntimeFactory();
 		secondFactory.failSession = 'ahp-session:/remembered';
@@ -1129,7 +1250,8 @@ describe('DaemonServer', () => {
 		await server.close();
 	});
 
-	it('prints actionable diagnostics without exposing secrets', async () => {
+	it('prints actionable diagnostics without exposing secrets', async context => {
+		context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
 		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-'));
 		temporaryDirectories.push(home);
 		const store = new ConfigStore(home);
@@ -1291,30 +1413,30 @@ describe('DaemonServer', () => {
 			},
 		}));
 		const factory = new TestRuntimeFactory();
-		let releaseStart!: () => void;
-		const startGate = new Promise<void>(resolve => {
-			releaseStart = resolve;
-		});
-		factory.startHook = () => startGate;
+		const startGate = new TestGate();
+		factory.startGate = startGate;
 		const server = new DaemonServer(home, await getOrCreateDaemonToken(home), store, factory);
 		const starting = server.start();
-		await server.whenListening;
-		let commandCompleted = false;
-		const command = requestDaemon(home, { command: 'channel.start', name: 'remembered' })
-			.then(status => {
-				commandCompleted = true;
-				return status;
-			});
-
-		await new Promise(resolve => setTimeout(resolve, 50));
-		assert.equal(commandCompleted, false);
-		releaseStart();
-		await starting;
 		try {
+			await server.whenListening;
+			await startGate.entered;
+			let commandCompleted = false;
+			const command = requestDaemon(home, { command: 'channel.start', name: 'remembered' })
+				.then(status => {
+					commandCompleted = true;
+					return status;
+				});
+
+			await new Promise<void>(resolve => setImmediate(resolve));
+			assert.equal(commandCompleted, false);
+			startGate.release();
+			await starting;
 			const status = await command;
 			assert.equal(status.channels[0]?.state, 'running');
 			assert.equal(factory.runtimes.length, 1);
 		} finally {
+			startGate.release();
+			await starting;
 			await server.close();
 		}
 	});
@@ -1361,14 +1483,41 @@ describe('DaemonServer', () => {
 });
 
 async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs: number): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
+	const deadline = performance.now() + timeoutMs;
+	while (performance.now() < deadline) {
 		if (await condition()) {
 			return;
 		}
-		await new Promise(resolve => setTimeout(resolve, 20));
+		await new Promise<void>(resolve => setImmediate(resolve));
 	}
 	throw new Error('Timed out waiting for condition');
+}
+
+async function waitForRunningChannel(
+	home: string,
+	name: string,
+	previousBindingId: string,
+): Promise<ChannelDaemonStatus> {
+	const deadline = performance.now() + 5000;
+	let lastStatus: ChannelDaemonStatus | undefined;
+	while (performance.now() < deadline) {
+		lastStatus = (await requestDaemon(home, { command: 'status' })).channels.find(channel => channel.name === name);
+		if (lastStatus?.state === 'running' && lastStatus.health.state === 'healthy'
+			&& lastStatus.runtime && lastStatus.runtime.bindingId !== previousBindingId) {
+			return lastStatus;
+		}
+		await new Promise<void>(resolve => setImmediate(resolve));
+	}
+	throw new Error(`Channel '${name}' did not finish startup with a new binding: ${JSON.stringify(lastStatus)}`);
+}
+
+async function settledChannelStatus(home: string, name: string, host: string): Promise<ChannelDaemonStatus> {
+	// A no-op rehost waits behind restart scheduling on the existing mutation queue;
+	// a read-only status request can observe retry metadata before its timer exists.
+	const status = await requestDaemon(home, { command: 'channel.rehost', name, host });
+	const channel = status.channels.find(channel => channel.name === name);
+	assert.ok(channel);
+	return channel;
 }
 
 async function configureHostAliases(store: ConfigStore, home: string): Promise<void> {
