@@ -105,12 +105,22 @@ files.
 - Combined handoff and in-flight MCP resource-materialization coverage with
   byte-exact text/image results and no stale results in the destination chat.
 
+## Completed: macOS prerelease onboarding
+
+- Install published `0.1.0-alpha.4` and configure Telegram through the ordinary
+  CLI flow with fresh bridge configuration and plugin-owned token setup.
+- Verify a real Telegram phone message reaches the bound Copilot conversation,
+  a reply returns through the plugin, and CLI status reports a healthy channel.
+
+This reused an existing test bot and allowlist on macOS; it was not a
+pristine-machine or new-pairing test.
+
 ## Next: Remote identity and release validation
 
 - Define a standard-backed stable identity and credential resolver before
   adding aliases for remote Agent Hosts.
-- Run a fresh macOS or Linux Telegram setup from the published prerelease
-  using plugin-owned configuration.
+- Verify published-prerelease Telegram onboarding on Linux using plugin-owned
+  configuration; results from another machine are pending.
 - Soak fakechat, Telegram, and Discord through daemon restarts and plugin
   upgrades.
 
