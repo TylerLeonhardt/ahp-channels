@@ -98,7 +98,7 @@ try {
 		channel: mcp,
 		channelInfo,
 		customizations,
-		onStatus: message => console.log(`[e2e] ${message}`),
+		status: { report: message => console.log(`[e2e] ${message}`) },
 	});
 	await bridge.start();
 	await waitForPluginSkill(

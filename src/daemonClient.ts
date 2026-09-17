@@ -11,23 +11,56 @@ import {
 	DaemonProtocolError,
 	MAX_DAEMON_MESSAGE_BYTES,
 	parseDaemonResponse,
+	type DaemonCommandResult,
 	type DaemonRequestBody,
+	type DaemonResponseData,
 	type DaemonStatus,
 } from './daemonProtocol.js';
 
 export async function requestDaemon(home: string, body: DaemonRequestBody, timeoutMs?: number): Promise<DaemonStatus> {
-	const token = await getOrCreateDaemonToken(home);
-	return requestDaemonWithToken(home, token, body, timeoutMs);
+	return (await requestDaemonResult(home, body, { timeoutMs })).status;
 }
 
-async function requestDaemonWithToken(home: string, token: string, body: DaemonRequestBody, timeoutMs?: number): Promise<DaemonStatus> {
+export async function requestDaemonData(
+	home: string,
+	body: Extract<DaemonRequestBody, { command: 'catalog.sessions' | 'catalog.chats' }>,
+	signal?: AbortSignal,
+): Promise<DaemonResponseData> {
+	const result = await requestDaemonResult(home, body, { signal });
+	if (!result.data) {
+		throw new DaemonProtocolError('INVALID_RESPONSE', `Daemon returned no data for ${body.command}`);
+	}
+	return result.data;
+}
+
+export interface DaemonRequestOptions {
+	readonly timeoutMs?: number;
+	readonly signal?: AbortSignal;
+}
+
+export async function requestDaemonResult(
+	home: string,
+	body: DaemonRequestBody,
+	options: DaemonRequestOptions = {},
+): Promise<DaemonCommandResult> {
+	const token = await getOrCreateDaemonToken(home);
+	return requestDaemonWithToken(home, token, body, options);
+}
+
+async function requestDaemonWithToken(
+	home: string,
+	token: string,
+	body: DaemonRequestBody,
+	options: DaemonRequestOptions = {},
+): Promise<DaemonCommandResult> {
 	const response = await sendRequest(getDaemonPaths(home).endpoint, JSON.stringify({
 		version: DAEMON_PROTOCOL_VERSION,
 		token,
 		body,
 	}), {
-		connectTimeoutMs: timeoutMs ?? 10_000,
-		responseTimeoutMs: timeoutMs ?? (isImmediateCommand(body) ? 10_000 : undefined),
+		connectTimeoutMs: options.timeoutMs ?? 10_000,
+		responseTimeoutMs: options.timeoutMs ?? (isImmediateCommand(body) ? 10_000 : undefined),
+		signal: options.signal,
 	});
 	let value: unknown;
 	try {
@@ -48,7 +81,7 @@ export async function probeDaemon(home: string, timeoutMs = 500): Promise<Daemon
 		return undefined;
 	}
 	try {
-		return await requestDaemonWithToken(home, token, { command: 'ping' }, timeoutMs);
+		return (await requestDaemonWithToken(home, token, { command: 'ping' }, { timeoutMs })).status;
 	} catch (error) {
 		if (isUnavailableError(error)) {
 			return undefined;
@@ -158,11 +191,16 @@ export async function stopDaemon(home: string): Promise<void> {
 interface SendRequestTimeouts {
 	readonly connectTimeoutMs: number;
 	readonly responseTimeoutMs?: number;
+	readonly signal?: AbortSignal;
 }
 
 async function sendRequest(endpoint: string, payload: string, timeouts: SendRequestTimeouts): Promise<string> {
 	if (Buffer.byteLength(payload) > MAX_DAEMON_MESSAGE_BYTES) {
 		throw new DaemonProtocolError('MESSAGE_TOO_LARGE', 'Daemon request exceeds the message size limit');
+	}
+
+	if (timeouts.signal?.aborted) {
+		throw timeouts.signal.reason;
 	}
 
 	return new Promise((resolve, reject) => {
@@ -182,6 +220,7 @@ async function sendRequest(endpoint: string, payload: string, timeouts: SendRequ
 			if (responseTimer) {
 				clearTimeout(responseTimer);
 			}
+			timeouts.signal?.removeEventListener('abort', onAbort);
 			socket.destroy();
 			if (error) {
 				reject(error);
@@ -189,6 +228,8 @@ async function sendRequest(endpoint: string, payload: string, timeouts: SendRequ
 				resolve(value ?? '');
 			}
 		};
+		const onAbort = () => finish(timeouts.signal?.reason);
+		timeouts.signal?.addEventListener('abort', onAbort, { once: true });
 
 		connectTimer = setTimeout(
 			() => finish(new Error(`Timed out connecting to daemon after ${timeouts.connectTimeoutMs}ms`)),

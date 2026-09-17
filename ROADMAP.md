@@ -89,12 +89,26 @@ files.
 - URI-preserving local fallback, daemon restoration, strict ambiguity and
   invalid-configuration errors, and secret-safe diagnostics.
 
-## Next: Host selection and release validation
+## Completed: Generic session selection and safe channel handoff
+
+- Structured, paginated session and chat discovery across configured local
+  Agent Hosts, with explicit empty, partial, and failed outcomes.
+- Searchable terminal selection plus noninteractive host/session/chat
+  selectors.
+- Generic Agent Host client tools for discovery, pending handoff, status, and
+  owner-scoped cancellation without plugin-tool autoapproval.
+- One daemon-owned host/session/chat commit with destination validation,
+  safe-turn boundaries, durable inbound holding, rollback, stale-binding
+  rejection, and restart recovery to the committed source.
+- Deterministic two-host external-channel E2E with distinct source and
+  destination session/chat identities.
+- Combined handoff and in-flight MCP resource-materialization coverage with
+  byte-exact text/image results and no stale results in the destination chat.
+
+## Next: Remote identity and release validation
 
 - Define a standard-backed stable identity and credential resolver before
   adding aliases for remote Agent Hosts.
-- Improve host, session, and chat selection without replacing URI-based
-  bindings.
 - Run a fresh macOS or Linux Telegram setup from the published prerelease
   using plugin-owned configuration.
 - Soak fakechat, Telegram, and Discord through daemon restarts and plugin

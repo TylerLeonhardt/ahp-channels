@@ -87,6 +87,7 @@ export class ChannelPermissionRelay {
 	private readonly offered = new WeakSet<ToolCallPendingConfirmationState>();
 	private readonly tasks = new Set<Promise<void>>();
 	private readonly lifetime = new AbortController();
+	private started = false;
 	private readonly onVerdict = (verdict: ChannelPermissionVerdict) => {
 		const pending = this.requests.get(verdict.request_id);
 		if (!pending || pending.phase !== 'awaiting' || !this.isCurrent(pending)) {
@@ -104,6 +105,7 @@ export class ChannelPermissionRelay {
 		private readonly transport: ChannelPermissionTransport | undefined,
 		private state: ChatState,
 		private readonly channelTools: readonly ToolDefinition[],
+		private readonly managementTools: readonly ToolDefinition[] = [],
 	) {
 		if (state.resource !== chat) {
 			throw new Error('Permission relay snapshot does not match its bound chat');
@@ -112,6 +114,10 @@ export class ChannelPermissionRelay {
 	}
 
 	start(): void {
+		if (this.started || this.lifetime.signal.aborted) {
+			return;
+		}
+		this.started = true;
 		this.reconcile();
 		if (this.transport) {
 			this.events.emit('status', 'tool permission relay enabled for this chat; sender authorization is owned by the channel plugin');
@@ -169,7 +175,7 @@ export class ChannelPermissionRelay {
 	}
 
 	private reconcile(): void {
-		if (this.lifetime.signal.aborted) {
+		if (!this.started || this.lifetime.signal.aborted) {
 			return;
 		}
 		for (const request of this.requests.values()) {
@@ -188,6 +194,10 @@ export class ChannelPermissionRelay {
 			}
 			if (isChannelToolContributor(tool, this.clientId)) {
 				this.offered.add(tool);
+				if (this.managementTools.some(definition => definition.name === tool.toolName)) {
+					this.events.emit('status', `left bridge management tool ${sanitizePermissionText(tool.toolName)} for Agent Host approval`);
+					continue;
+				}
 				const available = isChannelToolCall(tool, this.clientId, this.channelTools);
 				const reasonMessage = `Channel tool '${sanitizePermissionText(tool.toolName)}' is no longer available`;
 				this.host.dispatch(this.chat, available ? {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { access, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -109,6 +110,46 @@ describe('daemon control protocol', () => {
 				name: 'personal',
 				host: '@local',
 			},
+		);
+		const sourceBindingId = randomUUID();
+		assert.deepEqual(
+			parseDaemonRequest({
+				version: DAEMON_PROTOCOL_VERSION,
+				token: 'x'.repeat(32),
+				body: {
+					command: 'channel.handoff.request',
+					name: 'personal',
+					sourceBindingId,
+					target: {
+						host: '@destination',
+						session: 'ahp-session:/destination',
+						chat: 'ahp-chat:/destination',
+					},
+				},
+			}).body,
+			{
+				command: 'channel.handoff.request',
+				name: 'personal',
+				sourceBindingId,
+				target: {
+					host: '@destination',
+					session: 'ahp-session:/destination',
+					chat: 'ahp-chat:/destination',
+				},
+			},
+		);
+		assert.throws(
+			() => parseDaemonRequest({
+				version: DAEMON_PROTOCOL_VERSION,
+				token: 'x'.repeat(32),
+				body: {
+					command: 'channel.handoff.cancel',
+					name: 'personal',
+					sourceBindingId: 'not-a-binding-id',
+					requestId: randomUUID(),
+				},
+			}),
+			(error: unknown) => error instanceof DaemonProtocolError && error.code === 'INVALID_REQUEST',
 		);
 	});
 

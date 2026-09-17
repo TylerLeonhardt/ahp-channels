@@ -1,9 +1,16 @@
 import { z } from 'zod';
+import { ChannelHandoffRecordSchema, type ChannelHandoffRecord } from './channelHandoff.js';
 import { ChannelFailureStageSchema, type ChannelHealth } from './channelHealth.js';
 import type { ChannelInstanceConfig } from './config.js';
 import type { ChannelRuntimeSnapshot } from './channelRuntime.js';
+import {
+	ChatDiscoveryResultSchema,
+	SessionDiscoveryResultSchema,
+	type ChatDiscoveryResult,
+	type SessionDiscoveryResult,
+} from './sessionCatalog.js';
 
-export const DAEMON_PROTOCOL_VERSION = 5;
+export const DAEMON_PROTOCOL_VERSION = 6;
 export const MAX_DAEMON_MESSAGE_BYTES = 1024 * 1024;
 
 const ChannelInstanceSchema = z.strictObject({
@@ -15,6 +22,12 @@ const ChannelInstanceSchema = z.strictObject({
 	host: z.string().min(1).optional(),
 	clientId: z.string().min(1).optional(),
 	installation: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+});
+
+const BindingTargetSchema = z.strictObject({
+	host: z.string().min(1).optional(),
+	session: z.string().min(1),
+	chat: z.string().min(1).optional(),
 });
 
 const RequestBodySchema = z.discriminatedUnion('command', [
@@ -51,6 +64,40 @@ const RequestBodySchema = z.discriminatedUnion('command', [
 		host: z.string().min(1),
 	}),
 	z.strictObject({
+		command: z.literal('channel.handoff'),
+		name: z.string().min(1),
+		target: BindingTargetSchema,
+	}),
+	z.strictObject({
+		command: z.literal('channel.handoff.request'),
+		name: z.string().min(1),
+		sourceBindingId: z.string().uuid(),
+		target: BindingTargetSchema,
+	}),
+	z.strictObject({
+		command: z.literal('channel.handoff.cancel'),
+		name: z.string().min(1),
+		sourceBindingId: z.string().uuid(),
+		requestId: z.string().uuid(),
+	}),
+	z.strictObject({
+		command: z.literal('catalog.sessions'),
+		name: z.string().min(1),
+		sourceBindingId: z.string().uuid().optional(),
+		host: z.string().min(1).optional(),
+		cursor: z.string().min(1).optional(),
+		limit: z.number().int().min(1).max(100).optional(),
+	}),
+	z.strictObject({
+		command: z.literal('catalog.chats'),
+		name: z.string().min(1),
+		sourceBindingId: z.string().uuid().optional(),
+		host: z.string().min(1).optional(),
+		session: z.string().min(1),
+		cursor: z.string().min(1).optional(),
+		limit: z.number().int().min(1).max(100).optional(),
+	}),
+	z.strictObject({
 		command: z.literal('channel.repin'),
 		name: z.string().min(1),
 		installation: z.string().regex(/^[a-f0-9]{64}$/),
@@ -76,6 +123,7 @@ const RuntimeSnapshotSchema = z.strictObject({
 	clientId: z.string(),
 	channelName: z.string(),
 	startedAt: z.string(),
+	bindingId: z.string().uuid(),
 	busy: z.boolean(),
 	mode: z.enum(['mcp', 'customization-only']),
 });
@@ -121,6 +169,7 @@ const ChannelStatusSchema = z.strictObject({
 	definition: ChannelInstanceSchema,
 	runtime: RuntimeSnapshotSchema.optional(),
 	health: ChannelHealthSchema,
+	handoff: ChannelHandoffRecordSchema.optional(),
 });
 
 const DaemonStatusSchema = z.strictObject({
@@ -129,11 +178,21 @@ const DaemonStatusSchema = z.strictObject({
 	channels: z.array(ChannelStatusSchema),
 });
 
+const DaemonResponseDataSchema = z.discriminatedUnion('kind', [
+	SessionDiscoveryResultSchema,
+	ChatDiscoveryResultSchema,
+]);
+
+const DaemonCommandResultSchema = z.strictObject({
+	status: DaemonStatusSchema,
+	data: DaemonResponseDataSchema.optional(),
+});
+
 const ResponseSchema = z.discriminatedUnion('ok', [
 	z.strictObject({
 		version: z.literal(DAEMON_PROTOCOL_VERSION),
 		ok: z.literal(true),
-		result: DaemonStatusSchema,
+		result: DaemonCommandResultSchema,
 	}),
 	z.strictObject({
 		version: z.literal(DAEMON_PROTOCOL_VERSION),
@@ -157,6 +216,7 @@ export interface ChannelDaemonStatus {
 	readonly definition: ChannelInstanceConfig;
 	readonly runtime?: ChannelRuntimeSnapshot;
 	readonly health: ChannelHealth;
+	readonly handoff?: ChannelHandoffRecord;
 }
 
 export interface DaemonStatus {
@@ -168,7 +228,7 @@ export interface DaemonStatus {
 export interface DaemonSuccessResponse {
 	readonly version: typeof DAEMON_PROTOCOL_VERSION;
 	readonly ok: true;
-	readonly result: DaemonStatus;
+	readonly result: DaemonCommandResult;
 }
 
 export interface DaemonErrorResponse {
@@ -181,6 +241,13 @@ export interface DaemonErrorResponse {
 }
 
 export type DaemonResponse = DaemonSuccessResponse | DaemonErrorResponse;
+
+export type DaemonResponseData = SessionDiscoveryResult | ChatDiscoveryResult;
+
+export interface DaemonCommandResult {
+	readonly status: DaemonStatus;
+	readonly data?: DaemonResponseData;
+}
 
 export function parseDaemonRequest(value: unknown): DaemonRequest {
 	const parsed = RequestSchema.safeParse(value);

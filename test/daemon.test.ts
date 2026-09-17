@@ -1,16 +1,35 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { ConfigStore, type ChannelInstanceConfig } from '../src/config.js';
+import { FileChannelHandoffStore, type ChannelHandoffRecord } from '../src/channelHandoff.js';
 import { ChannelOperationError } from '../src/channelHealth.js';
-import { requestDaemon } from '../src/daemonClient.js';
+import {
+	DaemonChannelManagementService,
+	MANAGEMENT_TOOL_NAMES,
+} from '../src/channelManagement.js';
+import { requestDaemon, requestDaemonData } from '../src/daemonClient.js';
 import { getOrCreateDaemonToken } from '../src/daemonPaths.js';
 import { DaemonProtocolError } from '../src/daemonProtocol.js';
-import { DaemonServer, type DaemonRuntimeFactory, type ManagedChannelRuntime } from '../src/daemonServer.js';
+import {
+	DaemonServer,
+	type DaemonRuntimeFactory,
+	type DaemonSessionCatalog,
+	type ManagedChannelRuntime,
+} from '../src/daemonServer.js';
 import type { ChannelRuntimeSnapshot } from '../src/channelRuntime.js';
+import type {
+	ChatDiscoveryRequest,
+	ChatDiscoveryResult,
+	ChannelBindingTarget,
+	ResolvedChannelBinding,
+	SessionDiscoveryRequest,
+	SessionDiscoveryResult,
+} from '../src/sessionCatalog.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -22,6 +41,12 @@ class TestRuntime implements ManagedChannelRuntime {
 	closed = false;
 	busy = false;
 	failClose = false;
+	private handoff: {
+		readonly id: string;
+		readonly ready: Promise<void>;
+		readonly resolveReady: () => void;
+	} | undefined;
+	readonly bindingId = randomUUID();
 	private resolveStopped!: () => void;
 	readonly whenStopped = new Promise<void>(resolve => {
 		this.resolveStopped = resolve;
@@ -39,10 +64,17 @@ class TestRuntime implements ManagedChannelRuntime {
 			plugin: this.definition.plugin,
 			session: this.definition.session,
 			chat: this.definition.chat ?? 'ahp-chat:/default',
-			host: 'test-host',
+			host: this.definition.host === '@source'
+				? 'editor:1:source'
+				: this.definition.host === '@destination'
+					? 'editor:2:destination'
+					: this.definition.host === '@fallback'
+						? 'editor:3:fallback'
+						: 'test-host',
 			clientId: 'test-client',
 			channelName: 'fake-channel',
 			startedAt: new Date(0).toISOString(),
+			bindingId: this.bindingId,
 			busy: this.busy,
 			mode: this.startupError ? 'customization-only' : 'mcp',
 		};
@@ -56,6 +88,47 @@ class TestRuntime implements ManagedChannelRuntime {
 
 	async quiesce(): Promise<boolean> {
 		return !this.busy;
+	}
+
+	beginHandoff(id: string): void {
+		let resolveReady!: () => void;
+		const ready = new Promise<void>(resolve => {
+			resolveReady = resolve;
+		});
+		this.handoff = { id, ready, resolveReady };
+		if (!this.busy) {
+			resolveReady();
+		}
+	}
+
+	async waitForHandoffReady(id: string, signal: AbortSignal): Promise<void> {
+		if (!this.handoff || this.handoff.id !== id) {
+			throw new Error(`Unknown handoff ${id}`);
+		}
+		await Promise.race([
+			this.handoff.ready,
+			new Promise<never>((_resolve, reject) => {
+				signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+			}),
+		]);
+	}
+
+	async cancelHandoff(id: string): Promise<void> {
+		if (!this.handoff || this.handoff.id !== id) {
+			throw new Error(`Unknown handoff ${id}`);
+		}
+		this.handoff = undefined;
+	}
+
+	async quiesceHandoff(id: string): Promise<boolean> {
+		return this.handoff?.id === id && !this.busy;
+	}
+
+	async activate(): Promise<void> { }
+
+	finishTurn(): void {
+		this.busy = false;
+		this.handoff?.resolveReady();
 	}
 
 	async close(): Promise<void> {
@@ -75,6 +148,7 @@ class TestRuntimeFactory implements DaemonRuntimeFactory {
 	readonly runtimes: TestRuntime[] = [];
 	failSession: string | undefined;
 	runtimeError: string | undefined;
+	runtimeErrorSession: string | undefined;
 	validateHook: ((definition: ChannelInstanceConfig) => void | Promise<void>) | undefined;
 	startHook: ((definition: ChannelInstanceConfig) => void | Promise<void>) | undefined;
 
@@ -90,9 +164,95 @@ class TestRuntimeFactory implements DaemonRuntimeFactory {
 		if (definition.session === this.failSession) {
 			throw new ChannelOperationError('session-resolution', `failed to connect ${definition.session}`);
 		}
-		const runtime = new TestRuntime(name, definition, this.runtimeError);
+		const runtime = new TestRuntime(
+			name,
+			definition,
+			!this.runtimeErrorSession || definition.session === this.runtimeErrorSession
+				? this.runtimeError
+				: undefined,
+		);
 		this.runtimes.push(runtime);
 		return runtime;
+	}
+
+	prepare(name: string, definition: ChannelInstanceConfig): Promise<TestRuntime> {
+		return this.start(name, definition);
+	}
+}
+
+class TestSessionCatalog implements DaemonSessionCatalog {
+	validationError: Error | undefined;
+	readonly validations: ChannelBindingTarget[] = [];
+
+	async discoverSessions(request: SessionDiscoveryRequest): Promise<SessionDiscoveryResult> {
+		return {
+			kind: 'sessions',
+			outcome: 'ok',
+			items: [{
+				host: {
+					...(request.host ? { preferred: request.host } : {}),
+					actual: request.host === '@destination' ? 'editor:2:destination' : 'editor:1:source',
+					fallback: request.host === '@fallback',
+				},
+				resource: 'ahp-session:/destination',
+				title: 'Destination',
+				provider: 'test',
+				status: 1,
+				createdAt: new Date(0).toISOString(),
+				modifiedAt: new Date(1).toISOString(),
+			}],
+			failures: [],
+		};
+	}
+
+	async discoverChats(request: ChatDiscoveryRequest): Promise<ChatDiscoveryResult> {
+		return {
+			kind: 'chats',
+			outcome: 'ok',
+			host: {
+				...(request.host ? { preferred: request.host } : {}),
+				actual: 'editor:2:destination',
+				fallback: false,
+			},
+			session: {
+				resource: request.session,
+				title: 'Destination',
+				provider: 'test',
+				status: 1,
+			},
+			defaultChat: 'ahp-chat:/destination',
+			items: [{
+				resource: 'ahp-chat:/destination',
+				title: 'Destination chat',
+				status: 1,
+				modifiedAt: new Date(1).toISOString(),
+				isDefault: true,
+			}],
+			warnings: [],
+		};
+	}
+
+	async validateBinding(target: ChannelBindingTarget): Promise<ResolvedChannelBinding> {
+		this.validations.push(target);
+		if (this.validationError) {
+			throw this.validationError;
+		}
+		return {
+			...(target.host ? { preferredHost: target.host } : {}),
+			actualHost: target.host === '@fallback'
+				? 'editor:3:fallback'
+				: target.host === '@destination'
+					? 'editor:2:destination'
+					: target.host === '@source'
+						? 'editor:1:source'
+					: target.host ?? 'editor:2:destination',
+			fallback: target.host === '@fallback',
+			session: target.session,
+			chat: target.chat ?? 'ahp-chat:/default-destination',
+			warnings: target.host === '@fallback'
+				? ["Host alias '@fallback' did not connect; using local fallback editor:3:fallback"]
+				: [],
+		};
 	}
 }
 
@@ -273,6 +433,575 @@ describe('DaemonServer', () => {
 			status = await requestDaemon(home, { command: 'channel.delete', name: 'personal' });
 			assert.deepEqual(status.channels, []);
 			assert.deepEqual((await store.read()).channels, {});
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('accepts an agent handoff as pending and applies one cross-host binding after the source turn', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		const catalog = new TestSessionCatalog();
+		const server = new DaemonServer(
+			home,
+			await getOrCreateDaemonToken(home),
+			store,
+			factory,
+			undefined,
+			catalog,
+		);
+		await server.start();
+		try {
+			let status = await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake',
+					host: '@source',
+					session: 'ahp-session:/source',
+					chat: 'ahp-chat:/source',
+					enabled: false,
+				},
+				start: true,
+			});
+			const source = factory.runtimes[0];
+			assert.ok(source);
+			source.busy = true;
+
+			const management = new DaemonChannelManagementService(home).bind({
+				channel: 'personal',
+				bindingId: source.bindingId,
+				preferredHost: '@source',
+				session: 'ahp-session:/source',
+				chat: 'ahp-chat:/source',
+			});
+			const listResult = await management.callTool(
+				MANAGEMENT_TOOL_NAMES.listSessions,
+				{ limit: 10 },
+				new AbortController().signal,
+			);
+			assert.equal(listResult.success, true);
+			assert.equal(listResult.structuredContent?.['kind'], 'sessions');
+			await assert.rejects(
+				requestDaemonData(home, {
+					command: 'catalog.sessions',
+					name: 'personal',
+					sourceBindingId: randomUUID(),
+				}),
+				(error: unknown) => error instanceof DaemonProtocolError && error.code === 'STALE_BINDING',
+			);
+
+			const handoffResult = await management.callTool(
+				MANAGEMENT_TOOL_NAMES.handoff,
+				{
+					host: '@destination',
+					session: 'ahp-session:/destination',
+					chat: 'ahp-chat:/destination',
+				},
+				new AbortController().signal,
+			);
+			assert.equal(handoffResult.success, true);
+			assert.equal(handoffResult.structuredContent?.['state'], 'pending');
+			status = await requestDaemon(home, { command: 'status' });
+			const pending = status.channels[0]?.handoff;
+			assert.equal(pending?.state, 'pending');
+			assert.equal(pending?.resolvedTarget.actualHost, 'editor:2:destination');
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
+			assert.equal(source.closed, false);
+
+			const competingToolResult = await management.callTool(
+				MANAGEMENT_TOOL_NAMES.handoff,
+				{ host: '@destination', session: 'ahp-session:/other' },
+				new AbortController().signal,
+			);
+			assert.equal(competingToolResult.success, false);
+			assert.match(competingToolResult.error?.message ?? '', /already pending/);
+			assert.equal(source.closed, false);
+
+			await assert.rejects(
+				requestDaemon(home, {
+					command: 'channel.handoff.request',
+					name: 'personal',
+					sourceBindingId: source.bindingId,
+					target: {
+						host: '@destination',
+						session: 'ahp-session:/other',
+					},
+				}),
+				(error: unknown) => error instanceof DaemonProtocolError && error.code === 'HANDOFF_PENDING',
+			);
+
+			source.finishTurn();
+			await waitFor(async () => {
+				const handoff = (await requestDaemon(home, { command: 'status' })).channels[0]?.handoff;
+				return handoff?.state === 'applied';
+			}, 1000);
+			status = await requestDaemon(home, { command: 'status' });
+			assert.deepEqual({
+				definition: status.channels[0]?.definition,
+				runtime: status.channels[0]?.runtime && {
+					host: status.channels[0].runtime.host,
+					session: status.channels[0].runtime.session,
+					chat: status.channels[0].runtime.chat,
+				},
+				handoff: status.channels[0]?.handoff && {
+					state: status.channels[0].handoff.state,
+					actualHost: status.channels[0].handoff.resolvedTarget.actualHost,
+				},
+				sourceClosed: source.closed,
+			}, {
+				definition: {
+					plugin: 'fake',
+					host: '@destination',
+					session: 'ahp-session:/destination',
+					chat: 'ahp-chat:/destination',
+					enabled: true,
+				},
+				runtime: {
+					host: 'editor:2:destination',
+					session: 'ahp-session:/destination',
+					chat: 'ahp-chat:/destination',
+				},
+				handoff: {
+					state: 'applied',
+					actualHost: 'editor:2:destination',
+				},
+				sourceClosed: true,
+			});
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('allows only the owning source binding to cancel the first pending handoff', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		const server = new DaemonServer(
+			home,
+			await getOrCreateDaemonToken(home),
+			store,
+			factory,
+			undefined,
+			new TestSessionCatalog(),
+		);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake',
+					host: '@source',
+					session: 'ahp-session:/source',
+					enabled: false,
+				},
+				start: true,
+			});
+			const source = factory.runtimes[0];
+			assert.ok(source);
+			source.busy = true;
+			const pending = await requestDaemon(home, {
+				command: 'channel.handoff.request',
+				name: 'personal',
+				sourceBindingId: source.bindingId,
+				target: {
+					host: '@destination',
+					session: 'ahp-session:/destination',
+				},
+			});
+			const requestId = pending.channels[0]?.handoff?.requestId;
+			assert.ok(requestId);
+
+			await assert.rejects(
+				requestDaemon(home, {
+					command: 'channel.handoff.cancel',
+					name: 'personal',
+					sourceBindingId: randomUUID(),
+					requestId,
+				}),
+				(error: unknown) => error instanceof DaemonProtocolError && error.code === 'STALE_BINDING',
+			);
+			const cancelled = await requestDaemon(home, {
+				command: 'channel.handoff.cancel',
+				name: 'personal',
+				sourceBindingId: source.bindingId,
+				requestId,
+			});
+			assert.equal(cancelled.channels[0]?.handoff?.state, 'cancelled');
+			source.finishTurn();
+			await new Promise(resolve => setTimeout(resolve, 20));
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
+			assert.equal(source.closed, false);
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('fails and releases a pending handoff when its source runtime stops unexpectedly', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		const server = new DaemonServer(
+			home,
+			await getOrCreateDaemonToken(home),
+			store,
+			factory,
+			undefined,
+			new TestSessionCatalog(),
+		);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake',
+					host: '@source',
+					session: 'ahp-session:/source',
+					enabled: false,
+				},
+				start: true,
+			});
+			const source = factory.runtimes[0];
+			assert.ok(source);
+			source.busy = true;
+			await requestDaemon(home, {
+				command: 'channel.handoff.request',
+				name: 'personal',
+				sourceBindingId: source.bindingId,
+				target: {
+					host: '@destination',
+					session: 'ahp-session:/destination',
+				},
+			});
+
+			source.stopUnexpectedly();
+			await waitFor(async () => {
+				const status = await requestDaemon(home, { command: 'status' });
+				return status.channels[0]?.handoff?.state === 'failed';
+			}, 1000);
+			const stopped = await requestDaemon(home, { command: 'channel.stop', name: 'personal' });
+			assert.equal(stopped.channels[0]?.desired, 'stopped');
+			assert.match(stopped.channels[0]?.handoff?.error ?? '', /source runtime stopped/i);
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('does not conflate default-chat semantics with an explicit pin to the same chat', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		const server = new DaemonServer(
+			home,
+			await getOrCreateDaemonToken(home),
+			store,
+			factory,
+			undefined,
+			new TestSessionCatalog(),
+		);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake',
+					host: '@source',
+					session: 'ahp-session:/source',
+					enabled: false,
+				},
+				start: true,
+			});
+			const source = factory.runtimes[0];
+			assert.ok(source);
+			source.busy = true;
+			const status = await requestDaemon(home, {
+				command: 'channel.handoff.request',
+				name: 'personal',
+				sourceBindingId: source.bindingId,
+				target: {
+					host: '@source',
+					session: 'ahp-session:/source',
+					chat: 'ahp-chat:/default',
+				},
+			});
+			assert.equal(status.channels[0]?.handoff?.state, 'pending');
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('executes an explicit cross-host handoff through the real CLI entrypoint', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-cli-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const server = new DaemonServer(
+			home,
+			await getOrCreateDaemonToken(home),
+			store,
+			new TestRuntimeFactory(),
+			undefined,
+			new TestSessionCatalog(),
+		);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake',
+					host: '@source',
+					session: 'ahp-session:/source',
+					enabled: false,
+				},
+				start: true,
+			});
+			const output = await runCli(home, [
+				'channel',
+				'handoff',
+				'personal',
+				'--host',
+				'@destination',
+				'--session',
+				'ahp-session:/destination',
+				'--chat',
+				'ahp-chat:/destination',
+			]);
+			assert.match(output, /Handoff: applied/);
+			assert.deepEqual((await store.read()).channels['personal'], {
+				plugin: 'fake',
+				host: '@destination',
+				session: 'ahp-session:/destination',
+				chat: 'ahp-chat:/destination',
+				enabled: true,
+			});
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('keeps the committed source binding while the destination is preparing', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		const server = new DaemonServer(
+			home, await getOrCreateDaemonToken(home), store, factory, undefined, new TestSessionCatalog(),
+		);
+		let prepared!: () => void;
+		let release!: () => void;
+		const preparing = new Promise<void>(resolve => { prepared = resolve; });
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		let switching: Promise<unknown> | undefined;
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake', host: '@source', session: 'ahp-session:/source', enabled: false,
+				},
+				start: true,
+			});
+			factory.startHook = async definition => {
+				if (definition.session === 'ahp-session:/destination') {
+					prepared();
+					await gate;
+				}
+			};
+			switching = requestDaemon(home, {
+				command: 'channel.handoff',
+				name: 'personal',
+				target: { host: '@destination', session: 'ahp-session:/destination' },
+			});
+			await preparing;
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
+			const status = await requestDaemon(home, { command: 'status' });
+			assert.equal(status.channels[0]?.handoff?.state, 'pending');
+			assert.equal(status.channels[0]?.state, 'starting');
+			release();
+			await switching;
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/destination');
+		} finally {
+			release();
+			await switching;
+			await server.close();
+		}
+	});
+
+	it('restores the committed source and reports failure when restart interrupts a pending handoff', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		await store.update(config => ({
+			...config,
+			channels: {
+				personal: {
+					plugin: 'fake',
+					host: '@destination',
+					session: 'ahp-session:/destination',
+					chat: 'ahp-chat:/destination',
+					enabled: true,
+				},
+			},
+		}));
+		const now = new Date().toISOString();
+		const pending: ChannelHandoffRecord = {
+			requestId: randomUUID(),
+			state: 'pending',
+			requestedAt: now,
+			updatedAt: now,
+			source: {
+				actualHost: 'editor:1:source',
+				host: '@source',
+				session: 'ahp-session:/source',
+				resolvedChat: 'ahp-chat:/source-default',
+			},
+			target: {
+				host: '@destination',
+				session: 'ahp-session:/destination',
+				chat: 'ahp-chat:/destination',
+			},
+			resolvedTarget: {
+				preferredHost: '@destination',
+				actualHost: 'editor:2:destination',
+				fallback: false,
+				session: 'ahp-session:/destination',
+				chat: 'ahp-chat:/destination',
+				warnings: [],
+			},
+		};
+		await new FileChannelHandoffStore(home).write('personal', pending);
+		const factory = new TestRuntimeFactory();
+		const server = new DaemonServer(
+			home,
+			await getOrCreateDaemonToken(home),
+			store,
+			factory,
+			undefined,
+			new TestSessionCatalog(),
+		);
+
+		await server.start();
+		try {
+			const status = await requestDaemon(home, { command: 'status' });
+			assert.deepEqual({
+				definition: status.channels[0]?.definition,
+				handoffState: status.channels[0]?.handoff?.state,
+				handoffError: status.channels[0]?.handoff?.error,
+			}, {
+				definition: {
+					plugin: 'fake',
+					host: '@source',
+					session: 'ahp-session:/source',
+					enabled: true,
+				},
+				handoffState: 'failed',
+				handoffError: 'Daemon restarted before the handoff was applied; the committed source binding was restored',
+			});
+		} finally {
+			await server.close();
+		}
+	});
+
+	it('validates the destination before stopping and rolls back a failed cross-host start', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'ahp-channels-daemon-handoff-'));
+		temporaryDirectories.push(home);
+		const store = new ConfigStore(home);
+		await configureHostAliases(store, home);
+		const factory = new TestRuntimeFactory();
+		const catalog = new TestSessionCatalog();
+		const server = new DaemonServer(
+			home,
+			await getOrCreateDaemonToken(home),
+			store,
+			factory,
+			undefined,
+			catalog,
+		);
+		await server.start();
+		try {
+			await requestDaemon(home, {
+				command: 'channel.create',
+				name: 'personal',
+				definition: {
+					plugin: 'fake',
+					host: '@source',
+					session: 'ahp-session:/source',
+					enabled: false,
+				},
+				start: true,
+			});
+			const source = factory.runtimes[0];
+			assert.ok(source);
+			catalog.validationError = new Error('destination unavailable');
+			await assert.rejects(
+				requestDaemon(home, {
+					command: 'channel.handoff',
+					name: 'personal',
+					target: {
+						host: '@destination',
+						session: 'ahp-session:/destination',
+					},
+				}),
+				(error: unknown) => error instanceof DaemonProtocolError
+					&& error.code === 'INVALID_TARGET',
+			);
+			assert.equal(source.closed, false);
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
+
+			catalog.validationError = undefined;
+			factory.failSession = 'ahp-session:/destination';
+			await assert.rejects(
+				requestDaemon(home, {
+					command: 'channel.handoff',
+					name: 'personal',
+					target: {
+						host: '@fallback',
+						session: 'ahp-session:/destination',
+					},
+				}),
+				/Failed to switch channel/,
+			);
+			const status = await requestDaemon(home, { command: 'status' });
+			assert.equal(status.channels[0]?.handoff?.state, 'failed');
+			assert.equal(status.channels[0]?.handoff?.resolvedTarget.actualHost, 'editor:3:fallback');
+			assert.equal((await store.read()).channels['personal'].session, 'ahp-session:/source');
+			assert.equal(factory.runtimes.at(-1)?.definition.session, 'ahp-session:/source');
+
+			factory.failSession = undefined;
+			factory.runtimeError = 'destination channel setup is incomplete';
+			factory.runtimeErrorSession = 'ahp-session:/destination';
+			await assert.rejects(
+				requestDaemon(home, {
+					command: 'channel.handoff',
+					name: 'personal',
+					target: {
+						host: '@destination',
+						session: 'ahp-session:/destination',
+					},
+				}),
+				/Failed to switch channel/,
+			);
+			const degraded = await requestDaemon(home, { command: 'status' });
+			assert.equal(degraded.channels[0]?.handoff?.state, 'failed');
+			assert.equal(degraded.channels[0]?.definition.session, 'ahp-session:/source');
+			assert.equal(degraded.channels[0]?.runtime?.session, 'ahp-session:/source');
+			assert.equal(degraded.channels[0]?.runtime?.mode, 'mcp');
 		} finally {
 			await server.close();
 		}
@@ -640,6 +1369,29 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs: n
 		await new Promise(resolve => setTimeout(resolve, 20));
 	}
 	throw new Error('Timed out waiting for condition');
+}
+
+async function configureHostAliases(store: ConfigStore, home: string): Promise<void> {
+	await store.update(config => ({
+		...config,
+		hostAliases: {
+			source: {
+				kind: 'socket',
+				path: join(home, 'source.sock'),
+				withoutAuthentication: true,
+			},
+			destination: {
+				kind: 'socket',
+				path: join(home, 'destination.sock'),
+				withoutAuthentication: true,
+			},
+			fallback: {
+				kind: 'socket',
+				path: join(home, 'fallback.sock'),
+				withoutAuthentication: true,
+			},
+		},
+	}));
 }
 
 function runCli(home: string, args: readonly string[]): Promise<string> {

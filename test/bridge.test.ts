@@ -7,6 +7,7 @@ import {
 	MessageKind,
 	PendingMessageKind,
 	ResponsePartKind,
+	SessionStatus,
 	ToolCallCancellationReason,
 	ToolCallConfirmationReason,
 	ToolCallContributorKind,
@@ -121,7 +122,7 @@ describe('ChannelBridge', () => {
 				}],
 				nonce: 'plugin-nonce',
 			}],
-			onStatus: message => statuses.push(message),
+			status: { report: message => statuses.push(message) },
 		});
 		context.after(() => bridge.close());
 
@@ -307,6 +308,38 @@ describe('ChannelBridge', () => {
 		assert.deepEqual(toolCalls, [{ name: 'reply', args: { text: 'resumed reply' } }]);
 	});
 
+	it('defers restored tool permissions and execution until destination activation', async context => {
+		const fixture = createToolFixture(context);
+		await fixture.bridge.startPaused();
+		assert.deepEqual(fixture.dispatched, []);
+		assert.deepEqual(fixture.calls, []);
+
+		fixture.confirm();
+		await new Promise(resolve => setImmediate(resolve));
+		assert.deepEqual(fixture.dispatched, []);
+		assert.equal(fixture.host.readCount, 0);
+		assert.deepEqual(fixture.calls, []);
+
+		await fixture.bridge.activate();
+		await waitFor(() => fixture.dispatched.some(action => action.type === ActionType.ChatToolCallComplete));
+		assert.deepEqual(fixture.calls, ['reply']);
+	});
+
+	it('does not resurrect a tool completed while the destination was prepared', async context => {
+		const fixture = createToolFixture(context);
+		await fixture.bridge.startPaused();
+		fixture.subscription.push(actionEvent({
+			type: ActionType.ChatToolCallComplete,
+			turnId: 'tool-turn',
+			toolCallId: 'owned-tool',
+			result: { success: false, pastTenseMessage: 'Cancelled while preparing' },
+		}));
+		await new Promise(resolve => setImmediate(resolve));
+		await fixture.bridge.activate();
+		assert.deepEqual(fixture.calls, []);
+		assert.equal(fixture.dispatched.some(action => action.type === ActionType.ChatToolCallConfirmed), false);
+	});
+
 	for (const type of [ActionType.ChatTurnCancelled, ActionType.ChatTurnComplete] as const) {
 		it(`cancels a referenced input read immediately on ${type}`, async context => {
 			const fixture = createToolFixture(context);
@@ -451,6 +484,378 @@ describe('ChannelBridge', () => {
 		await channelHandler?.({ content: 'ignored' });
 		assert.equal(dispatchCount, 1);
 		await bridge.close();
+	});
+
+	it('leaves bridge management tools for Agent Host approval and dispatches them separately', async context => {
+		const subscription = new TestSubscription();
+		const dispatched: StateAction[] = [];
+		const managementCalls: Array<{ name: string; args: Readonly<Record<string, unknown>> }> = [];
+		const channelCalls: string[] = [];
+		const bridge = new ChannelBridge({
+			client: {
+				dispatch(_channel, action): DispatchHandle {
+					dispatched.push(action);
+					return { clientSeq: dispatched.length };
+				},
+			},
+			clientId: 'channel-client',
+			session: 'ahp-session:/session',
+			chat: 'ahp-chat:/chat',
+			chatState: {
+				resource: 'ahp-chat:/chat',
+				title: 'Chat',
+				status: SessionStatus.Idle,
+				modifiedAt: new Date(0).toISOString(),
+				turns: [],
+			},
+			chatSubscription: subscription,
+			channel: {
+				async setChannelHandler() { },
+				async callTool(name) {
+					channelCalls.push(name);
+					return { success: true, pastTenseMessage: 'Called channel tool' };
+				},
+				async close() { },
+			},
+			channelInfo: {
+				name: 'fake',
+				tools: [{ name: 'reply' }],
+			},
+			management: {
+				tools: [{ name: 'manage', inputSchema: { type: 'object' } }],
+				async callTool(name, args) {
+					managementCalls.push({ name, args });
+					return { success: true, pastTenseMessage: 'Managed channel' };
+				},
+			},
+			customizations: [],
+		});
+		context.after(() => bridge.close());
+		await bridge.start();
+		const registration = dispatched.find(action => action.type === ActionType.SessionActiveClientSet);
+		assert.ok(registration?.type === ActionType.SessionActiveClientSet);
+		assert.deepEqual(registration.activeClient.tools.map(tool => tool.name), ['reply', 'manage']);
+
+		const turn = {
+			type: ActionType.ChatTurnStarted,
+			turnId: 'management-turn',
+			startedAt: new Date(0).toISOString(),
+			message: { text: 'switch', origin: { kind: MessageKind.User } },
+		} as const;
+		subscription.push(actionEvent(turn));
+		subscription.push(actionEvent({
+			type: ActionType.ChatToolCallStart,
+			turnId: turn.turnId,
+			toolCallId: 'management-tool',
+			toolName: 'manage',
+			displayName: 'Manage',
+			contributor: { kind: ToolCallContributorKind.Client, clientId: 'channel-client' },
+		}));
+		subscription.push(actionEvent({
+			type: ActionType.ChatToolCallReady,
+			turnId: turn.turnId,
+			toolCallId: 'management-tool',
+			invocationMessage: 'Manage',
+			toolInput: '{"session":"ahp-session:/next"}',
+			options: [],
+		}));
+		await new Promise(resolve => setTimeout(resolve, 10));
+		assert.equal(dispatched.some(action =>
+			action.type === ActionType.ChatToolCallConfirmed
+				&& action.toolCallId === 'management-tool'
+		), false);
+		assert.deepEqual(managementCalls, []);
+
+		subscription.push(actionEvent({
+			type: ActionType.ChatToolCallConfirmed,
+			turnId: turn.turnId,
+			toolCallId: 'management-tool',
+			approved: true,
+			confirmed: ToolCallConfirmationReason.UserAction,
+		}));
+		await waitFor(() => dispatched.some(action =>
+			action.type === ActionType.ChatToolCallComplete
+				&& action.toolCallId === 'management-tool'
+		));
+		assert.deepEqual(managementCalls, [{
+			name: 'manage',
+			args: { session: 'ahp-session:/next' },
+		}]);
+		assert.deepEqual(channelCalls, []);
+	});
+
+	it('rejects channel tool names that collide with bridge management tools', async () => {
+		const subscription = new TestSubscription();
+		const bridge = new ChannelBridge({
+			client: {
+				dispatch(): DispatchHandle {
+					return { clientSeq: 1 };
+				},
+			},
+			clientId: 'channel-client',
+			session: 'ahp-session:/session',
+			chat: 'ahp-chat:/chat',
+			chatState: {
+				resource: 'ahp-chat:/chat',
+				title: 'Chat',
+				status: SessionStatus.Idle,
+				modifiedAt: new Date(0).toISOString(),
+				turns: [],
+			},
+			chatSubscription: subscription,
+			channel: {
+				async setChannelHandler() { },
+				async callTool(): Promise<never> {
+					throw new Error('Unexpected tool call');
+				},
+				async close() { },
+			},
+			channelInfo: { name: 'fake', tools: [{ name: 'collision' }] },
+			management: {
+				tools: [{ name: 'collision' }],
+				async callTool(): Promise<never> {
+					throw new Error('Unexpected tool call');
+				},
+			},
+			customizations: [],
+		});
+		await assert.rejects(
+			bridge.start(),
+			/tool name conflicts with bridge management tool.*collision/,
+		);
+		await bridge.close();
+	});
+
+	it('holds journaled inbound messages until a pending handoff is cancelled', async context => {
+		const subscription = new TestSubscription();
+		const dispatched: StateAction[] = [];
+		let channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
+		let enqueueGate: Promise<void> | undefined;
+		const pending: Array<{ id: string; event: ChannelEvent; receivedAt: string; stableIdentity: boolean }> = [];
+		const bridge = new ChannelBridge({
+			client: {
+				dispatch(_channel, action): DispatchHandle {
+					dispatched.push(action);
+					return { clientSeq: dispatched.length };
+				},
+			},
+			clientId: 'channel-client',
+			session: 'ahp-session:/session',
+			chat: 'ahp-chat:/chat',
+			chatState: {
+				resource: 'ahp-chat:/chat',
+				title: 'Chat',
+				status: SessionStatus.InProgress,
+				modifiedAt: new Date(0).toISOString(),
+				turns: [],
+				activeTurn: {
+					id: 'source-turn',
+					startedAt: new Date(0).toISOString(),
+					message: { text: 'handoff', origin: { kind: MessageKind.User } },
+					usage: undefined,
+					responseParts: [],
+				},
+			},
+			chatSubscription: subscription,
+			channel: {
+				async setChannelHandler(handler) {
+					channelHandler = handler;
+				},
+				async callTool(): Promise<never> {
+					throw new Error('Unexpected tool call');
+				},
+				async close() { },
+			},
+			channelInfo: { name: 'fake', tools: [] },
+			customizations: [],
+			eventJournal: {
+				async enqueue(_source, event) {
+					await enqueueGate;
+					const value = {
+						id: `held-${pending.length}`,
+						event,
+						receivedAt: new Date(0).toISOString(),
+						stableIdentity: true,
+					};
+					pending.push(value);
+					return value;
+				},
+				async pending() {
+					return pending;
+				},
+				async markDelivered() { },
+			},
+		});
+		context.after(() => bridge.close());
+		await bridge.start();
+		bridge.beginHandoff('handoff-request');
+		await channelHandler?.({ content: 'arrived while pending' });
+		assert.equal(dispatched.some(action =>
+			action.type === ActionType.ChatPendingMessageSet
+				|| action.type === ActionType.ChatTurnStarted && action.turnId !== 'source-turn'
+		), false);
+
+		const abort = new AbortController();
+		let ready = false;
+		const readiness = bridge.waitForHandoffReady('handoff-request', abort.signal).then(() => {
+			ready = true;
+		});
+		await Promise.resolve();
+		assert.equal(ready, false);
+		subscription.push(actionEvent({
+			type: ActionType.ChatTurnComplete,
+			turnId: 'source-turn',
+			duration: 0,
+		}));
+		await readiness;
+		assert.equal(await bridge.quiesceHandoff('handoff-request'), true);
+
+		const lateEnqueue = deferred<void>();
+		enqueueGate = lateEnqueue.promise;
+		const handling = channelHandler?.({ content: 'late held message' });
+		let quiesced = false;
+		const quiescing = bridge.quiesceHandoff('handoff-request').then(result => {
+			quiesced = result;
+		});
+		try {
+			await new Promise(resolve => setImmediate(resolve));
+			assert.equal(quiesced, false, 'Final quiescence must drain a late journal write');
+		} finally {
+			lateEnqueue.resolve();
+		}
+		await handling;
+		await quiescing;
+		assert.equal(quiesced, true, 'A held message must not fail an otherwise idle handoff');
+
+		await bridge.cancelHandoff('handoff-request');
+		const replay = dispatched.find(action =>
+			action.type === ActionType.ChatTurnStarted
+				&& action.turnId !== 'source-turn'
+		);
+		assert.ok(replay?.type === ActionType.ChatTurnStarted);
+		assert.match(replay.message.text, /arrived while pending/);
+		const queued = dispatched.find(action => action.type === ActionType.ChatPendingMessageSet);
+		assert.ok(queued?.type === ActionType.ChatPendingMessageSet);
+		assert.match(queued.message.text, /late held message/);
+	});
+
+	it('journals destination events while prepared and replays them only after activation', async context => {
+		const subscription = new TestSubscription();
+		const dispatched: StateAction[] = [];
+		let channelHandler: ((event: ChannelEvent) => void | Promise<void>) | undefined;
+		const pending: Array<{ id: string; event: ChannelEvent; receivedAt: string; stableIdentity: boolean }> = [];
+		const bridge = new ChannelBridge({
+			client: {
+				dispatch(_channel, action): DispatchHandle {
+					dispatched.push(action);
+					return { clientSeq: dispatched.length };
+				},
+			},
+			clientId: 'destination-client',
+			session: 'ahp-session:/destination',
+			chat: 'ahp-chat:/destination',
+			chatState: {
+				resource: 'ahp-chat:/destination',
+				title: 'Destination',
+				status: SessionStatus.Idle,
+				modifiedAt: new Date(0).toISOString(),
+				turns: [],
+			},
+			chatSubscription: subscription,
+			channel: {
+				async setChannelHandler(handler) {
+					channelHandler = handler;
+				},
+				async callTool(): Promise<never> {
+					throw new Error('Unexpected tool call');
+				},
+				async close() { },
+			},
+			channelInfo: { name: 'fake', tools: [{ name: 'reply' }] },
+			customizations: [],
+			eventJournal: {
+				async enqueue(_source, event) {
+					const journaled = {
+						id: `prepared-${pending.length}`,
+						event,
+						receivedAt: new Date(0).toISOString(),
+						stableIdentity: true,
+					};
+					pending.push(journaled);
+					return journaled;
+				},
+				async pending() {
+					return pending;
+				},
+				async markDelivered() { },
+			},
+		});
+		context.after(() => bridge.close());
+
+		await bridge.startPaused();
+		await channelHandler?.({ content: 'arrived before durable commit' });
+		assert.equal(dispatched.some(action =>
+			action.type === ActionType.SessionActiveClientSet
+				|| action.type === ActionType.ChatTurnStarted
+		), false);
+
+		await bridge.activate();
+		assert.equal(dispatched[0]?.type, ActionType.SessionActiveClientSet);
+		const turn = dispatched.find(action => action.type === ActionType.ChatTurnStarted);
+		assert.ok(turn?.type === ActionType.ChatTurnStarted);
+		assert.match(turn.message.text, /arrived before durable commit/);
+	});
+
+	it('rejects pending handoff readiness when the source bridge stops unexpectedly', async () => {
+		const subscription = new TestSubscription();
+		const bridge = new ChannelBridge({
+			client: {
+				dispatch(): DispatchHandle {
+					return { clientSeq: 1 };
+				},
+			},
+			clientId: 'source-client',
+			session: 'ahp-session:/source',
+			chat: 'ahp-chat:/source',
+			chatState: {
+				resource: 'ahp-chat:/source',
+				title: 'Source',
+				status: SessionStatus.InProgress,
+				modifiedAt: new Date(0).toISOString(),
+				turns: [],
+				activeTurn: {
+					id: 'active',
+					startedAt: new Date(0).toISOString(),
+					message: { text: 'handoff', origin: { kind: MessageKind.User } },
+					usage: undefined,
+					responseParts: [],
+				},
+			},
+			chatSubscription: subscription,
+			channel: {
+				async setChannelHandler() { },
+				async callTool(): Promise<never> {
+					throw new Error('Unexpected tool call');
+				},
+				async close() { },
+			},
+			channelInfo: { name: 'fake', tools: [] },
+			customizations: [],
+			eventJournal: {
+				async enqueue(): Promise<never> {
+					throw new Error('Unexpected event');
+				},
+				async pending() {
+					return [];
+				},
+				async markDelivered() { },
+			},
+		});
+		await bridge.start();
+		bridge.beginHandoff('interrupted');
+		const readiness = bridge.waitForHandoffReady('interrupted', new AbortController().signal);
+		await bridge.close();
+		await assert.rejects(readiness);
 	});
 });
 

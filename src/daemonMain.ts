@@ -55,16 +55,18 @@ async function main(): Promise<void> {
 		const configStore = new ConfigStore(home);
 		const plugins = new PluginManager(configStore);
 		const agentHosts = new AgentHostService(configStore);
+		const runtimeServices = createChannelRuntimeServices(plugins, agentHosts, { home, stderr: logger });
 		const token = await getOrCreateDaemonToken(home);
 		daemon = new DaemonServer(
 			home,
 			token,
 			configStore,
 			createDaemonRuntimeFactory(
-				createChannelRuntimeServices(plugins, agentHosts, { home, stderr: logger }),
+				runtimeServices,
 				plugins,
 			),
 			logger,
+			runtimeServices.sessionCatalog,
 		);
 		process.once('SIGINT', shutdown);
 		process.once('SIGTERM', shutdown);

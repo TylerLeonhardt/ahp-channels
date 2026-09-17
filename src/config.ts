@@ -40,6 +40,12 @@ export interface ChannelInstanceConfig {
 	readonly installation?: string;
 }
 
+export interface ChannelBindingSelection {
+	readonly host?: string | null;
+	readonly session: string;
+	readonly chat?: string;
+}
+
 export interface VsCodeLocalHostAliasConfig {
 	readonly kind: 'vscode-local';
 	readonly registry: string;
@@ -103,13 +109,21 @@ export function retargetChannelInstance(
 	session: string,
 	chat?: string,
 ): ChannelInstanceConfig {
+	return rebindChannelInstance(definition, { session, ...(chat ? { chat } : {}) });
+}
+
+export function rebindChannelInstance(
+	definition: ChannelInstanceConfig,
+	target: ChannelBindingSelection,
+): ChannelInstanceConfig {
+	const host = target.host === null ? undefined : target.host ?? definition.host;
 	return {
 		plugin: definition.plugin,
-		session,
+		session: target.session,
 		enabled: definition.enabled,
-		...(chat ? { chat } : {}),
+		...(target.chat ? { chat: target.chat } : {}),
 		...(definition.server ? { server: definition.server } : {}),
-		...(definition.host ? { host: definition.host } : {}),
+		...(host ? { host } : {}),
 		...(definition.clientId ? { clientId: definition.clientId } : {}),
 		...(definition.installation ? { installation: definition.installation } : {}),
 	};

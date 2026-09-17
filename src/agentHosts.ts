@@ -17,6 +17,7 @@ import {
 	type AgentHostConnectionTarget,
 	type AgentHostEndpoint,
 } from './endpoints.js';
+import { sanitizeErrorSummary } from './channelHealth.js';
 
 export type HostAliasResolutionErrorCode = 'ambiguous' | 'invalid' | 'unavailable' | 'unknown';
 
@@ -40,6 +41,18 @@ export interface HostAliasInspection {
 	readonly error?: string;
 }
 
+export interface AgentHostCandidate {
+	readonly target: AgentHostConnectionTarget;
+	readonly fallback: boolean;
+	readonly verifySessionCatalog: boolean;
+}
+
+export interface AgentHostResolutionPlan {
+	readonly preferredHost?: string;
+	readonly candidates: readonly AgentHostCandidate[];
+	readonly warnings: readonly string[];
+}
+
 export class AgentHostService {
 	constructor(
 		private readonly configStore: ConfigStore,
@@ -56,6 +69,89 @@ export class AgentHostService {
 			return this.resolveAlias(aliasName);
 		}
 		return selectAgentHost(await this.discover(), selector);
+	}
+
+	async configuredSelectors(): Promise<readonly string[]> {
+		return Object.keys((await this.configStore.read()).hostAliases)
+			.sort((a, b) => a.localeCompare(b))
+			.map(formatHostAliasSelector);
+	}
+
+	async resolveCandidates(selector?: string): Promise<AgentHostResolutionPlan> {
+		if (!selector) {
+			const endpoints = await this.discover();
+			if (endpoints.length === 0) {
+				throw new Error('No running local Agent Host endpoints were discovered');
+			}
+			return {
+				candidates: endpoints.map(target => ({
+					target,
+					fallback: false,
+					verifySessionCatalog: true,
+				})),
+				warnings: [],
+			};
+		}
+
+		if (!isHostAliasSelector(selector)) {
+			return {
+				preferredHost: selector,
+				candidates: [{
+					target: await this.resolve(selector),
+					fallback: false,
+					verifySessionCatalog: false,
+				}],
+				warnings: [],
+			};
+		}
+
+		const warnings: string[] = [];
+		let preferred: AgentHostConnectionTarget | undefined;
+		try {
+			preferred = await this.resolve(selector);
+		} catch (error) {
+			if (!(error instanceof HostAliasResolutionError) || error.code !== 'unavailable') {
+				throw error;
+			}
+			warnings.push(`${error.message}; searching other local Agent Hosts for the bound session`);
+		}
+
+		let fallbackEndpoints: readonly AgentHostEndpoint[] = [];
+		try {
+			fallbackEndpoints = await this.discover();
+		} catch (error) {
+			if (!preferred) {
+				throw error;
+			}
+			warnings.push(`Local Agent Host fallback discovery failed: ${sanitizeErrorSummary(errorMessage(error))}`);
+		}
+
+		const candidates: AgentHostCandidate[] = [];
+		if (preferred) {
+			candidates.push({
+				target: preferred,
+				fallback: false,
+				verifySessionCatalog: false,
+			});
+		}
+		for (const target of fallbackEndpoints) {
+			if (target.id === preferred?.id) {
+				continue;
+			}
+			candidates.push({
+				target,
+				fallback: true,
+				verifySessionCatalog: true,
+			});
+		}
+		if (candidates.length === 0) {
+			throw new Error(`Host alias '${selector}' is unavailable and no fallback Agent Hosts were discovered`);
+		}
+		return {
+			preferredHost: selector,
+			candidates,
+			warnings,
+		};
 	}
 
 	async resolveAlias(name: string): Promise<AgentHostConnectionTarget> {
@@ -370,4 +466,8 @@ function describeConnectionTarget(target: AgentHostConnectionTarget): Record<str
 
 function isDiscoveredEndpoint(target: AgentHostConnectionTarget): target is AgentHostEndpoint {
 	return 'registryFile' in target;
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
