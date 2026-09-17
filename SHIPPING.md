@@ -36,8 +36,8 @@
 - [x] Verify published `0.1.0-alpha.4` Telegram onboarding on macOS with fresh
       bridge configuration and plugin-owned token setup, including a real
       phone message/reply. Existing test bot and allowlist reused.
-- [ ] Verify published-prerelease Telegram onboarding on Linux; results from
-      another machine are pending.
+- [x] Verify published-prerelease Telegram onboarding on Linux; the user
+      confirmed success on another machine.
 - [ ] Soak the alpha with fakechat, Telegram, and Discord.
 - [x] Add actionable channel health diagnostics.
 - [x] Add log rotation.

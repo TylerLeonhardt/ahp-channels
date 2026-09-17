@@ -115,12 +115,16 @@ files.
 This reused an existing test bot and allowlist on macOS; it was not a
 pristine-machine or new-pairing test.
 
+## Completed: Linux prerelease onboarding
+
+- Published-prerelease Telegram onboarding confirmed by the user on another
+  Linux machine. This is user-reported verification, separate from the macOS
+  run performed here.
+
 ## Next: Remote identity and release validation
 
 - Define a standard-backed stable identity and credential resolver before
   adding aliases for remote Agent Hosts.
-- Verify published-prerelease Telegram onboarding on Linux using plugin-owned
-  configuration; results from another machine are pending.
 - Soak fakechat, Telegram, and Discord through daemon restarts and plugin
   upgrades.
 
