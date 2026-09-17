@@ -28,7 +28,7 @@ try {
 	}
 	tarball = join(root, result[0]['filename']);
 	if (basename(tarball) !== `ahp-channels-${VERSION}.tgz`) {
-		throw new Error(`Expected prerelease tarball ahp-channels-${VERSION}.tgz, received ${basename(tarball)}`);
+		throw new Error(`Expected package tarball ahp-channels-${VERSION}.tgz, received ${basename(tarball)}`);
 	}
 	await runNpm(['install', '--prefix', temporary, tarball], root);
 	cliEntry = join(temporary, 'node_modules', 'ahp-channels', 'dist', 'cli.js');

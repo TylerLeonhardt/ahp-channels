@@ -19,6 +19,16 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require release commit on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::Release tags must point to a commit already merged into main."
+            exit 1
+          fi
 
       - uses: actions/setup-node@v6
         with:
@@ -80,5 +90,6 @@ jobs:
           else
             gh release create "${GITHUB_REF_NAME}" \
               --title "${GITHUB_REF_NAME}" \
-              --generate-notes
+              --generate-notes \
+              --latest
           fi

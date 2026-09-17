@@ -2,29 +2,144 @@
 
 Run Claude Code channel plugins against local Agent Host Protocol servers.
 
-`ahp-channels` is an experimental compatibility adapter. It launches a
-Claude-style MCP channel plugin, forwards inbound channel notifications to an
-AHP chat, exposes the plugin's MCP tools as AHP client tools, and contributes
-the installed Open Plugin to the AHP session so the host can discover its
-skills and other customizations.
+`ahp-channels` connects messaging plugins to an existing agent conversation.
+It runs the plugin's MCP server, forwards inbound messages to an AHP chat,
+exposes the plugin's tools, and contributes its setup skills and other Open
+Plugin customizations to that conversation. The Agent Host supplies the agent
+provider and its permission controls; the plugin owns credentials, pairing,
+and platform-specific behavior.
+
+Version **0.1.0** includes:
+
+- Named channels managed by a background daemon.
+- Local host aliases and discovery of existing sessions and chats.
+- Searchable terminal selection and agent-requested handoffs.
+- Durable inbound delivery journals, restart recovery, and health diagnostics.
+- Plugin-defined reply tools, bounded attachment/resource translation, and
+  native permission relay for plugins that support it.
+
+[Quick start](#quick-start) · [Host connections](#select-a-local-agent-host) ·
+[Channel controls](#manage-a-channel) · [Upgrading](#upgrade-the-bridge) ·
+[Compatibility](#compatibility-and-limits) · [Development](#development)
+
+## Requirements
+
+- **Node.js 22 or newer** and npm.
+- **Git** for plugin marketplace installation.
+- A running **local Agent Host** with a configured agent provider and an
+  existing conversation. VS Code builds that expose Agent Host endpoints are
+  supported; opening an ordinary editor window alone does not guarantee an
+  endpoint is available.
+- The selected plugin's runtime and account requirements. The official
+  Telegram, Discord, and fakechat plugins currently require
+  [Bun](https://bun.sh/docs/installation).
+
+The bridge does not install or authenticate the agent provider, start an
+Agent Host, or create agent conversations. Configure those through the host's
+own UI or documented tools first.
 
 ## Quick start
 
-```powershell
-npm install
-npm run build
+These commands use the published package, not a source checkout. The
+single-line commands work in macOS/Linux shells and PowerShell.
 
-node .\dist\cli.js plugin install fakechat@claude-plugins-official
-node .\dist\cli.js host discover
-node .\dist\cli.js host alias add local --host 0
-node .\dist\cli.js session list --host @local
-node .\dist\cli.js channel create fakechat --plugin fakechat --session <session-uri> --host @local
-node .\dist\cli.js channel start fakechat
-node .\dist\cli.js channel select fakechat
+### 1. Install the CLI and a channel plugin
+
+```sh
+npm install -g ahp-channels
+ahp-channels --version
+ahp-channels plugin install telegram@claude-plugins-official
 ```
 
+Telegram is an example, not a special mode in the bridge. Choose another
+compatible plugin to use a different channel.
+
+### 2. Choose the receiving agent conversation
+
+```sh
+ahp-channels host discover
+ahp-channels host alias add local --host 0
+ahp-channels session list --host "@local"
+```
+
+Use the index of the intended host from `host discover`; `0` above selects the
+first entry. If no hosts are found, enable/start a supported host before
+continuing. See [Host connections](#select-a-local-agent-host) for explicit
+loopback WebSocket or socket targets.
+
+A **session is an agent conversation**, not the terminal in which you run the
+CLI. Choose the conversation that should receive Telegram messages and copy
+its exact `resource` URI from `session list`. The bridge does not assume that
+the conversation currently open in VS Code is the one you want.
+
+### 3. Create and start the named channel
+
+Replace `PASTE_SESSION_URI` below with that exact URI:
+
+```sh
+ahp-channels channel create telegram --plugin telegram --session "PASTE_SESSION_URI" --host "@local"
+ahp-channels channel start telegram
+ahp-channels channel status telegram
+```
+
+The first start may report **`error (degraded)`** if the plugin still needs
+credentials or setup. In this mode, its setup skills remain contributed to
+the selected conversation, but the channel cannot receive messages yet.
+
+### 4. Complete the plugin's setup in that conversation
+
+Open the **same agent conversation selected in step 2**. Invoke the plugin's
+setup skill there, such as `/telegram:configure`, or ask the agent to run the
+Telegram setup skill and follow its instructions. Review pairing and access
+policy using the plugin's access skill, such as `/telegram:access`.
+
+These are **agent skills, not shell commands or `ahp-channels` subcommands**.
+Keep bot tokens private and follow the plugin's credential-storage guidance.
+The bridge does not configure tokens or approve external senders for you.
+
+After the setup turn finishes, the daemon automatically retries the plugin.
+To request a retry from the terminal once the conversation is idle:
+
+```sh
+ahp-channels channel restart telegram
+ahp-channels channel status telegram
+```
+
+`Channel ... is processing a turn` means the restart was refused to protect
+active work; finish the turn and retry. For credentials supplied through
+environment variables, see [Plugin environment and restarts](#plugin-environment-and-restarts).
+
+### 5. Send a message and verify the reply
+
+Once status reports **`running (healthy)`**, send a message through Telegram
+and verify that the agent replies through the plugin. A new sender may first
+need to complete the plugin's pairing process.
+
+If startup only shows `MCP error -32000: Connection closed`, locate the log:
+
+```sh
+ahp-channels daemon logs
+```
+
+This prints the log file path; inspect it for the plugin's actual diagnostic,
+such as a missing token or runtime. Use the plugin's own setup documentation
+to resolve it rather than editing bridge internals.
+
+To redirect the channel later, without creating another conversation:
+
+```sh
+ahp-channels channel select telegram
+```
+
+The picker requires an interactive terminal. For scripts, use
+[`channel handoff`](#discover-and-select-existing-sessions) with explicit
+host/session/chat selectors.
+
+### Configuration and process ownership
+
 The CLI stores configuration under `~/.ahp-channels` by default. Override this
-with `AHP_CHANNELS_HOME`.
+with `AHP_CHANNELS_HOME`, and use the same value for every command that manages
+that installation. Use a persistent location for a channel you intend to keep.
 
 Installed marketplace plugins are copied into content-addressed directories
 under `~/.ahp-channels/plugins/<marketplace>/<plugin>/<sha256>`. Marketplace
@@ -32,9 +147,10 @@ checkouts remain source catalogs; channel processes and contributed
 customizations use the installed copy. Existing `node_modules` and `.git`
 directories are not copied.
 
-The official preview plugins currently require Bun. The adapter
-supports standalone TCP hosts and normal editor Agent Hosts over Windows named
-pipes or Unix domain sockets.
+Changing `AHP_CHANNELS_HOME` isolates bridge configuration, **not plugin-owned
+credentials or accounts**. Do not start a second poller for the same bot or
+channel identity. Stop the old bridge first, and follow the plugin's own
+multi-instance guidance if you need separate bots.
 
 ## Select a local Agent Host
 
@@ -55,7 +171,7 @@ ahp-channels host discover
 ahp-channels host alias add work --host 0
 ahp-channels host alias list
 ahp-channels host alias inspect work
-ahp-channels session list --host @work
+ahp-channels session list --host "@work"
 ```
 
 A VS Code alias stores the endpoint registry directory, endpoint kind
@@ -107,9 +223,9 @@ supported.
 Use aliases anywhere a host selector is accepted:
 
 ```powershell
-ahp-channels channel create telegram --plugin telegram --session <session-uri> --host @work
-ahp-channels channel run telegram --session <session-uri> --host @work
-ahp-channels channel select-host telegram --host @custom
+ahp-channels channel create telegram --plugin telegram --session "PASTE_SESSION_URI" --host "@work"
+ahp-channels channel run telegram --session "PASTE_SESSION_URI" --host "@work"
+ahp-channels channel select-host telegram --host "@custom"
 ```
 
 Legacy endpoint indices and ID prefixes remain supported. Configuration
@@ -130,7 +246,7 @@ Removing an alias referenced by any channel is rejected. Select a different
 host first, then remove it:
 
 ```powershell
-ahp-channels channel select-host telegram --host @custom
+ahp-channels channel select-host telegram --host "@custom"
 ahp-channels host alias remove work
 ```
 
@@ -251,21 +367,33 @@ Rendering or understanding a particular image, audio, or document format is
 provider/model-dependent. MCP display annotations, icons, and opaque `_meta`
 are not interpreted as file access or new AHP attachment fields.
 
-## Status
+## Compatibility and limits
 
-The compatibility bridge and durable daemon control milestones are complete.
-Channel status includes structured operational health diagnostics. See
-[ROADMAP.md](./ROADMAP.md) for the remaining setup, reliability, and
-distribution work.
+| Area | 0.1.0 scope |
+| --- | --- |
+| Platforms | Windows, macOS, and Linux CLI/package CI. Published-prerelease Telegram onboarding verified on macOS and user-confirmed on Linux. |
+| Agent Hosts | Local VS Code registry endpoints and explicitly configured loopback WebSocket/socket hosts. AHP 0.9 hosts are tested; the client negotiates protocol compatibility. |
+| Channel plugins | Stdio MCP servers declaring `claude/channel`. Plugins supply their own runtime, credentials, schemas, and access controls. |
+| Sessions | Select existing session/chat URIs. No session creation, history migration, or implicit cancellation/movement of agent work. |
+| Permissions | Exact-client, advertised-plugin-tool approval; management tools use host-authoritative permission policy. Only trusted plugins and authorized senders should be enabled. |
+| Attachments | Bounded MCP content/resource materialization. File-path conventions require the appropriate shared filesystem; rendering and media understanding depend on the provider. |
+| Editor integration | The authenticated daemon contract can serve a future extension. No VS Code extension or private editor-chat integration is included. |
+| Remote hosts | Remote URLs, SSH/tunnel provisioning, and remote credential/identity management are not supported. |
+
+A `0.1.0` package release is not a guarantee that every host/provider/plugin
+combination has been tested. Automated coverage includes the official fakechat
+smoke test and separate permission, attachment, and handoff fixtures. Longer
+multi-plugin soak testing is an explicitly deferred follow-up, not completed
+release evidence. See [SHIPPING.md](./SHIPPING.md) and [ROADMAP.md](./ROADMAP.md).
 
 ## Manage a channel
 
 ```powershell
 ahp-channels channel status telegram
 ahp-channels channel upgrade telegram
-ahp-channels channel switch telegram --session <new-session-uri>
-ahp-channels channel select-host telegram --host @work
-ahp-channels channel handoff telegram --host @work --session <new-session-uri> --chat <new-chat-uri>
+ahp-channels channel switch telegram --session "NEW_SESSION_URI"
+ahp-channels channel select-host telegram --host "@work"
+ahp-channels channel handoff telegram --host "@work" --session "NEW_SESSION_URI" --chat "NEW_CHAT_URI"
 ahp-channels channel select telegram
 ahp-channels channel stop telegram
 ahp-channels channel start telegram
@@ -282,8 +410,8 @@ structured result:
 
 ```powershell
 ahp-channels session list --limit 25
-ahp-channels session list --host @work --json
-ahp-channels session list --cursor <opaque-cursor>
+ahp-channels session list --host "@work" --json
+ahp-channels session list --cursor "RETURNED_CURSOR"
 ```
 
 Catalog entries include the exact session URI and only the title, provider,
@@ -302,9 +430,9 @@ noninteractive callers must use the explicit operation, which never prompts:
 
 ```powershell
 ahp-channels channel handoff telegram `
-  --host @work `
-  --session ahp-session:/... `
-  --chat ahp-chat:/...
+  --host "@work" `
+  --session "DESTINATION_SESSION_URI" `
+  --chat "DESTINATION_CHAT_URI"
 ```
 
 Omit `--chat` to preserve the destination session's default-chat semantics.
@@ -500,6 +628,40 @@ questions remain in the Agent Host UI.
 Re-confirmation previews include the current permission request, with the
 original tool intention shown only as additional context.
 
+## Upgrade the bridge
+
+Wait until the channels are idle, then stop the daemon **with the currently
+installed CLI before upgrading**:
+
+```sh
+ahp-channels daemon stop
+npm install -g ahp-channels@latest
+ahp-channels --version
+ahp-channels daemon start
+ahp-channels channel list
+```
+
+This restarts the process with the installed version rather than leaving an
+older daemon running behind a newer CLI. Stopping the daemon affects every
+channel in that bridge home. Enabled channels are restored on startup; plugin
+installation pins and plugin-owned credentials are not upgraded by this step.
+
+If a command reports `Invalid input: expected ... at version`, the CLI and
+daemon use different control protocols. Stop the daemon using the older CLI
+or build that launched it, then start the new version. Do not start another
+bridge against the same bot as a workaround.
+
+Back up bridge configuration before upgrading an early alpha. Version 0.1.0
+reads configuration versions 3 and 4 and writes version 4. Earlier
+configuration formats are not automatically migrated; use a separate
+persistent bridge home to reinstall plugins and recreate the desired bindings
+through the CLI after stopping the old bridge. Plugin-owned state remains
+separate.
+
+Stable releases are published under npm's `latest` tag. Prereleases use
+`next`; that tag may still point to an older alpha after a stable release, so
+use the default install or `@latest` for stable updates.
+
 ## Manage plugin versions
 
 ```powershell
@@ -528,7 +690,7 @@ upgraded, rolled back, or pruned by these commands.
 For one-off foreground use, `channel run` remains available:
 
 ```powershell
-ahp-channels channel run telegram --session <session-uri>
+ahp-channels channel run telegram --session "PASTE_SESSION_URI"
 ```
 
 Foreground channels remain owned by that terminal process. They do not publish
@@ -537,6 +699,17 @@ instances; stop the foreground process and create a named channel when durable
 terminal or agent handoff control is required.
 
 ## Development
+
+For a source checkout:
+
+```sh
+git clone https://github.com/TylerLeonhardt/ahp-channels.git
+cd ahp-channels
+npm ci
+npm run check
+```
+
+Additional validation commands:
 
 ```powershell
 npm test
@@ -665,5 +838,13 @@ browser-originated turns and plugin responses rather than injecting AHP
 turns or permission verdicts. A browser must be able to reach that UI and
 upload the disposable files.
 
-See [SHIPPING.md](./SHIPPING.md) for the npm prerelease gates and
-[PUBLISHING.md](./PUBLISHING.md) for the tag-driven release process.
+## Releases and license
+
+Releases are built and published by
+[GitHub Actions](./.github/workflows/publish.yml) using npm trusted publishing
+and provenance, not by a local `npm publish`. See
+[PUBLISHING.md](./PUBLISHING.md) for the protected-branch, tag-driven process
+and [SHIPPING.md](./SHIPPING.md) for release validation.
+
+Licensed under [MIT](./LICENSE). Report bugs at
+[GitHub Issues](https://github.com/TylerLeonhardt/ahp-channels/issues).
