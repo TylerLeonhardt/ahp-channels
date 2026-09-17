@@ -141,6 +141,17 @@ The CLI stores configuration under `~/.ahp-channels` by default. Override this
 with `AHP_CHANNELS_HOME`, and use the same value for every command that manages
 that installation. Use a persistent location for a channel you intend to keep.
 
+Installed marketplace plugins are copied into content-addressed directories
+under `~/.ahp-channels/plugins/<marketplace>/<plugin>/<sha256>`. Marketplace
+checkouts remain source catalogs; channel processes and contributed
+customizations use the installed copy. Existing `node_modules` and `.git`
+directories are not copied.
+
+Changing `AHP_CHANNELS_HOME` isolates bridge configuration, **not plugin-owned
+credentials or accounts**. Do not start a second poller for the same bot or
+channel identity. Stop the old bridge first, and follow the plugin's own
+multi-instance guidance if you need separate bots.
+
 ## VS Code extension
 
 The npm package includes a VS Code extension for managing the daemon, installing
@@ -159,16 +170,8 @@ errors. All actions are also available from the Command Palette.
 Use `ahpChannels.home` in VS Code settings when the
 extension should use a state directory other than `~/.ahp-channels`.
 
-Installed marketplace plugins are copied into content-addressed directories
-under `~/.ahp-channels/plugins/<marketplace>/<plugin>/<sha256>`. Marketplace
-checkouts remain source catalogs; channel processes and contributed
-customizations use the installed copy. Existing `node_modules` and `.git`
-directories are not copied.
-
-Changing `AHP_CHANNELS_HOME` isolates bridge configuration, **not plugin-owned
-credentials or accounts**. Do not start a second poller for the same bot or
-channel identity. Stop the old bridge first, and follow the plugin's own
-multi-instance guidance if you need separate bots.
+See the [extension guide](./vscode-extension/README.md) for setup, controls, and
+troubleshooting.
 
 ## Select a local Agent Host
 

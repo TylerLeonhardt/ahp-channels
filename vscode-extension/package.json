@@ -9,6 +9,14 @@
     "type": "git",
     "url": "https://github.com/TylerLeonhardt/ahp-channels.git"
   },
+  "homepage": "https://github.com/TylerLeonhardt/ahp-channels#vs-code-extension",
+  "bugs": {
+    "url": "https://github.com/TylerLeonhardt/ahp-channels/issues"
+  },
+  "vsce": {
+    "baseContentUrl": "https://github.com/TylerLeonhardt/ahp-channels/blob/main/vscode-extension",
+    "baseImagesUrl": "https://raw.githubusercontent.com/TylerLeonhardt/ahp-channels/main/vscode-extension"
+  },
   "engines": {
     "vscode": "^1.95.0"
   },
