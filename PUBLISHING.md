@@ -17,6 +17,12 @@ The `prepack` lifecycle also builds
 npm tarball. `npm version` keeps the extension manifest version synchronized
 with the package version.
 
+After publishing npm and creating the GitHub Release, the workflow attaches
+that same version-matched VSIX as a standalone release asset. It uses the file
+produced by npm's `prepack` lifecycle without rebuilding it. Download the
+VSIX from the release's **Assets** section for manual Marketplace upload.
+The workflow does not publish to the VS Code Marketplace.
+
 ## Build a VSIX for manual Marketplace upload
 
 ```powershell
@@ -133,6 +139,12 @@ publication, move a published tag, or overwrite an npm version. If npm accepted
 the package but a later step failed, establish that outcome before deciding
 which recovery step to rerun.
 
+The VSIX upload fails explicitly if the expected file is missing, empty, or
+cannot be uploaded; it does not overwrite an existing asset. If npm publication
+succeeded but the asset upload failed, recover the VSIX from that exact npm
+version and upload it to the matching GitHub Release. Do not republish npm
+solely to retry a release-asset upload.
+
 ## Pipeline guarantees
 
 The workflow:
@@ -146,3 +158,4 @@ The workflow:
 6. Rejects versions already present on npm.
 7. Publishes through npm OIDC trusted publishing.
 8. Creates a matching GitHub Release with the appropriate prerelease/latest flag.
+9. Attaches the matching npm-bundled VSIX to that release for download.
